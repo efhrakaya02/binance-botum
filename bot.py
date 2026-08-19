@@ -27,12 +27,8 @@ def hesapla_rsi(closes, period=14):
     rsi[:period] = 100. - 100. / (1. + rs)
     for i in range(period, len(closes)):
         delta = deltas[i - 1]
-        if delta > 0:
-            upval = delta
-            downval = 0.
-        else:
-            upval = 0.
-            downval = -delta
+        if delta > 0: upval = delta; downval = 0.
+        else: upval = 0.; downval = -delta
         up = (up * (period - 1) + upval) / period
         down = (down * (period - 1) + downval) / period
         rs = up / down if down != 0 else 0
@@ -43,31 +39,18 @@ def hesapla_rsi(closes, period=14):
 def otomatik_analiz():
     try:
         exchange = get_exchange()
-        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT']
+        # İsterseniz burada ZEC/USDT'yi çıkarabilirsiniz
+        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT'] 
         butce_usdt = 15.0
         leverage = 5
 
         positions = exchange.fetch_positions()
-        # 1. Önce Açık Pozisyonları Denetle (ROI Yönetimi)
-        for p in positions:
-            if float(p['contracts']) > 0:
-                roi = float(p['percentage']) * leverage # Kaldıraçlı ROI
-                symbol = p['symbol']
-                
-                # Hedef: ROI %5 kâr veya -%2 zarar
-                if roi >= 5.0 or roi <= -2.0:
-                    print(f"POZİSYON KAPATILIYOR: {symbol} | ROI: %{roi:.2f}")
-                    side = 'sell' if p['side'] == 'long' else 'buy'
-                    exchange.create_order(symbol, 'market', side, float(p['contracts']), None, {'reduceOnly': True})
-
-        # 2. Yeni İşlem Fırsatları
-        balance = exchange.fetch_balance()
-        usdt_free = balance.get('USDT', {}).get('free', 0)
         acik_semboller = [p['symbol'] for p in positions if float(p['contracts']) > 0]
+        
+        results = []
 
         for symbol in symbols:
             if symbol in acik_semboller: continue
-            if usdt_free < butce_usdt: break
 
             exchange.set_leverage(leverage, symbol)
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
@@ -80,12 +63,32 @@ def otomatik_analiz():
 
             if signal:
                 amount = round((butce_usdt * leverage) / current_price, 4)
+                
+                # 1. Ana Giriş (Market)
                 exchange.create_order(symbol, 'market', signal, amount)
-                print(f"YENİ İŞLEM: {symbol} {signal.upper()}")
+                
+                # 2. TP ve SL Fiyatlarını Hesapla
+                # %5 Kar, %2 Zarar
+                if signal == 'buy':
+                    tp_price = round(current_price * 1.05, 4)
+                    sl_price = round(current_price * 0.98, 4)
+                    close_side = 'sell'
+                else:
+                    tp_price = round(current_price * 0.95, 4)
+                    sl_price = round(current_price * 1.02, 4)
+                    close_side = 'buy'
 
-        return jsonify({"durum": "basarili"}), 200
+                # 3. TP (Limit Emri)
+                exchange.create_order(symbol, 'limit', close_side, amount, tp_price, {'reduceOnly': True})
+                
+                # 4. SL (Stop-Market Emri)
+                exchange.create_order(symbol, 'STOP_MARKET', close_side, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
+                
+                results.append(f"{symbol} işlem açıldı: TP@{tp_price}, SL@{sl_price}")
+
+        return jsonify({"durum": "basarili", "detaylar": results})
     except Exception as e:
-        return jsonify({"durum": "hata", "mesaj": str(e)}), 200
+        return jsonify({"hata": str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
