@@ -6,6 +6,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
+# Railway Variables'dan anahtarları çek
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 
@@ -47,64 +48,50 @@ def otomatik_analiz():
         butce_usdt = 15.0  
         leverage = 5
 
-        # 1. Cüzdan Bakiyesi ve Açık Pozisyonları Kontrol Et
+        # Cüzdan ve Pozisyon Kontrolü
         balance = exchange.fetch_balance()
         usdt_free = balance.get('USDT', {}).get('free', 0)
-        
-        # Binance Futures'daki mevcut açık pozisyonları çek
         positions = exchange.fetch_positions()
         acik_semboller = [p['symbol'] for p in positions if float(p['contracts']) > 0]
-
-        print(f"Serbest USDT: {usdt_free:.2f} | Açık Pozisyonlar: {acik_semboller}")
 
         sonuclar = []
 
         for symbol in symbols:
             try:
-                # KRİTİK KONTROL: Bu coinde zaten açık pozisyonumuz varsa yeni işlem AÇMA!
+                # 1. Aynı coinde açık pozisyon varsa geç
                 if symbol in acik_semboller:
-                    sonuclar.append(f"{symbol}: Zaten açık pozisyon var, pas geçildi.")
+                    sonuclar.append(f"{symbol}: Açık pozisyon var, pas geçildi.")
                     continue
-
-                # Bakiye kontrolü (15 USDT'den az varsa işlem yapma)
+                
+                # 2. Bakiye kontrolü
                 if usdt_free < butce_usdt:
-                    sonuclar.append("Yetersiz bakiye!")
+                    sonuclar.append("Yetersiz bakiye, işlem durduruldu.")
                     break
 
-                # 2. Kaldıraç Ayarla
+                # 3. Analiz için veri çek
                 exchange.set_leverage(leverage, symbol)
-                
-                # 3. Mum Verilerini Çek (1 Saatlik)
                 ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
                 closes = df['close'].values
                 current_price = closes[-1]
-                
-                # 4. İndikatörler (MA20 ve RSI14)
                 ma20 = df['close'].rolling(window=20).mean().iloc[-1]
                 rsi = hesapla_rsi(closes, period=14)
-                
-                print(f"{symbol} -> Fiyat: {current_price} | MA20: {ma20:.2f} | RSI: {rsi:.2f}")
 
-                # 5. Strateji Kararı
+                # 4. Strateji
                 signal = None
-                if current_price > ma20 and rsi < 65:
-                    signal = 'buy'
-                elif current_price < ma20 and rsi > 35:
-                    signal = 'sell'
+                if current_price > ma20 and rsi < 65: signal = 'buy'
+                elif current_price < ma20 and rsi > 35: signal = 'sell'
 
                 if signal:
+                    # Miktar hesapla ve sınırları doğrula
                     amount = round((butce_usdt * leverage) / current_price, 4)
-                    
-                    # Lot sınırları güvenliği
                     if symbol == 'BTC/USDT' and amount < 0.001: amount = 0.001
                     elif symbol == 'ETH/USDT' and amount < 0.001: amount = 0.001
                     elif symbol == 'SOL/USDT' and amount < 0.01: amount = 0.01
                     elif symbol == 'XRP/USDT' and amount < 1.0: amount = 1.0
                     elif symbol == 'ZEC/USDT' and amount < 0.01: amount = 0.01
 
-                    # TP (%4) ve SL (%2) Fiyatları
+                    # TP ve SL Hesapla
                     if signal == 'buy':
                         tp_price = round(current_price * 1.04, 4)
                         sl_price = round(current_price * 0.98, 4)
@@ -114,25 +101,23 @@ def otomatik_analiz():
                         sl_price = round(current_price * 1.02, 4)
                         tp_sl_side = 'buy'
 
-                    print(f"İŞLEM AÇILIYOR: {symbol} {signal.upper()} | Miktar: {amount} | TP: {tp_price} | SL: {sl_price}")
-
-                    # --- CANLI EMİR GÖNDERİMİ ---
-                    # 1. Piyasa Emri
+                    # Emirleri gönder
                     exchange.create_order(symbol, 'market', signal, amount)
-                    
-                    # 2. Kar Al ve Zarar Durdur (ReduceOnly ile sadece pozisyon kapatsın)
                     exchange.create_order(symbol, 'take_profit_market', tp_sl_side, amount, None, {'stopPrice': tp_price, 'reduceOnly': True})
                     exchange.create_order(symbol, 'stop_market', tp_sl_side, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
 
-                    sonuclar.append(f"{symbol}: {signal.upper()} açıldı (TP: {tp_price}, SL: {sl_price})")
+                    sonuclar.append(f"{symbol}: {signal.upper()} açıldı.")
                 else:
-                    sonuclar.append(f"{symbol}: Nötr")
+                    sonuclar.append(f"{symbol}: Nötr.")
 
             except Exception as ex:
-                print(f"{symbol} hata: {str(ex)}")
                 sonuclar.append(f"{symbol} hata: {str(ex)}")
 
         return jsonify({"durum": "basarili", "detaylar": sonuclar}), 200
 
     except Exception as e:
-        return jsonify({"durum"
+        return jsonify({"durum": "hata", "mesaj": str(e)}), 200
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
