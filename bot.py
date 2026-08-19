@@ -104,11 +104,10 @@ def otomatik_analiz():
                     # 1. Ana Giriş Emri (Market)
                     exchange.create_order(symbol, 'market', signal, amount)
                     
-                    # 2. Kar Al (Take Profit Market) Emri
-                    tp_params = {'stopPrice': tp_price, 'reduceOnly': True}
-                    exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', tp_sl_side, amount, None, tp_params)
+                    # 2. Kar Al (TP) - LİMİT Emri (Binance'de en kararlı çalışan yöntem)
+                    exchange.create_order(symbol, 'limit', tp_sl_side, amount, tp_price, {'reduceOnly': True})
                     
-                    # 3. Zarar Durdur (Stop Market) Emri
+                    # 3. Zarar Durdur (SL) - STOP_MARKET Emri
                     sl_params = {'stopPrice': sl_price, 'reduceOnly': True}
                     exchange.create_order(symbol, 'STOP_MARKET', tp_sl_side, amount, None, sl_params)
 
