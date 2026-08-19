@@ -48,7 +48,7 @@ def otomatik_analiz():
         butce_usdt = 15.0  
         leverage = 5
 
-        # Cüzdan ve Pozisyon Kontrolü
+        # Cüzdan ve Açık Pozisyon Kontrolü
         balance = exchange.fetch_balance()
         usdt_free = balance.get('USDT', {}).get('free', 0)
         positions = exchange.fetch_positions()
@@ -58,7 +58,7 @@ def otomatik_analiz():
 
         for symbol in symbols:
             try:
-                # 1. Aynı coinde açık pozisyon varsa geç
+                # 1. Aynı coinde açık pozisyon varsa işlem açma, geç
                 if symbol in acik_semboller:
                     sonuclar.append(f"{symbol}: Açık pozisyon var, pas geçildi.")
                     continue
@@ -77,13 +77,13 @@ def otomatik_analiz():
                 ma20 = df['close'].rolling(window=20).mean().iloc[-1]
                 rsi = hesapla_rsi(closes, period=14)
 
-                # 4. Strateji
+                # 4. Strateji Kararı
                 signal = None
                 if current_price > ma20 and rsi < 65: signal = 'buy'
                 elif current_price < ma20 and rsi > 35: signal = 'sell'
 
                 if signal:
-                    # Miktar hesapla ve sınırları doğrula
+                    # Miktar hesapla ve minimum lot sınırlarını koru
                     amount = round((butce_usdt * leverage) / current_price, 4)
                     if symbol == 'BTC/USDT' and amount < 0.001: amount = 0.001
                     elif symbol == 'ETH/USDT' and amount < 0.001: amount = 0.001
@@ -91,7 +91,7 @@ def otomatik_analiz():
                     elif symbol == 'XRP/USDT' and amount < 1.0: amount = 1.0
                     elif symbol == 'ZEC/USDT' and amount < 0.01: amount = 0.01
 
-                    # TP ve SL Hesapla
+                    # TP (%4) ve SL (%2) Fiyat Hesaplama
                     if signal == 'buy':
                         tp_price = round(current_price * 1.04, 4)
                         sl_price = round(current_price * 0.98, 4)
@@ -101,12 +101,18 @@ def otomatik_analiz():
                         sl_price = round(current_price * 1.02, 4)
                         tp_sl_side = 'buy'
 
-                    # Emirleri gönder
+                    # 1. Ana Giriş Emri (Market)
                     exchange.create_order(symbol, 'market', signal, amount)
-                    exchange.create_order(symbol, 'take_profit_market', tp_sl_side, amount, None, {'stopPrice': tp_price, 'reduceOnly': True})
-                    exchange.create_order(symbol, 'stop_market', tp_sl_side, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
+                    
+                    # 2. Kar Al (Take Profit Market) Emri
+                    tp_params = {'stopPrice': tp_price, 'reduceOnly': True}
+                    exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', tp_sl_side, amount, None, tp_params)
+                    
+                    # 3. Zarar Durdur (Stop Market) Emri
+                    sl_params = {'stopPrice': sl_price, 'reduceOnly': True}
+                    exchange.create_order(symbol, 'STOP_MARKET', tp_sl_side, amount, None, sl_params)
 
-                    sonuclar.append(f"{symbol}: {signal.upper()} açıldı.")
+                    sonuclar.append(f"{symbol}: {signal.upper()} açıldı (TP: {tp_price}, SL: {sl_price}).")
                 else:
                     sonuclar.append(f"{symbol}: Nötr.")
 
