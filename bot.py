@@ -6,7 +6,6 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# Railway Variables'dan anahtarları çek
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 
@@ -45,81 +44,46 @@ def otomatik_analiz():
     try:
         exchange = get_exchange()
         symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT']
-        butce_usdt = 15.0  
+        butce_usdt = 15.0
         leverage = 5
 
-        # Cüzdan ve Açık Pozisyon Kontrolü
+        positions = exchange.fetch_positions()
+        # 1. Önce Açık Pozisyonları Denetle (ROI Yönetimi)
+        for p in positions:
+            if float(p['contracts']) > 0:
+                roi = float(p['percentage']) * leverage # Kaldıraçlı ROI
+                symbol = p['symbol']
+                
+                # Hedef: ROI %5 kâr veya -%2 zarar
+                if roi >= 5.0 or roi <= -2.0:
+                    print(f"POZİSYON KAPATILIYOR: {symbol} | ROI: %{roi:.2f}")
+                    side = 'sell' if p['side'] == 'long' else 'buy'
+                    exchange.create_order(symbol, 'market', side, float(p['contracts']), None, {'reduceOnly': True})
+
+        # 2. Yeni İşlem Fırsatları
         balance = exchange.fetch_balance()
         usdt_free = balance.get('USDT', {}).get('free', 0)
-        positions = exchange.fetch_positions()
         acik_semboller = [p['symbol'] for p in positions if float(p['contracts']) > 0]
 
-        sonuclar = []
-
         for symbol in symbols:
-            try:
-                # 1. Aynı coinde açık pozisyon varsa işlem açma, geç
-                if symbol in acik_semboller:
-                    sonuclar.append(f"{symbol}: Açık pozisyon var, pas geçildi.")
-                    continue
-                
-                # 2. Bakiye kontrolü
-                if usdt_free < butce_usdt:
-                    sonuclar.append("Yetersiz bakiye, işlem durduruldu.")
-                    break
+            if symbol in acik_semboller: continue
+            if usdt_free < butce_usdt: break
 
-                # 3. Analiz için veri çek
-                exchange.set_leverage(leverage, symbol)
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                closes = df['close'].values
-                current_price = closes[-1]
-                ma20 = df['close'].rolling(window=20).mean().iloc[-1]
-                rsi = hesapla_rsi(closes, period=14)
+            exchange.set_leverage(leverage, symbol)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            current_price = df['close'].iloc[-1]
+            ma20 = df['close'].rolling(window=20).mean().iloc[-1]
+            rsi = hesapla_rsi(df['close'].values, period=14)
 
-                # 4. Strateji Kararı
-                signal = None
-                if current_price > ma20 and rsi < 65: signal = 'buy'
-                elif current_price < ma20 and rsi > 35: signal = 'sell'
+            signal = 'buy' if current_price > ma20 and rsi < 65 else ('sell' if current_price < ma20 and rsi > 35 else None)
 
-                if signal:
-                    # Miktar hesapla ve minimum lot sınırlarını koru
-                    amount = round((butce_usdt * leverage) / current_price, 4)
-                    if symbol == 'BTC/USDT' and amount < 0.001: amount = 0.001
-                    elif symbol == 'ETH/USDT' and amount < 0.001: amount = 0.001
-                    elif symbol == 'SOL/USDT' and amount < 0.01: amount = 0.01
-                    elif symbol == 'XRP/USDT' and amount < 1.0: amount = 1.0
-                    elif symbol == 'ZEC/USDT' and amount < 0.01: amount = 0.01
+            if signal:
+                amount = round((butce_usdt * leverage) / current_price, 4)
+                exchange.create_order(symbol, 'market', signal, amount)
+                print(f"YENİ İŞLEM: {symbol} {signal.upper()}")
 
-                    # TP (%4) ve SL (%2) Fiyat Hesaplama
-                    if signal == 'buy':
-                        tp_price = round(current_price * 1.04, 4)
-                        sl_price = round(current_price * 0.98, 4)
-                        tp_sl_side = 'sell'
-                    else:
-                        tp_price = round(current_price * 0.96, 4)
-                        sl_price = round(current_price * 1.02, 4)
-                        tp_sl_side = 'buy'
-
-                    # 1. Ana Giriş Emri (Market)
-                    exchange.create_order(symbol, 'market', signal, amount)
-                    
-                    # 2. Kar Al (TP) - LİMİT Emri (Binance'de en kararlı çalışan yöntem)
-                    exchange.create_order(symbol, 'limit', tp_sl_side, amount, tp_price, {'reduceOnly': True})
-                    
-                    # 3. Zarar Durdur (SL) - STOP_MARKET Emri
-                    sl_params = {'stopPrice': sl_price, 'reduceOnly': True}
-                    exchange.create_order(symbol, 'STOP_MARKET', tp_sl_side, amount, None, sl_params)
-
-                    sonuclar.append(f"{symbol}: {signal.upper()} açıldı (TP: {tp_price}, SL: {sl_price}).")
-                else:
-                    sonuclar.append(f"{symbol}: Nötr.")
-
-            except Exception as ex:
-                sonuclar.append(f"{symbol} hata: {str(ex)}")
-
-        return jsonify({"durum": "basarili", "detaylar": sonuclar}), 200
-
+        return jsonify({"durum": "basarili"}), 200
     except Exception as e:
         return jsonify({"durum": "hata", "mesaj": str(e)}), 200
 
