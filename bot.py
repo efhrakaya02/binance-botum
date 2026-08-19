@@ -11,6 +11,12 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot'}
 })
 
+# Tarayıcıdan linke tıklandığında çalışacak ana sayfa
+@app.route('/')
+def ana_sayfa():
+    return "Binance Al-Sat Botu Aktif ve Çalışıyor! 🚀"
+
+# TradingView'den sinyal geldiğinde çalışacak webhook adresi
 @app.route('/webhook', methods=['POST'])
 def sinyali_isle():
     try:
