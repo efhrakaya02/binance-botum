@@ -22,8 +22,8 @@ def get_exchange():
 
 def hesapla_rsi(series, period=14):
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(window=int(period)).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=int(period)).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
@@ -103,11 +103,11 @@ def otomatik_analiz():
                 if pd.isna(ma20) or pd.isna(rsi):
                     continue
                 
-                # Miktar hesaplama ve kısıtlama kontrolü (10-15 USDT arası)
+                # Miktar hesaplama ve kısıtlama kontrolü (precision int() içine alındı)
                 raw_amount = ORDER_SIZE / current_price
                 market_data = exchange.load_markets()
                 market = market_data.get(symbol, {})
-                precision = market.get('precision', {}).get('amount', 3)
+                precision = int(market.get('precision', {}).get('amount', 3))
                 min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
                 amount = max(round(raw_amount, precision), min_amount)
                 
@@ -120,7 +120,7 @@ def otomatik_analiz():
                     exchange.create_order(symbol, 'market', 'sell', amount)
 
             except Exception as sym_err:
-                # Tek bir coindeki hata (veri çekememe vb.) diğerlerini engellemesin, döngü devam etsin
+                # Tek bir coindeki hata diğerlerini engellemesin, döngü devam etsin
                 print(f"{symbol} taranırken hata oluştu (atlandı): {sym_err}")
                 continue
         
