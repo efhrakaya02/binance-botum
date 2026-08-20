@@ -9,7 +9,7 @@ app = Flask(__name__)
 # Ayarlar
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 15.0  # Coin başına işlem büyüklüğü (USDT)
+ORDER_SIZE = 10.0  # Coin başına işlem büyüklüğü 10 USDT
 
 def get_exchange():
     return ccxt.binance({
@@ -55,54 +55,56 @@ def otomatik_analiz():
                         params={'reduceOnly': True}
                     )
         
-        # Güncel açık pozisyon listesini tekrar filtrele
-        positions = exchange.fetch_positions()
-        acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
-        acik_semboller = [p['symbol'] for p in acik_pozisyonlar]
+        # 2. Yeni Pozisyon Açma Kontrolü (Bakiyenin %50'si aktif, %50'si boşta kalacak)
+        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'RE/USDT', 'TUT/USDT', 'RED/USDT', 'LINK/USDT', 'BNB/USDT']
         
-        # 2. Yeni Pozisyon Açma Kontrolü (Bakiyenin %50'si boşta kalacak)
-        toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
-        max_usage = total_balance * 0.5
-        
-        if toplam_kullanilan + ORDER_SIZE <= max_usage:
-            symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'RE/USDT', 'TUT/USDT', 'RED/USDT', 'LINK/USDT', 'BNB/USDT']
+        for symbol in symbols:
+            # Her adımda güncel pozisyonları ve kullanılan marjini yeniden hesapla
+            positions = exchange.fetch_positions()
+            acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
+            acik_semboller = [p['symbol'] for p in acik_pozisyonlar]
             
-            for symbol in symbols:
-                if symbol in acik_semboller:
-                    continue  # Her coin için aynı anda sadece bir pozisyon olabilir
+            # Eğer bu coinde zaten açık pozisyon varsa atla (Her coin için max 1 pozisyon)
+            if symbol in acik_semboller:
+                continue
                 
-                try:
-                    # OHLCV Veri Çek ve İndikatörleri Hesapla
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    
-                    df['ma20'] = df['close'].rolling(window=20).mean()
-                    df['rsi'] = hesapla_rsi(df['close'], period=14)
-                    
-                    current_price = df['close'].iloc[-1]
-                    ma20 = df['ma20'].iloc[-1]
-                    rsi = df['rsi'].iloc[-1]
-                    
-                    if pd.isna(ma20) or pd.isna(rsi):
-                        continue
-                    
-                    # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI aşırı alımda değilse (< 65)
-                    if current_price > ma20 and rsi < 65:
-                        amount = ORDER_SIZE / current_price
-                        exchange.create_order(symbol, 'market', 'buy', amount)
-                        break  # Her döngüde en fazla 1 işlem aç
-                    
-                    # SHORT Sinyali: Fiyat MA20'nin altında ve RSI aşırı satımda değilse (> 35)
-                    elif current_price < ma20 and rsi > 35:
-                        amount = ORDER_SIZE / current_price
-                        exchange.create_order(symbol, 'market', 'sell', amount)
-                        break  # Her döngüde en fazla 1 işlem aç
-
-                except Exception:
-                    # Listede hatalı/olmayan bir coin varsa takılmadan diğerine geçer
+            toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
+            max_aktif_limit = total_balance * 0.5  # Bakiyenin %50'si kullanılabilir max sınır
+            
+            # Eğer yeni emir eklemek %50 sınırı aşıyorsa döngüyü bitir
+            if toplam_kullanilan + ORDER_SIZE > max_aktif_limit:
+                break
+            
+            try:
+                # OHLCV Veri Çek ve İndikatörleri Hesapla
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                
+                df['ma20'] = df['close'].rolling(window=20).mean()
+                df['rsi'] = hesapla_rsi(df['close'], period=14)
+                
+                current_price = df['close'].iloc[-1]
+                ma20 = df['ma20'].iloc[-1]
+                rsi = df['rsi'].iloc[-1]
+                
+                if pd.isna(ma20) or pd.isna(rsi):
                     continue
+                
+                # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI < 65
+                if current_price > ma20 and rsi < 65:
+                    amount = ORDER_SIZE / current_price
+                    exchange.create_order(symbol, 'market', 'buy', amount)
+                
+                # SHORT Sinyali: Fiyat MA20'nin altında ve RSI > 35
+                elif current_price < ma20 and rsi > 35:
+                    amount = ORDER_SIZE / current_price
+                    exchange.create_order(symbol, 'market', 'sell', amount)
+
+            except Exception:
+                # Hatalı veya borsada bulunmayan coinlerde takılmadan devam et
+                continue
         
-        return jsonify({"durum": "Basarili", "mesaj": "Analiz ve kontrol döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Analiz, %50 bakiye sınırı ve çoklu tarama tamamlandı."})
         
     except Exception as e:
         return jsonify({"durum": "Hata", "hata_mesaji": str(e)})
