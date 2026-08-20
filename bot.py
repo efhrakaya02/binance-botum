@@ -71,31 +71,36 @@ def otomatik_analiz():
                 if symbol in acik_semboller:
                     continue  # Her coin için aynı anda sadece bir pozisyon olabilir
                 
-                # OHLCV Veri Çek ve İndikatörleri Hesapla
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
-                df['ma20'] = df['close'].rolling(window=20).mean()
-                df['rsi'] = hesapla_rsi(df['close'], period=14)
-                
-                current_price = df['close'].iloc[-1]
-                ma20 = df['ma20'].iloc[-1]
-                rsi = df['rsi'].iloc[-1]
-                
-                if pd.isna(ma20) or pd.isna(rsi):
+                try:
+                    # OHLCV Veri Çek ve İndikatörleri Hesapla
+                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    
+                    df['ma20'] = df['close'].rolling(window=20).mean()
+                    df['rsi'] = hesapla_rsi(df['close'], period=14)
+                    
+                    current_price = df['close'].iloc[-1]
+                    ma20 = df['ma20'].iloc[-1]
+                    rsi = df['rsi'].iloc[-1]
+                    
+                    if pd.isna(ma20) or pd.isna(rsi):
+                        continue
+                    
+                    # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI aşırı alımda değilse (< 65)
+                    if current_price > ma20 and rsi < 65:
+                        amount = ORDER_SIZE / current_price
+                        exchange.create_order(symbol, 'market', 'buy', amount)
+                        break  # Her döngüde en fazla 1 işlem aç
+                    
+                    # SHORT Sinyali: Fiyat MA20'nin altında ve RSI aşırı satımda değilse (> 35)
+                    elif current_price < ma20 and rsi > 35:
+                        amount = ORDER_SIZE / current_price
+                        exchange.create_order(symbol, 'market', 'sell', amount)
+                        break  # Her döngüde en fazla 1 işlem aç
+
+                except Exception:
+                    # Listede hatalı/olmayan bir coin varsa takılmadan diğerine geçer
                     continue
-                
-                # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI aşırı alımda değilse (< 65)
-                if current_price > ma20 and rsi < 65:
-                    amount = ORDER_SIZE / current_price
-                    exchange.create_order(symbol, 'market', 'buy', amount)
-                    break  # Her döngüde en fazla 1 işlem aç
-                
-                # SHORT Sinyali: Fiyat MA20'nin altında ve RSI aşırı satımda değilse (> 35)
-                elif current_price < ma20 and rsi > 35:
-                    amount = ORDER_SIZE / current_price
-                    exchange.create_order(symbol, 'market', 'sell', amount)
-                    break  # Her döngüde en fazla 1 işlem aç
         
         return jsonify({"durum": "Basarili", "mesaj": "Analiz ve kontrol döngüsü tamamlandı."})
         
