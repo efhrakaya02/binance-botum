@@ -65,7 +65,7 @@ def otomatik_analiz():
         max_usage = total_balance * 0.5
         
         if toplam_kullanilan + ORDER_SIZE <= max_usage:
-            symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT']
+            symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'RE/USDT', 'TUT/USDT', 'RED/USDT', 'LINK/USDT', 'BNB/USDT']
             
             for symbol in symbols:
                 if symbol in acik_semboller:
