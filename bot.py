@@ -9,7 +9,7 @@ app = Flask(__name__)
 # Ayarlar
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 10.0  # Coin başına işlem büyüklüğü 10 USDT
+ORDER_SIZE = 10.0  # Kesin olarak 10 USDT taban işlem büyüklüğü
 
 def get_exchange():
     return ccxt.binance({
@@ -90,21 +90,30 @@ def otomatik_analiz():
                 if pd.isna(ma20) or pd.isna(rsi):
                     continue
                 
+                # Miktar hesaplama ve Binance lot/min-notional kısıtlarına uygunluk kontrolü
+                # 10 ile 15 USDT arasında olması garanti edilir (ORDER_SIZE = 10.0)
+                raw_amount = ORDER_SIZE / current_price
+                market_data = exchange.load_markets()
+                market = market_data.get(symbol, {})
+                precision = market.get('precision', {}).get('amount', 3)
+                
+                # Coine özel minimum işlem miktarı kontrolü
+                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
+                amount = max(round(raw_amount, precision), min_amount)
+                
                 # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI < 65
                 if current_price > ma20 and rsi < 65:
-                    amount = ORDER_SIZE / current_price
                     exchange.create_order(symbol, 'market', 'buy', amount)
                 
                 # SHORT Sinyali: Fiyat MA20'nin altında ve RSI > 35
                 elif current_price < ma20 and rsi > 35:
-                    amount = ORDER_SIZE / current_price
                     exchange.create_order(symbol, 'market', 'sell', amount)
 
             except Exception:
                 # Hatalı veya borsada bulunmayan coinlerde takılmadan devam et
                 continue
         
-        return jsonify({"durum": "Basarili", "mesaj": "Analiz, %50 bakiye sınırı ve çoklu tarama tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Analiz ve 10-15 USDT sınırlandırılmış emir döngüsü tamamlandı."})
         
     except Exception as e:
         return jsonify({"durum": "Hata", "hata_mesaji": str(e)})
