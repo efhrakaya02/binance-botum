@@ -27,6 +27,58 @@ def hesapla_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+def hesapla_supertrend(df, period=10, multiplier=3):
+    # ATR Hesaplama
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    
+    # HL2 (Orta Nokta)
+    hl2 = (high + low) / 2
+    
+    # Temel Bantlar
+    final_upperband = hl2 + (multiplier * atr)
+    final_lowerband = hl2 - (multiplier * atr)
+    
+    supertrend = [True] * len(df)
+    
+    for i in range(period, len(df)):
+        curr_close = close.iloc[i]
+        prev_close = close.iloc[i-1]
+        
+        # Üst Bant Mantığı
+        if final_upperband.iloc[i] < final_upperband.iloc[i-1] or prev_close > final_upperband.iloc[i-1]:
+            pass
+        else:
+            final_upperband.iloc[i] = final_upperband.iloc[i-1]
+            
+        # Alt Bant Mantığı
+        if final_lowerband.iloc[i] > final_lowerband.iloc[i-1] or prev_close < final_lowerband.iloc[i-1]:
+            pass
+        else:
+            final_lowerband.iloc[i] = final_lowerband.iloc[i-1]
+            
+        # SuperTrend Yönü (True = Bullish/Long, False = Bearish/Short)
+        if i == period:
+            supertrend[i] = True if curr_close > final_upperband.iloc[i] else False
+        else:
+            prev_st = supertrend[i-1]
+            if prev_st == True and curr_close <= final_lowerband.iloc[i]:
+                supertrend[i] = False
+            elif prev_st == False and curr_close >= final_upperband.iloc[i]:
+                supertrend[i] = True
+            else:
+                supertrend[i] = prev_st
+                
+    df['supertrend'] = supertrend
+    return df
+
 @app.route('/')
 def health_check():
     return "Bot Aktif ve Çalışıyor", 200
@@ -51,7 +103,6 @@ def otomatik_analiz():
                 if initial_margin > 0:
                     roi = float(p['unrealizedPnl']) / initial_margin
                     
-                    # %6 Kar veya %3 Zarar durumunda pozisyonu kapat
                     if roi >= 0.06 or roi <= -0.03:
                         side = 'sell' if p['side'] == 'long' else 'buy'
                         exchange.create_order(
@@ -64,8 +115,7 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi sırasında hata (devam ediliyor): {pos_err}")
 
-        # 2. Yeni Pozisyon Açma Kontrolü (Bakiyenin %50'si aktif, %50'si boşta)
-        # TUT ve RED pariteleri çıkarıldı, RSI filtreleri sertleştirildi (<30 ve >70)
+        # 2. Yeni Pozisyon Açma Kontrolü (EMA50 + SuperTrend + RSI Stratejisi)
         symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'LINK/USDT', 'BNB/USDT']
         
         for symbol in symbols:
@@ -85,21 +135,24 @@ def otomatik_analiz():
                 if toplam_kullanilan + ORDER_SIZE > max_aktif_limit:
                     break
                 
-                # OHLCV Veri Çek ve İndikatörleri Hesapla
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                # Yeterli veri alabilmek için limit 100 yapıldı (EMA50 için gerekli)
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
-                df['ma20'] = df['close'].rolling(window=20).mean()
+                # İndikatörler
+                df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
                 df['rsi'] = hesapla_rsi(df['close'], period=14)
+                df = hesapla_supertrend(df, period=10, multiplier=3)
                 
                 current_price = df['close'].iloc[-1]
-                ma20 = df['ma20'].iloc[-1]
+                ema50 = df['ema50'].iloc[-1]
                 rsi = df['rsi'].iloc[-1]
+                st_bullish = df['supertrend'].iloc[-1]  # True ise Long, False ise Short
                 
-                if pd.isna(ma20) or pd.isna(rsi):
+                if pd.isna(ema50) or pd.isna(rsi):
                     continue
                 
-                # Binance Min Notional (En az 5 USDT) Koruması
+                # Binance Min Notional (En az 5.5 USDT) Koruması
                 market_data = exchange.load_markets()
                 market = market_data.get(symbol, {})
                 
@@ -113,19 +166,19 @@ def otomatik_analiz():
                 
                 amount = max(round(raw_amount, precision), min_amount)
                 
-                # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI aşırı satım bölgesinde (< 30)
-                if current_price > ma20 and rsi < 30:
+                # LONG SİNYALİ: Fiyat EMA50 üstünde + SuperTrend Bullish (True) + RSI < 30 (Örtüşme)
+                if current_price > ema50 and st_bullish and rsi < 30:
                     exchange.create_order(symbol, 'market', 'buy', amount)
                 
-                # SHORT Sinyali: Fiyat MA20'nin altında ve RSI aşırı alım bölgesinde (> 70)
-                elif current_price < ma20 and rsi > 70:
+                # SHORT SİNYALİ: Fiyat EMA50 altında + SuperTrend Bearish (False) + RSI > 70 (Örtüşme)
+                elif current_price < ema50 and not st_bullish and rsi > 70:
                     exchange.create_order(symbol, 'market', 'sell', amount)
 
             except Exception as sym_err:
                 print(f"{symbol} taranırken hata oluştu (atlandı): {sym_err}")
                 continue
         
-        return jsonify({"durum": "Basarili", "mesaj": "Analiz ve güncel strateji döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "EMA50 + SuperTrend + RSI analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası yakalandı: {str(e)}")
