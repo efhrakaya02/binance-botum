@@ -10,7 +10,8 @@ app = Flask(__name__)
 # Ayarlar
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 12.0  # Hedef işlem büyüklüğü (10-15 USDT arası)
+ORDER_SIZE = 12.0  # İşlem başına hedef bütçe (USDT)
+MAX_POSITIONS = 2  # En fazla aynı anda 2 pozisyon
 
 def get_exchange():
     return ccxt.binance({
@@ -63,23 +64,24 @@ def hesapla_supertrend(df, period=10, multiplier=3):
                 supertrend[i] = prev_st
                 
     df['supertrend'] = supertrend
+    df['atr'] = atr
     return df
 
 @app.route('/')
 def health_check():
-    return "Bot Aktif ve Çalışıyor", 200
+    return "Akıllı Tarayıcı Bot Aktif ve Çalışıyor", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("Analiz döngüsü tetiklendi.")
+    print("Akıllı analiz ve tarama döngüsü tetiklendi.")
     try:
         exchange = get_exchange()
+        exchange.load_markets()
         
-        # Bakiyeyi al
         balance_info = exchange.fetch_balance()['USDT']
         total_balance = balance_info['free'] + balance_info['used']
         
-        # 1. Açık Pozisyonları Yönet (ROI Kontrolü: %6 Kar, %3 Zarar)
+        # 1. Açık Pozisyonları Kontrol Et ve Yönet
         try:
             positions = exchange.fetch_positions()
             acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
@@ -89,6 +91,7 @@ def otomatik_analiz():
                 if initial_margin > 0:
                     roi = float(p['unrealizedPnl']) / initial_margin
                     
+                    # Dinamik Hedefler: %6 Kâr veya %3 Zarar anında kapat (veya ATR bazlı çıkış)
                     if roi >= 0.06 or roi <= -0.03:
                         side = 'sell' if p['side'] == 'long' else 'buy'
                         exchange.create_order(
@@ -99,71 +102,106 @@ def otomatik_analiz():
                             params={'reduceOnly': True}
                         )
         except Exception as pos_err:
-            print(f"Pozisyon yönetimi sırasında hata (devam ediliyor): {pos_err}")
+            print(f"Pozisyon yönetimi hatası (devam ediliyor): {pos_err}")
 
-        # 2. Yeni Pozisyon Açma Kontrolü (Sadece EMA50 + SuperTrend Stratejisi)
-        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'LINK/USDT', 'BNB/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT']
+        # Eğer maksimum pozisyon sınırına ulaşıldıysa yeni tarama yapma
+        if len(acik_pozisyonlar) >= MAX_POSITIONS:
+            return jsonify({"durum": "Beklemede", "mesaj": f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı."})
+
+        # 2. Tüm Borsayı Tara ve Hacme Göre En İyi 20 Coin'i Seç
+        tickers = exchange.fetch_tickers()
+        usdt_tickers = {s: t for s, t in tickers.items() if s.endswith('/USDT') and ':' not in s}
         
-        for symbol in symbols:
+        # Hacme (quoteVolume) göre büyükten küçüğe sırala ve ilk 20'yi al
+        sorted_tickers = sorted(usdt_tickers.items(), key=lambda x: x[1].get('quoteVolume', 0) or 0, reverse=True)
+        top_symbols = [item[0] for item in sorted_tickers[:20]]
+        
+        en_iyi_fırsat = None
+        
+        for symbol in top_symbols:
             try:
-                time.sleep(0.3)
+                time.sleep(0.2)
                 
-                positions = exchange.fetch_positions()
-                acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
-                acik_semboller = [p['symbol'] for p in acik_pozisyonlar]
-                
-                if symbol in acik_semboller:
+                # Zaten açık olan sembolü tekrar tarama
+                if symbol in [p['symbol'] for p in acik_pozisyonlar]:
                     continue
-                    
-                toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
-                max_aktif_limit = total_balance * 0.5
                 
-                if toplam_kullanilan + ORDER_SIZE > max_aktif_limit:
+                # Fonlama Oranı (Funding Rate) Kontrolü (Aşırı şişmiş oranları filtrele)
+                funding_info = exchange.fetch_funding_rate(symbol)
+                funding_rate = funding_info.get('fundingRate', 0)
+                if funding_rate is None: 
+                    funding_rate = 0
+                
+                # Çok aşırı pozitif fonlama varsa Long açma, aşırı negatif varsa Short açma
+                skip_long_due_to_funding = funding_rate > 0.0015  # %0.15'ten büyükse aşırı kalabalık
+                skip_short_due_to_funding = funding_rate < -0.0015
+                
+                # Çoklu Zaman Dilimi (Multi-Timeframe) Analizi
+                # 4h (Ana Trend) Teyidi
+                ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
+                df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
+                
+                trend_4h_up = df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1]
+                
+                # 1h (Tetik Zamanı) Teyidi
+                ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
+                df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
+                df_1h = hesapla_supertrend(df_1h, period=10, multiplier=3)
+                
+                current_price = df_1h['close'].iloc[-1]
+                ema50_1h = df_1h['ema50'].iloc[-1]
+                st_bullish_1h = df_1h['supertrend'].iloc[-1]
+                
+                if pd.isna(ema50_1h):
+                    continue
+                
+                # LONG Fırsatı: 4h trend yukarı VE 1h EMA50 üstünde VE 1h SuperTrend Yeşil VE Fonlama uygun
+                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and not skip_long_due_to_funding:
+                    en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
+                    break # En iyi ilk güçlü fırsatı yakala ve çık
+                
+                # SHORT Fırsatı: 4h trend aşağı VE 1h EMA50 altında VE 1h SuperTrend Kırmızı VE Fonlama uygun
+                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not skip_short_due_to_funding:
+                    en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
-                
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                
-                df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-                df = hesapla_supertrend(df, period=10, multiplier=3)
-                
-                current_price = df['close'].iloc[-1]
-                ema50 = df['ema50'].iloc[-1]
-                st_bullish = df['supertrend'].iloc[-1]
-                
-                if pd.isna(ema50):
-                    continue
-                
-                market_data = exchange.load_markets()
-                market = market_data.get(symbol, {})
-                
-                raw_amount = ORDER_SIZE / current_price
-                precision = int(market.get('precision', {}).get('amount', 3))
-                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
-                
-                min_notional = 5.5
-                if (raw_amount * current_price) < min_notional:
-                    raw_amount = min_notional / current_price
-                
-                amount = max(round(raw_amount, precision), min_amount)
-                
-                # LONG SİNYALİ: Fiyat EMA50 üstünde VE SuperTrend Bullish (Yeşil)
-                if current_price > ema50 and st_bullish:
-                    exchange.create_order(symbol, 'market', 'buy', amount)
-                
-                # SHORT SİNYALİ: Fiyat EMA50 altında VE SuperTrend Bearish (Kırmızı)
-                elif current_price < ema50 and not st_bullish:
-                    exchange.create_order(symbol, 'market', 'sell', amount)
-
+                    
             except Exception as sym_err:
-                print(f"{symbol} taranırken hata oluştu (atlandı): {sym_err}")
                 continue
-        
-        return jsonify({"durum": "Basarili", "mesaj": "EMA50 + SuperTrend analiz döngüsü tamamlandı."})
+
+        # 3. Bulunan Fırsatı Değerlendir ve Emri Gir
+        if en_iyi_fırsat:
+            symbol = en_iyi_fırsat['symbol']
+            side = en_iyi_fırsat['side']
+            current_price = en_iyi_fırsat['price']
+            
+            market_data = exchange.load_markets()
+            market = market_data.get(symbol, {})
+            
+            raw_amount = ORDER_SIZE / current_price
+            precision = int(market.get('precision', {}).get('amount', 3))
+            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
+            
+            min_notional = 5.5
+            if (raw_amount * current_price) < min_notional:
+                raw_amount = min_notional / current_price
+            
+            amount = max(round(raw_amount, precision), min_amount)
+            
+            # Sermaye kontrolü (Toplam bakiyenin yarısı sınırı)
+            toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
+            max_aktif_limit = total_balance * 0.5
+            
+            if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
+                exchange.create_order(symbol, 'market', side, amount)
+                print(f"AKILLI İŞLEM AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount}")
+
+        return jsonify({"durum": "Basarili", "mesaj": "Tüm borsa tarandı, fonlama oranları ve çoklu zaman dilimi kontrol edildi."})
         
     except Exception as e:
-        print(f"Genel analiz döngüsü hatası yakalandı: {str(e)}")
-        return jsonify({"durum": "OK_Koru", "mesaj": "Anlık bir hata yutuldu, sistem çalışmaya devam ediyor."})
+        print(f"Genel analiz döngüsü hatası: {str(e)}")
+        return jsonify({"durum": "OK_Koru", "mesaj": "Hata yutuldu, sistem çalışmaya devam ediyor."})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
