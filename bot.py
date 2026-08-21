@@ -41,7 +41,7 @@ def otomatik_analiz():
         balance_info = exchange.fetch_balance()['USDT']
         total_balance = balance_info['free'] + balance_info['used']
         
-        # 1. Açık Pozisyonları Yönet (ROI Kontrolü: %5 Kar, %2 Zarar)
+        # 1. Açık Pozisyonları Yönet (ROI Kontrolü: %6 Kar, %3 Zarar)
         try:
             positions = exchange.fetch_positions()
             acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
@@ -51,7 +51,8 @@ def otomatik_analiz():
                 if initial_margin > 0:
                     roi = float(p['unrealizedPnl']) / initial_margin
                     
-                    if roi >= 0.05 or roi <= -0.02:
+                    # %6 Kar veya %3 Zarar durumunda pozisyonu kapat
+                    if roi >= 0.06 or roi <= -0.03:
                         side = 'sell' if p['side'] == 'long' else 'buy'
                         exchange.create_order(
                             symbol=p['symbol'], 
@@ -64,7 +65,8 @@ def otomatik_analiz():
             print(f"Pozisyon yönetimi sırasında hata (devam ediliyor): {pos_err}")
 
         # 2. Yeni Pozisyon Açma Kontrolü (Bakiyenin %50'si aktif, %50'si boşta)
-        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'RE/USDT', 'TUT/USDT', 'RED/USDT', 'LINK/USDT', 'BNB/USDT']
+        # TUT ve RED pariteleri çıkarıldı, RSI filtreleri sertleştirildi (<30 ve >70)
+        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'LINK/USDT', 'BNB/USDT']
         
         for symbol in symbols:
             try:
@@ -105,26 +107,25 @@ def otomatik_analiz():
                 precision = int(market.get('precision', {}).get('amount', 3))
                 min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
                 
-                # Notional sınır kontrolü (En az 5.5 USDT garanti edelim ki -4164 hatası alınmasın)
                 min_notional = 5.5
                 if (raw_amount * current_price) < min_notional:
                     raw_amount = min_notional / current_price
                 
                 amount = max(round(raw_amount, precision), min_amount)
                 
-                # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI < 65
-                if current_price > ma20 and rsi < 65:
+                # LONG Sinyali: Fiyat MA20'nin üstünde ve RSI aşırı satım bölgesinde (< 30)
+                if current_price > ma20 and rsi < 30:
                     exchange.create_order(symbol, 'market', 'buy', amount)
                 
-                # SHORT Sinyali: Fiyat MA20'nin altında ve RSI > 35
-                elif current_price < ma20 and rsi > 35:
+                # SHORT Sinyali: Fiyat MA20'nin altında ve RSI aşırı alım bölgesinde (> 70)
+                elif current_price < ma20 and rsi > 70:
                     exchange.create_order(symbol, 'market', 'sell', amount)
 
             except Exception as sym_err:
                 print(f"{symbol} taranırken hata oluştu (atlandı): {sym_err}")
                 continue
         
-        return jsonify({"durum": "Basarili", "mesaj": "Analiz ve kontrol döngüsü hatasız tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Analiz ve güncel strateji döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası yakalandı: {str(e)}")
