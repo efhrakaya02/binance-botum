@@ -116,7 +116,7 @@ def otomatik_analiz():
             print(f"Pozisyon yönetimi sırasında hata (devam ediliyor): {pos_err}")
 
         # 2. Yeni Pozisyon Açma Kontrolü (EMA50 + SuperTrend + RSI Stratejisi)
-        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'LINK/USDT', 'BNB/USDT', 'ADA/USDT', 'ONG/USDT', 'XAU/USDT', 'SKHYNIX/USDT', 'HYPE/USDT', 'SOXL/USDT', 'KORU/USDT', 'MU/USDT']
+        symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'LINK/USDT', 'BNB/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT']
         
         for symbol in symbols:
             try:
