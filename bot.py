@@ -20,13 +20,6 @@ def get_exchange():
         'options': {'defaultType': 'future'}
     })
 
-def hesapla_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=int(period)).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=int(period)).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
 def hesapla_supertrend(df, period=10, multiplier=3):
     high = df['high']
     low = df['low']
@@ -108,7 +101,7 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi sırasında hata (devam ediliyor): {pos_err}")
 
-        # 2. Yeni Pozisyon Açma Kontrolü (Dengelenmiş Strateji)
+        # 2. Yeni Pozisyon Açma Kontrolü (Sadece EMA50 + SuperTrend Stratejisi)
         symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ZEC/USDT', 'LINK/USDT', 'BNB/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT']
         
         for symbol in symbols:
@@ -132,15 +125,13 @@ def otomatik_analiz():
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
                 df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-                df['rsi'] = hesapla_rsi(df['close'], period=14)
                 df = hesapla_supertrend(df, period=10, multiplier=3)
                 
                 current_price = df['close'].iloc[-1]
                 ema50 = df['ema50'].iloc[-1]
-                rsi = df['rsi'].iloc[-1]
                 st_bullish = df['supertrend'].iloc[-1]
                 
-                if pd.isna(ema50) or pd.isna(rsi):
+                if pd.isna(ema50):
                     continue
                 
                 market_data = exchange.load_markets()
@@ -156,19 +147,19 @@ def otomatik_analiz():
                 
                 amount = max(round(raw_amount, precision), min_amount)
                 
-                # LONG SİNYALİ: Fiyat EMA50 üstünde + SuperTrend Bullish + RSI < 45 (Daha erişilebilir eşik)
-                if current_price > ema50 and st_bullish and rsi < 45:
+                # LONG SİNYALİ: Fiyat EMA50 üstünde VE SuperTrend Bullish (Yeşil)
+                if current_price > ema50 and st_bullish:
                     exchange.create_order(symbol, 'market', 'buy', amount)
                 
-                # SHORT SİNYALİ: Fiyat EMA50 altında + SuperTrend Bearish + RSI > 55 (Daha erişilebilir eşik)
-                elif current_price < ema50 and not st_bullish and rsi > 55:
+                # SHORT SİNYALİ: Fiyat EMA50 altında VE SuperTrend Bearish (Kırmızı)
+                elif current_price < ema50 and not st_bullish:
                     exchange.create_order(symbol, 'market', 'sell', amount)
 
             except Exception as sym_err:
                 print(f"{symbol} taranırken hata oluştu (atlandı): {sym_err}")
                 continue
         
-        return jsonify({"durum": "Basarili", "mesaj": "Dengelenmiş analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "EMA50 + SuperTrend analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası yakalandı: {str(e)}")
