@@ -68,7 +68,7 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Garanti Havuzlu Momentum Botu Aktif", 200
+    return "Kesin Çözümlü Momentum Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
@@ -134,12 +134,13 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Kesin Çözüm: Tüm Futures USDT çiftlerini doğrudan alıp hacim/değişime göre sırala
-        tickers = exchange.fetch_tickers()
-        coin_listesi = []
+        # 2. Kesin Çözüm: Tüm aktif USDT futures paritelerini doğrudan market üzerinden çekelim
+        all_symbols = [s for s in exchange.symbols if s.endswith('/USDT') and ':' not in s]
         
-        for symbol, t in tickers.items():
-            if symbol.endswith('/USDT') and ':' not in symbol:
+        coin_listesi = []
+        for symbol in all_symbols:
+            try:
+                t = exchange.fetch_ticker(symbol)
                 last_p = t.get('last', 0) or 0
                 open_p = t.get('open', 0) or last_p
                 vol = t.get('quoteVolume', 0) or 0
@@ -151,8 +152,10 @@ def otomatik_analiz():
                         'change': degisim_yuzdesi,
                         'volume': vol
                     })
+                time.sleep(0.05) # Rate limit koruması
+            except:
+                continue
         
-        # En çok yükselenler ve en çok düşenler olarak ayırıp birleştirelim
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         
         top_gainers = [item['symbol'] for item in coin_listesi[:15]]
@@ -238,7 +241,7 @@ def otomatik_analiz():
                 exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Garanti havuzlu tarama başarıyla tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Havuz başarıyla dolduruldu ve tarama yapıldı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
