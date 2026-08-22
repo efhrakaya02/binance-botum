@@ -7,11 +7,10 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# Ayarlar
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 12.0  # İşlem başına hedef bütçe (USDT)
-MAX_POSITIONS = 2  # En fazla aynı anda 2 pozisyon
+ORDER_SIZE = 12.0  
+MAX_POSITIONS = 2  
 
 def get_exchange():
     return ccxt.binance({
@@ -69,11 +68,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Anlık Loglu Trend Takipçisi Bot Aktif", 200
+    return "Momentum Avcısı Trailing Stop Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Yeni Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- Momentum ve Trend Tarama Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -81,12 +80,11 @@ def otomatik_analiz():
         balance_info = exchange.fetch_balance()['USDT']
         total_balance = balance_info['free'] + balance_info['used']
         
-        # Açık pozisyonları al
         positions = exchange.fetch_positions()
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
         print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
         
-        # 1. Açık Pozisyonları Yönet (Trailing Stop)
+        # 1. Pozisyon Yönetimi (Trailing Stop)
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -126,35 +124,46 @@ def otomatik_analiz():
                             amount=float(p['contracts']), 
                             params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Trailing Stop Tetiklendi! Pozisyon kapatıldı.", flush=True)
+                        print(f"[{symbol}] Trailing Stop Tetiklendi! Pozisyon kârla kapatıldı.", flush=True)
                     else:
-                        print(f"[{symbol}] Pozisyon takipte. Yön: {side.upper()}, Giriş: {entry_price}, Anlık: {current_price}", flush=True)
+                        print(f"[{symbol}] Pozisyon takipte ({side.upper()}). Giriş: {entry_price}, Anlık: {current_price}", flush=True)
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
         if len(acik_pozisyonlar) >= MAX_POSITIONS:
-            print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldığı için yeni tarama atlanıyor.", flush=True)
-            return jsonify({"durum": "Beklemede", "mesaj": f"Maksimum pozisyon sınırına ulaşıldı."})
+            print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
+            return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Hacme Göre En İyi 20 Coin'i Seç ve Tara
+        # 2. Dinamik Havuz: Gainers ve Losers (En Çok Hareket Edenler) Taraması
         tickers = exchange.fetch_tickers()
         usdt_tickers = {s: t for s, t in tickers.items() if s.endswith('/USDT') and ':' not in s}
         
-        sorted_tickers = sorted(usdt_tickers.items(), key=lambda x: x[1].get('quoteVolume', 0) or 0, reverse=True)
-        top_symbols = [item[0] for item in sorted_tickers[:20]]
+        # Fiyat değişim oranına (% change) göre sırala (En çok yükselenler ve en çok düşenler)
+        # percentage verisi yoksa 0 kabul edilir
+        sorted_by_change = sorted(
+            usdt_tickers.items(), 
+            key=lambda x: x[1].get('percentage', 0) or 0, 
+            reverse=True
+        )
         
-        print(f"Hacmi en yüksek ilk 20 coin tarandı. Detaylı filtreler uygulanıyor...", flush=True)
+        # En çok yükselen ilk 15 ve en çok düşen ilk 15 coini birleştirerek dinamik bir odak havuzu oluşturalım
+        top_gainers = [item[0] for item in sorted_by_change[:15]]
+        top_losers = [item[0] for item in sorted_by_change[-15:]]
+        
+        # Benzersiz (tekil) bir liste yapalım
+        target_symbols = list(set(top_gainers + top_losers))
+        print(f"Dinamik Hareketli Havuz Oluşturuldu. İncelenecek coin sayısı: {len(target_symbols)}", flush=True)
+        
         en_iyi_fırsat = None
         
-        for symbol in top_symbols:
+        for symbol in target_symbols:
             try:
-                time.sleep(0.2)
+                time.sleep(0.15)
                 
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
-                    print(f"-> {symbol}: Zaten açık pozisyon var, atlanıyor.", flush=True)
                     continue
                 
-                # Fonlama Oranı
+                # Fonlama Oranı Kontrolü
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
                 
@@ -162,16 +171,15 @@ def otomatik_analiz():
                 skip_short = funding_rate < -0.0015
                 
                 if skip_long or skip_short:
-                    print(f"-> {symbol}: Fonlama oranına takıldı (Funding: {funding_rate:.6f}), atlanıyor.", flush=True)
                     continue
                 
-                # 4h Trend
+                # 4h Trend Kontrolü
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
                 df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
                 trend_4h_up = df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1]
                 
-                # 1h Tetik
+                # 1h Tetik Kontrolü
                 ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
                 df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
@@ -184,23 +192,20 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h):
                     continue
                 
-                # Kontrol ve Loglama
+                # Sinyal Doğrulama
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h:
-                    print(f"*** KUSURSUZ LONG FIRSATI YAKALANDI: {symbol} ***", flush=True)
+                    print(f"*** MOMENTUM LONG FIRSATI: {symbol} ***rü", flush=True)
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
                 elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h:
-                    print(f"*** KUSURSUZ SHORT FIRSATI YAKALANDI: {symbol} ***", flush=True)
+                    print(f"*** MOMENTUM SHORT FIRSATI: {symbol} ***", flush=True)
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
-                else:
-                    print(f"-> {symbol}: Filtrelerden geçemedi (4h Up: {trend_4h_up}, 1h Price>EMA: {current_price > ema50_1h}, ST Bullish: {st_bullish_1h})", flush=True)
                     
             except Exception as sym_err:
-                print(f"-> {symbol} incelenirken hata: {sym_err}", flush=True)
                 continue
 
-        # 3. İşlem Açma
+        # 3. İşlem Emri Girişi
         if en_iyi_fırsat:
             symbol = en_iyi_fırsat['symbol']
             side = en_iyi_fırsat['side']
@@ -224,9 +229,9 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! İŞLEM BAŞARIYLA AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
+                print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Konuşkan ve akışkan analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Gainers/Losers tabanlı dinamik tarama tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
