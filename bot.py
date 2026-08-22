@@ -69,11 +69,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Trend Takipçisi Trailing Stop Bot Aktif", 200
+    return "Konuşkan Trend Takipçisi Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("Trend takibi ve Trailing Stop döngüsü tetiklendi.")
+    print("--- Yeni Analiz Döngüsü Başlatıldı ---")
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -84,21 +84,20 @@ def otomatik_analiz():
         # Açık pozisyonları al
         positions = exchange.fetch_positions()
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
+        print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}")
         
-        # 1. Açık Pozisyonları Yönet (Trailing Stop / İzleyen Stop Mekanizması)
+        # 1. Açık Pozisyonları Yönet (Trailing Stop)
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
                 initial_margin = float(p['initialMargin'])
                 entry_price = float(p['entryPrice'])
-                side = p['side'] # 'long' veya 'short'
+                side = p['side']
                 
                 if initial_margin > 0:
-                    # Güncel fiyatı çek
                     ticker = exchange.fetch_ticker(symbol)
                     current_price = ticker['last']
                     
-                    # Güncel ATR'yi hesapla (1h verisi üzerinden)
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=30)
                     df_temp = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     tr = pd.concat([df_temp['high'] - df_temp['low'], 
@@ -106,26 +105,18 @@ def otomatik_analiz():
                                   abs(df_temp['low'] - df_temp['close'].shift())], axis=1).max(axis=1)
                     current_atr = tr.rolling(window=10).mean().iloc[-1]
                     
-                    # Dinamik İzleyen Mesafe (Örn: 1.5 * ATR)
                     trailing_mesafe = 1.5 * current_atr
-                    
                     stop_tetiklendi = False
                     
                     if side == 'long':
-                        # Long pozisyonda fiyat yükseldikçe en yüksek fiyatı baz alarak stop'u yukarı taşıyoruz
-                        # Pratik takip için anlık fiyata göre izleyen stop hesaplıyoruz:
                         dinamik_stop = current_price - trailing_mesafe
-                        # Eğer anlık fiyat dinamik stopun altına sarktıysa veya giriş fiyatının altındaki ilk ATR stopa değdiyse
                         if current_price <= dinamik_stop:
                             stop_tetiklendi = True
-                            
                     elif side == 'short':
-                        # Short pozisyonda fiyat düştükçe stop'u aşağı taşıyoruz
                         dinamik_stop = current_price + trailing_mesafe
                         if current_price >= dinamik_stop:
                             stop_tetiklendi = True
                     
-                    # Pozisyon kapatma koşulu: Momentum bitti ve izleyen stop tetiklendi
                     if stop_tetiklendi:
                         close_side = 'sell' if side == 'long' else 'buy'
                         exchange.create_order(
@@ -135,21 +126,24 @@ def otomatik_analiz():
                             amount=float(p['contracts']), 
                             params={'reduceOnly': True}
                         )
-                        print(f"Trailing Stop Tetiklendi ({symbol}): Kâr maksimize edilerek pozisyon kapatıldı.")
+                        print(f"[{symbol}] Trailing Stop Tetiklendi! Pozisyon kapatıldı.")
+                    else:
+                        print(f"[{symbol}] Pozisyon takipte. Yön: {side.upper()}, Giriş: {entry_price}, Anlık: {current_price}")
         except Exception as pos_err:
-            print(f"Pozisyon yönetimi (Trailing) hatası: {pos_err}")
+            print(f"Pozisyon yönetimi hatası: {pos_err}")
 
-        # Eğer maksimum pozisyon sınırına ulaşıldıysa yeni tarama yapma
         if len(acik_pozisyonlar) >= MAX_POSITIONS:
-            return jsonify({"durum": "Beklemede", "mesaj": f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı."})
+            print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldığı için yeni tarama atlanıyor.")
+            return jsonify({"durum": "Beklemede", "mesaj": f"Maksimum pozisyon sınırına ulaşıldı."})
 
-        # 2. Tüm Borsayı Tara ve Hacme Göre En İyi 20 Coin'i Seç
+        # 2. Hacme Göre En İyi 20 Coin'i Seç ve Tara
         tickers = exchange.fetch_tickers()
         usdt_tickers = {s: t for s, t in tickers.items() if s.endswith('/USDT') and ':' not in s}
         
         sorted_tickers = sorted(usdt_tickers.items(), key=lambda x: x[1].get('quoteVolume', 0) or 0, reverse=True)
         top_symbols = [item[0] for item in sorted_tickers[:20]]
         
+        print(f"Hacmi en yüksek ilk 20 coin tarandı. Detaylı filtreler uygulanıyor...")
         en_iyi_fırsat = None
         
         for symbol in top_symbols:
@@ -157,22 +151,27 @@ def otomatik_analiz():
                 time.sleep(0.2)
                 
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
+                    print(f"-> {symbol}: Zaten açık pozisyon var, atlanıyor.")
                     continue
                 
-                # Fonlama Oranı Kontrolü
+                # Fonlama Oranı
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
                 
                 skip_long = funding_rate > 0.0015
                 skip_short = funding_rate < -0.0015
                 
-                # Çoklu Zaman Dilimi Teyidi (4h Ana Trend)
+                if skip_long or skip_short:
+                    print(f"-> {symbol}: Fonlama oranına takıldı (Funding: {funding_rate:.6f}), atlanıyor.")
+                    continue
+                
+                # 4h Trend
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
                 df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
                 trend_4h_up = df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1]
                 
-                # 1h Tetik Zamanı
+                # 1h Tetik
                 ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
                 df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
@@ -185,18 +184,23 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h):
                     continue
                 
-                # Sinyal Kontrolleri (Long ve Short yönlü tarama)
-                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and not skip_long:
+                # Kontrol ve Loglama
+                if trend_4h_up and current_price > ema50_1h and st_bullish_1h:
+                    print(f"*** KUSURSUZ LONG FIRSATI YAKALANDI: {symbol} ***")
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
-                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not skip_short:
+                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h:
+                    print(f"*** KUSURSUZ SHORT FIRSATI YAKALANDI: {symbol} ***")
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
+                else:
+                    print(f"-> {symbol}: Filtrelerden geçemedi (4h Up: {trend_4h_up}, 1h Price>EMA: {current_price > ema50_1h}, ST Bullish: {st_bullish_1h})")
                     
             except Exception as sym_err:
+                print(f"-> {symbol} incelenirken hata: {sym_err}")
                 continue
 
-        # 3. Bulunan Fırsatı Değerlendir ve Emri Gir
+        # 3. İşlem Açma
         if en_iyi_fırsat:
             symbol = en_iyi_fırsat['symbol']
             side = en_iyi_fırsat['side']
@@ -220,9 +224,9 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"TREND TAKİP İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount}")
+                print(f"!!! İŞLEM BAŞARIYLA AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!")
 
-        return jsonify({"durum": "Basarili", "mesaj": "Trailing stop odaklı akıllı analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Konuşkan analiz döngüsü tamamlandı, logları kontrol edin."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}")
