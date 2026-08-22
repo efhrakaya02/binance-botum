@@ -69,11 +69,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Konuşkan Trend Takipçisi Bot Aktif", 200
+    return "Anlık Loglu Trend Takipçisi Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Yeni Analiz Döngüsü Başlatıldı ---")
+    print("--- Yeni Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -84,7 +84,7 @@ def otomatik_analiz():
         # Açık pozisyonları al
         positions = exchange.fetch_positions()
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
-        print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}")
+        print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
         
         # 1. Açık Pozisyonları Yönet (Trailing Stop)
         try:
@@ -126,14 +126,14 @@ def otomatik_analiz():
                             amount=float(p['contracts']), 
                             params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Trailing Stop Tetiklendi! Pozisyon kapatıldı.")
+                        print(f"[{symbol}] Trailing Stop Tetiklendi! Pozisyon kapatıldı.", flush=True)
                     else:
-                        print(f"[{symbol}] Pozisyon takipte. Yön: {side.upper()}, Giriş: {entry_price}, Anlık: {current_price}")
+                        print(f"[{symbol}] Pozisyon takipte. Yön: {side.upper()}, Giriş: {entry_price}, Anlık: {current_price}", flush=True)
         except Exception as pos_err:
-            print(f"Pozisyon yönetimi hatası: {pos_err}")
+            print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
         if len(acik_pozisyonlar) >= MAX_POSITIONS:
-            print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldığı için yeni tarama atlanıyor.")
+            print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldığı için yeni tarama atlanıyor.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": f"Maksimum pozisyon sınırına ulaşıldı."})
 
         # 2. Hacme Göre En İyi 20 Coin'i Seç ve Tara
@@ -143,7 +143,7 @@ def otomatik_analiz():
         sorted_tickers = sorted(usdt_tickers.items(), key=lambda x: x[1].get('quoteVolume', 0) or 0, reverse=True)
         top_symbols = [item[0] for item in sorted_tickers[:20]]
         
-        print(f"Hacmi en yüksek ilk 20 coin tarandı. Detaylı filtreler uygulanıyor...")
+        print(f"Hacmi en yüksek ilk 20 coin tarandı. Detaylı filtreler uygulanıyor...", flush=True)
         en_iyi_fırsat = None
         
         for symbol in top_symbols:
@@ -151,7 +151,7 @@ def otomatik_analiz():
                 time.sleep(0.2)
                 
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
-                    print(f"-> {symbol}: Zaten açık pozisyon var, atlanıyor.")
+                    print(f"-> {symbol}: Zaten açık pozisyon var, atlanıyor.", flush=True)
                     continue
                 
                 # Fonlama Oranı
@@ -162,7 +162,7 @@ def otomatik_analiz():
                 skip_short = funding_rate < -0.0015
                 
                 if skip_long or skip_short:
-                    print(f"-> {symbol}: Fonlama oranına takıldı (Funding: {funding_rate:.6f}), atlanıyor.")
+                    print(f"-> {symbol}: Fonlama oranına takıldı (Funding: {funding_rate:.6f}), atlanıyor.", flush=True)
                     continue
                 
                 # 4h Trend
@@ -186,18 +186,18 @@ def otomatik_analiz():
                 
                 # Kontrol ve Loglama
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h:
-                    print(f"*** KUSURSUZ LONG FIRSATI YAKALANDI: {symbol} ***")
+                    print(f"*** KUSURSUZ LONG FIRSATI YAKALANDI: {symbol} ***", flush=True)
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
                 elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h:
-                    print(f"*** KUSURSUZ SHORT FIRSATI YAKALANDI: {symbol} ***")
+                    print(f"*** KUSURSUZ SHORT FIRSATI YAKALANDI: {symbol} ***", flush=True)
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
                 else:
-                    print(f"-> {symbol}: Filtrelerden geçemedi (4h Up: {trend_4h_up}, 1h Price>EMA: {current_price > ema50_1h}, ST Bullish: {st_bullish_1h})")
+                    print(f"-> {symbol}: Filtrelerden geçemedi (4h Up: {trend_4h_up}, 1h Price>EMA: {current_price > ema50_1h}, ST Bullish: {st_bullish_1h})", flush=True)
                     
             except Exception as sym_err:
-                print(f"-> {symbol} incelenirken hata: {sym_err}")
+                print(f"-> {symbol} incelenirken hata: {sym_err}", flush=True)
                 continue
 
         # 3. İşlem Açma
@@ -224,12 +224,12 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! İŞLEM BAŞARIYLA AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!")
+                print(f"!!! İŞLEM BAŞARIYLA AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Konuşkan analiz döngüsü tamamlandı, logları kontrol edin."})
+        return jsonify({"durum": "Basarili", "mesaj": "Konuşkan ve akışkan analiz döngüsü tamamlandı."})
         
     except Exception as e:
-        print(f"Genel analiz döngüsü hatası: {str(e)}")
+        print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
         return jsonify({"durum": "OK_Koru", "mesaj": "Hata yutuldu, sistem çalışmaya devam ediyor."})
 
 if __name__ == '__main__':
