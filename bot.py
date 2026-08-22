@@ -68,11 +68,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Kesin Çözümlü Momentum Botu Aktif", 200
+    return "Hızlı ve Güvenli Momentum Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Momentum ve Trend Tarama Döngüsü Başlatıldı ---", flush=True)
+    print("--- Hızlı Momentum ve Trend Tarama Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -134,16 +134,21 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Kesin Çözüm: Tüm aktif USDT futures paritelerini doğrudan market üzerinden çekelim
-        all_symbols = [s for s in exchange.symbols if s.endswith('/USDT') and ':' not in s]
-        
+        # 2. Hızlı Toplu Veri Çekme (Tek İstek ile Timeoutsız Çözüm)
+        tickers = exchange.fetch_tickers()
         coin_listesi = []
-        for symbol in all_symbols:
-            try:
-                t = exchange.fetch_ticker(symbol)
-                last_p = t.get('last', 0) or 0
-                open_p = t.get('open', 0) or last_p
+        
+        for symbol, t in tickers.items():
+            if symbol.endswith('/USDT') and ':' not in symbol:
+                last_p = t.get('last') or t.get('close') or 0
+                open_p = t.get('open') or last_p
                 vol = t.get('quoteVolume', 0) or 0
+                
+                # Eğer open veya last verisi sözlükte doğrudan yoksa info kısmından yakalayalım
+                if last_p == 0 and 'info' in t:
+                    last_p = float(t['info'].get('lastPrice', 0))
+                if open_p == 0 and 'info' in t:
+                    open_p = float(t['info'].get('openPrice', 0))
                 
                 if open_p > 0 and last_p > 0:
                     degisim_yuzdesi = ((last_p - open_p) / open_p) * 100
@@ -152,9 +157,6 @@ def otomatik_analiz():
                         'change': degisim_yuzdesi,
                         'volume': vol
                     })
-                time.sleep(0.05) # Rate limit koruması
-            except:
-                continue
         
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         
@@ -166,9 +168,10 @@ def otomatik_analiz():
         
         en_iyi_fırsat = None
         
-        for symbol in target_symbols:
+        # Timeout yaşamamak için havuzdan en fazla ilk 10 tanesini detaylı inceleyelim (en hareketlileri)
+        for symbol in target_symbols[:10]:
             try:
-                time.sleep(0.15)
+                time.sleep(0.1)
                 
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
                     continue
@@ -241,7 +244,7 @@ def otomatik_analiz():
                 exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Havuz başarıyla dolduruldu ve tarama yapıldı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Hızlı tarama tamamlandı, timeout sorunu çözüldü."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
