@@ -68,11 +68,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Gainers/Losers Destekli Momentum Botu Aktif", 200
+    return "Esnek Filtreli Momentum Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Hızlı Momentum ve Trend Tarama Başlatıldı ---", flush=True)
+    print("--- Momentum ve Trend Tarama Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -134,16 +134,17 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Kesin Garantili Dinamik Havuz (Binance 24h Change Oranı İle)
+        # 2. Kesin Çözümlü Esnek Havuz Oluşturma
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
         for symbol, t in tickers.items():
-            if symbol.endswith('/USDT') and ':' not in symbol:
+            # Sadece USDT içeren vadeli kontratları yakalayalım (örn: BTC/USDT)
+            if 'USDT' in symbol:
                 degisim_yuzdesi = 0.0
                 vol = 0.0
                 
-                if 'info' in t:
+                if 'info' in t and t['info'] is not None:
                     degisim_yuzdesi = float(t['info'].get('priceChangePercent', 0) or 0)
                     vol = float(t['info'].get('quoteVolume', 0) or 0)
                 else:
@@ -159,7 +160,12 @@ def otomatik_analiz():
                     'volume': vol
                 })
         
-        # En çok yükselenler ve düşenler olarak sırala
+        # Eğer yukarıdakilerle yine boş kalırsa market listesinden doğrudan tamamla
+        if len(coin_listesi) == 0:
+            for market_symbol in exchange.symbols:
+                if 'USDT' in market_symbol:
+                    coin_listesi.append({'symbol': market_symbol, 'change': 0.0, 'volume': 1.0})
+
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         
         top_gainers = [item['symbol'] for item in coin_listesi[:15]]
@@ -170,7 +176,6 @@ def otomatik_analiz():
         
         en_iyi_fırsat = None
         
-        # Timeout yaşamamak için havuzdan ilk 10 hareketli coini incele
         for symbol in target_symbols[:10]:
             try:
                 time.sleep(0.1)
@@ -246,7 +251,7 @@ def otomatik_analiz():
                 exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Tam tarama hatasız ve hızlı şekilde tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Havuz başarıyla dolduruldu ve tarama yapıldı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
