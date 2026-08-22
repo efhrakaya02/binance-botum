@@ -68,7 +68,7 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Güvenli Momentum Avcısı Bot Aktif", 200
+    return "Garanti Havuzlu Momentum Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
@@ -134,27 +134,29 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Güvenli Dinamik Havuz: Hacmi ve Fiyat Hareketi Olan Coinler
+        # 2. Kesin Çözüm: Tüm Futures USDT çiftlerini doğrudan alıp hacim/değişime göre sırala
         tickers = exchange.fetch_tickers()
-        usdt_tickers = {}
+        coin_listesi = []
         
-        for s, t in tickers.items():
-            if s.endswith('/USDT') and ':' not in s:
-                # Değişim oranını güvenli bir şekilde alalım (bazı ccxt sürümlerinde 'change' veya 'percentage' olabilir)
-                change = t.get('percentage')
-                if change is None and t.get('open') and t.get('last'):
-                    change = ((t['last'] - t['open']) / t['open']) * 100
+        for symbol, t in tickers.items():
+            if symbol.endswith('/USDT') and ':' not in symbol:
+                last_p = t.get('last', 0) or 0
+                open_p = t.get('open', 0) or last_p
+                vol = t.get('quoteVolume', 0) or 0
                 
-                usdt_tickers[s] = {
-                    'percentage': change if change is not None else 0.0,
-                    'quoteVolume': t.get('quoteVolume', 0) or 0
-                }
+                if open_p > 0 and last_p > 0:
+                    degisim_yuzdesi = ((last_p - open_p) / open_p) * 100
+                    coin_listesi.append({
+                        'symbol': symbol,
+                        'change': degisim_yuzdesi,
+                        'volume': vol
+                    })
         
-        # En çok yükselenler ve en çok düşenler olarak sırala
-        sorted_by_change = sorted(usdt_tickers.items(), key=lambda x: x[1]['percentage'], reverse=True)
+        # En çok yükselenler ve en çok düşenler olarak ayırıp birleştirelim
+        coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         
-        top_gainers = [item[0] for item in sorted_by_change[:15]]
-        top_losers = [item[0] for item in sorted_by_change[-15:]]
+        top_gainers = [item['symbol'] for item in coin_listesi[:15]]
+        top_losers = [item['symbol'] for item in coin_listesi[-15:]]
         
         target_symbols = list(set(top_gainers + top_losers))
         print(f"Dinamik Hareketli Havuz Oluşturuldu. İncelenecek coin sayısı: {len(target_symbols)}", flush=True)
@@ -236,7 +238,7 @@ def otomatik_analiz():
                 exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Güvenli Gainers/Losers taraması tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Garanti havuzlu tarama başarıyla tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
