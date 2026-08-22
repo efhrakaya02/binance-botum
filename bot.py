@@ -68,7 +68,7 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Esnek Filtreli Momentum Botu Aktif", 200
+    return "TradFi Filtreli Güvenli Momentum Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
@@ -134,13 +134,13 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Kesin Çözümlü Esnek Havuz Oluşturma
+        # 2. Dinamik Havuz (TradFi ve Ek Sözleşme Gerektirenleri Filtreleyerek)
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
         for symbol, t in tickers.items():
-            # Sadece USDT içeren vadeli kontratları yakalayalım (örn: BTC/USDT)
-            if 'USDT' in symbol:
+            # Sadece saf USDT paritelerini al, ':' içeren (TradFi / Multi-asset vb.) kontratları ele
+            if 'USDT' in symbol and ':' not in symbol:
                 degisim_yuzdesi = 0.0
                 vol = 0.0
                 
@@ -160,12 +160,6 @@ def otomatik_analiz():
                     'volume': vol
                 })
         
-        # Eğer yukarıdakilerle yine boş kalırsa market listesinden doğrudan tamamla
-        if len(coin_listesi) == 0:
-            for market_symbol in exchange.symbols:
-                if 'USDT' in market_symbol:
-                    coin_listesi.append({'symbol': market_symbol, 'change': 0.0, 'volume': 1.0})
-
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         
         top_gainers = [item['symbol'] for item in coin_listesi[:15]]
@@ -251,7 +245,7 @@ def otomatik_analiz():
                 exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Havuz başarıyla dolduruldu ve tarama yapıldı."})
+        return jsonify({"durum": "Basarili", "mesaj": "TradFi filtrelemesiyle tarama hatasız tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
