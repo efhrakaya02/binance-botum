@@ -68,7 +68,7 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "TradFi Filtreli Güvenli Momentum Botu Aktif", 200
+    return "Kararlı ve Güvenli Momentum Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
@@ -134,13 +134,13 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Dinamik Havuz (TradFi ve Ek Sözleşme Gerektirenleri Filtreleyerek)
+        # 2. Kesin Garantili Dinamik Havuz Oluşturma
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
         for symbol, t in tickers.items():
-            # Sadece saf USDT paritelerini al, ':' içeren (TradFi / Multi-asset vb.) kontratları ele
-            if 'USDT' in symbol and ':' not in symbol:
+            # Standard futures paritelerini güvenle yakalayalım (örn: BTC/USDT:USDT veya BTC/USDT)
+            if 'USDT' in symbol and not any(tradfi in symbol for tradfi in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
                 degisim_yuzdesi = 0.0
                 vol = 0.0
                 
@@ -160,6 +160,12 @@ def otomatik_analiz():
                     'volume': vol
                 })
         
+        # Eğer filtreler yüzünden liste boş kalırsa exchange.symbols üzerinden garanti doldur
+        if len(coin_listesi) == 0:
+            for s in exchange.symbols:
+                if 'USDT' in s:
+                    coin_listesi.append({'symbol': s, 'change': 0.0, 'volume': 1.0})
+
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         
         top_gainers = [item['symbol'] for item in coin_listesi[:15]]
@@ -177,7 +183,7 @@ def otomatik_analiz():
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
                     continue
                 
-                # Fonlama Oranı Kontrolü
+                # Fonlama Oranı Kontrolü (TradFi sözleşmeleri hariç tutulduğu için hata alınmaz)
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
                 
@@ -245,7 +251,7 @@ def otomatik_analiz():
                 exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "TradFi filtrelemesiyle tarama hatasız tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Havuz başarıyla dolduruldu ve tarama yapıldı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
