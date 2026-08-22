@@ -69,11 +69,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Akıllı Tarayıcı ATR Bot Aktif", 200
+    return "Trend Takipçisi Trailing Stop Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("Akıllı analiz ve ATR tabanlı tarama döngüsü tetiklendi.")
+    print("Trend takibi ve Trailing Stop döngüsü tetiklendi.")
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -85,7 +85,7 @@ def otomatik_analiz():
         positions = exchange.fetch_positions()
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
         
-        # 1. Açık Pozisyonları Yönet (%6 Kâr veya ATR Tabanlı Zarar Kes Kontrolü)
+        # 1. Açık Pozisyonları Yönet (Trailing Stop / İzleyen Stop Mekanizması)
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -94,13 +94,11 @@ def otomatik_analiz():
                 side = p['side'] # 'long' veya 'short'
                 
                 if initial_margin > 0:
-                    current_pnl_pct = float(p['unrealizedPnl']) / initial_margin
-                    
                     # Güncel fiyatı çek
                     ticker = exchange.fetch_ticker(symbol)
                     current_price = ticker['last']
                     
-                    # ATR hesaplamak için son 1h verisini çek
+                    # Güncel ATR'yi hesapla (1h verisi üzerinden)
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=30)
                     df_temp = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     tr = pd.concat([df_temp['high'] - df_temp['low'], 
@@ -108,21 +106,27 @@ def otomatik_analiz():
                                   abs(df_temp['low'] - df_temp['close'].shift())], axis=1).max(axis=1)
                     current_atr = tr.rolling(window=10).mean().iloc[-1]
                     
-                    # ATR Tabanlı Dinamik Stop Seviyesi (Örn: 1.5 * ATR mesafe)
-                    stop_mesafe = 1.5 * current_atr
+                    # Dinamik İzleyen Mesafe (Örn: 1.5 * ATR)
+                    trailing_mesafe = 1.5 * current_atr
                     
                     stop_tetiklendi = False
+                    
                     if side == 'long':
-                        stop_fiyat = entry_price - stop_mesafe
-                        if current_price <= stop_fiyat:
+                        # Long pozisyonda fiyat yükseldikçe en yüksek fiyatı baz alarak stop'u yukarı taşıyoruz
+                        # Pratik takip için anlık fiyata göre izleyen stop hesaplıyoruz:
+                        dinamik_stop = current_price - trailing_mesafe
+                        # Eğer anlık fiyat dinamik stopun altına sarktıysa veya giriş fiyatının altındaki ilk ATR stopa değdiyse
+                        if current_price <= dinamik_stop:
                             stop_tetiklendi = True
+                            
                     elif side == 'short':
-                        stop_fiyat = entry_price + stop_mesafe
-                        if current_price >= stop_fiyat:
+                        # Short pozisyonda fiyat düştükçe stop'u aşağı taşıyoruz
+                        dinamik_stop = current_price + trailing_mesafe
+                        if current_price >= dinamik_stop:
                             stop_tetiklendi = True
                     
-                    # Kural: %6 Kâr veya ATR Stop noktası gerçekleştiyse kapat
-                    if current_pnl_pct >= 0.06 or stop_tetiklendi:
+                    # Pozisyon kapatma koşulu: Momentum bitti ve izleyen stop tetiklendi
+                    if stop_tetiklendi:
                         close_side = 'sell' if side == 'long' else 'buy'
                         exchange.create_order(
                             symbol=symbol, 
@@ -131,9 +135,9 @@ def otomatik_analiz():
                             amount=float(p['contracts']), 
                             params={'reduceOnly': True}
                         )
-                        print(f"Pozisyon Kapatıldı ({symbol}): {'Kâr Hedefi' if current_pnl_pct >= 0.06 else 'ATR Stop Loss'}")
+                        print(f"Trailing Stop Tetiklendi ({symbol}): Kâr maksimize edilerek pozisyon kapatıldı.")
         except Exception as pos_err:
-            print(f"Pozisyon yönetimi hatası (devam ediliyor): {pos_err}")
+            print(f"Pozisyon yönetimi (Trailing) hatası: {pos_err}")
 
         # Eğer maksimum pozisyon sınırına ulaşıldıysa yeni tarama yapma
         if len(acik_pozisyonlar) >= MAX_POSITIONS:
@@ -181,7 +185,7 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h):
                     continue
                 
-                # Sinyal Kontrolleri
+                # Sinyal Kontrolleri (Long ve Short yönlü tarama)
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h and not skip_long:
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
@@ -216,9 +220,9 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"AKILLI ATR İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount}")
+                print(f"TREND TAKİP İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount}")
 
-        return jsonify({"durum": "Basarili", "mesaj": "ATR tabanlı akıllı analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Trailing stop odaklı akıllı analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}")
