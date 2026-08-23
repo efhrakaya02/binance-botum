@@ -20,6 +20,13 @@ def get_exchange():
         'options': {'defaultType': 'future'}
     })
 
+def hesapla_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def hesapla_supertrend(df, period=10, multiplier=3):
     high = df['high']
     low = df['low']
@@ -68,11 +75,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Gelişmiş Kademeli Kâr Al ve Trend Kontrollü Bot Aktif", 200
+    return "RSI, Hacim Onaylı ve Kademeli Stop Kilitli Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Akıllı Pozisyon Yönetimi ve Tarama Döngüsü Başlatıldı ---", flush=True)
+    print("--- Gelişmiş Filtreli Tarama ve Kademeli Stop Yönetimi Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -84,7 +91,7 @@ def otomatik_analiz():
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
         print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
         
-        # 1. Gelişmiş Pozisyon Yönetimi (Trend Bozulması + Kademeli Kâr Al + Borsa Stopu)
+        # 1. Kademeli Stop Yükseltme ve Trend Yönetimi
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -97,13 +104,12 @@ def otomatik_analiz():
                     ticker = exchange.fetch_ticker(symbol)
                     current_price = ticker['last']
                     
-                    # Anlık ROI / Kâr yüzdesi hesapla
                     if side == 'long':
                         kar_yuzdesi = ((current_price - entry_price) / entry_price) * 100
                     else:
                         kar_yuzdesi = ((entry_price - current_price) / entry_price) * 100
                         
-                    # 1h Trend ve SuperTrend Durumunu Kontrol Et
+                    # Trend Kontrolü (1h SuperTrend ve EMA50)
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                     df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
@@ -120,31 +126,43 @@ def otomatik_analiz():
                         
                     close_side = 'sell' if side == 'long' else 'buy'
                     
-                    # Durum A: Trend tersine döndüyse kârın/zararın tamamıyla çık
                     if trend_tersine_dondu:
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Trend tersine döndü! Pozisyon tamamen kapatıldı. Kâr/Zarar Yüzdesi: %{kar_yuzdesi:.2f}", flush=True)
+                        print(f"[{symbol}] Trend tersine döndü! Pozisyon kapatıldı. Kâr/Zarar: %{kar_yuzdesi:.2f}", flush=True)
                         continue
                         
-                    # Durum B: Kademeli Kâr Al (%10 ve sonraki her %5 artışta yarısını kapat)
-                    # Not: Bu mantığı takip edebilmek için basitçe kâr eşiklerini kontrol ediyoruz.
-                    # Örneğin kar %10'u geçtiyse ve henüz bu kademe alınmadıysa yarısını kapat.
-                    # (Pratikte miktar kontrolüyle entegre edilebilir, şimdilik temel eşik tetikleyicisi:)
-                    if kar_yuzdesi >= 10.0 and contracts > 0.001:
-                        yari_miktar = round(contracts / 2, 3)
-                        if yari_miktar > 0:
-                            try:
-                                exchange.create_order(
-                                    symbol=symbol, type='market', side=close_side, amount=yari_miktar, params={'reduceOnly': True}
-                                )
-                                print(f"[{symbol}] Kâr hedefi yakalandı (%{kar_yuzdesi:.2f}). Miktar yarısı (%50) cebe atıldı: {yari_miktar}", flush=True)
-                            except Exception as partial_err:
-                                print(f"Kademeli kâr al hatası: {partial_err}", flush=True)
-                                
+                    # Kademeli Stop Güncelleme Mantığı (Her %5 artışta stopu karlı noktaya sabitle)
+                    # Not: Borsa emirleri güncellenirken önce açık stop emirleri iptal edilip yeni stop fiyatı girilir.
+                    try:
+                        hedef_stop_fiyat = None
+                        if kar_yuzdesi >= 20:
+                            hedef_stop_fiyat = entry_price * (1.15 if side == 'long' else 0.85) # %15 kâr garantisi
+                        elif kar_yuzdesi >= 15:
+                            hedef_stop_fiyat = entry_price * (1.10 if side == 'long' else 0.90) # %10 kâr garantisi
+                        elif kar_yuzdesi >= 10:
+                            hedef_stop_fiyat = entry_price * (1.05 if side == 'long' else 0.95) # %5 kâr garantisi
+                        elif kar_yuzdesi >= 5:
+                            hedef_stop_fiyat = entry_price # Başa baş (Breakeven)
+                            
+                        if hedef_stop_fiyat is not None:
+                            # Açık emirleri temizle ve yeni stop emri koy
+                            open_orders = exchange.fetch_open_orders(symbol)
+                            for o in open_orders:
+                                if o['type'] == 'STOP_MARKET':
+                                    exchange.cancel_order(o['id'], symbol)
+                                    
+                            stop_params = {
+                                'stopPrice': float(exchange.price_to_precision(symbol, hedef_stop_fiyat)),
+                                'reduceOnly': True
+                            }
+                            exchange.create_order(symbol, 'STOP_MARKET', close_side, contracts, params=stop_params)
+                            print(f"[{symbol}] Kademeli Stop Güncellendi! Kâr: %{kar_yuzdesi:.2f}, Yeni Stop: {hedef_stop_fiyat:.4f}", flush=True)
+                    except Exception as stop_up_err:
+                        print(f"Kademeli stop güncelleme hatası: {stop_up_err}", flush=True)
+                        
                     print(f"[{symbol}] Pozisyon takipte ({side.upper()}). Giriş: {entry_price}, Anlık: {current_price}, Kâr: %{kar_yuzdesi:.2f}", flush=True)
-                    
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
@@ -152,7 +170,7 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Dinamik Havuz Oluşturma
+        # 2. Dinamik Havuz ve Filtreleme (RSI + Gerçek Hacim Onayı)
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
@@ -190,18 +208,32 @@ def otomatik_analiz():
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
                     continue
                 
+                # Fonlama Oranı Kontrolü
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
                 if funding_rate > 0.0015 or funding_rate < -0.0015:
                     continue
                 
+                # OHLCV ve Hacim / RSI Kontrolleri için 1h veri çek
+                ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
+                df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                
+                # Gerçek Hacim Kontrolü: Son 1 saatlik hacim, son 24 saatlik ortalama saatlik hacmin 1.5 katı mı?
+                ortalama_hacim = df_1h['volume'].mean()
+                son_hacim = df_1h['volume'].iloc[-1]
+                if son_hacim < (ortalama_hacim * 1.5):
+                    continue # Yeterli hacim patlaması yoksa elenir
+                
+                # RSI Hesaplama ve Kontrolü
+                df_1h['rsi'] = hesapla_rsi(df_1h['close'], period=14)
+                current_rsi = df_1h['rsi'].iloc[-1]
+                
+                # 4h Trend Kontrolü
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
                 df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
                 trend_4h_up = df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1]
                 
-                ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=100)
-                df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
                 df_1h = hesapla_supertrend(df_1h, period=10, multiplier=3)
                 
@@ -209,19 +241,21 @@ def otomatik_analiz():
                 ema50_1h = df_1h['ema50'].iloc[-1]
                 st_bullish_1h = df_1h['supertrend'].iloc[-1]
                 
-                if pd.isna(ema50_1h):
+                if pd.isna(ema50_1h) or pd.isna(current_rsi):
                     continue
                 
-                if trend_4h_up and current_price > ema50_1h and st_bullish_1h:
+                # Long Sinyal ve RSI Bandı (50 - 70 arası)
+                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and (50 <= current_rsi <= 70):
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
-                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h:
+                # Short Sinyal ve RSI Bandı (30 - 50 arası)
+                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and (30 <= current_rsi <= 50):
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
             except Exception:
                 continue
 
-        # 3. İşlem Emri ve Borsa Tabanlı Stop-Loss Girişi
+        # 3. İşlem Emri ve İlk Güvenlik Stopu Girişi
         if en_iyi_fırsat:
             symbol = en_iyi_fırsat['symbol']
             side = en_iyi_fırsat['side']
@@ -242,35 +276,28 @@ def otomatik_analiz():
             max_aktif_limit = total_balance * 0.5
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
-                # Ana Pozisyon Emri (Market)
-                order = exchange.create_order(symbol, 'market', side, amount)
+                exchange.create_order(symbol, 'market', side, amount)
                 print(f"!!! MOMENTUM İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
                 
-                # Borsa Tabanlı Güvence Stop-Loss Emri (Sunucu Çökmesine Karşı)
                 try:
-                    # ATR bazlı %3-4 mesafede borsa stopu koyalım
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
                     df_s = pd.DataFrame(ohlcv_stop, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     tr_s = pd.concat([df_s['high'] - df_s['low'], abs(df_s['high'] - df_s['close'].shift()), abs(df_s['low'] - df_s['close'].shift())], axis=1).max(axis=1)
                     atr_val = tr_s.rolling(window=10).mean().iloc[-1]
                     
                     stop_side = 'sell' if side == 'buy' else 'buy'
-                    if side == 'buy':
-                        stop_price = current_price - (2.0 * atr_val)
-                    else:
-                        stop_price = current_price + (2.0 * atr_val)
+                    stop_price = current_price - (2.0 * atr_val) if side == 'buy' else current_price + (2.0 * atr_val)
                         
-                    # Binance stopMarket emri parametreleri
                     stop_params = {
                         'stopPrice': float(exchange.price_to_precision(symbol, stop_price)),
                         'reduceOnly': True
                     }
                     exchange.create_order(symbol, 'STOP_MARKET', stop_side, amount, params=stop_params)
-                    print(f"[{symbol}] Borsa tabanlı güvenlik stop emri yerleştirildi. Stop Fiyatı: {stop_price:.4f}", flush=True)
+                    print(f"[{symbol}] Güvenlik stop emri yerleştirildi. Stop Fiyatı: {stop_price:.4f}", flush=True)
                 except Exception as borsa_stop_err:
-                    print(f"Borsa stop emri oluşturulurken hata (ana işlem devam ediyor): {borsa_stop_err}", flush=True)
+                    print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Akıllı döngü ve borsa stopları başarıyla işlendi."})
+        return jsonify({"durum": "Basarili", "mesaj": "Gelişmiş RSI, hacim ve kademeli stop döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
