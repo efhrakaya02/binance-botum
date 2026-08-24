@@ -110,7 +110,6 @@ def otomatik_analiz():
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
         print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
         
-        # Aktif olmayan pozisyonları hafızadan temizle
         aktif_semboller = [p['symbol'] for p in acik_pozisyonlar]
         for s in list(pozisyon_en_yuksek_kar.keys()):
             if s not in aktif_semboller:
@@ -136,23 +135,21 @@ def otomatik_analiz():
                         
                     close_side = 'sell' if side == 'long' else 'buy'
                     
-                    # --- YENİ KURAL: Zirveden %5 veya daha fazla geri çekilme ve düşüş devam ediyorsa kapat ---
+                    # Zirveden %5 veya daha fazla geri çekilme koruması
                     if symbol not in pozisyon_en_yuksek_kar:
                         pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi
                     else:
                         if kar_yuzdesi > pozisyon_en_yuksek_kar[symbol]:
-                            pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi # Yeni zirveyi kaydet
+                            pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi
                             
                     en_yuksek_kar = pozisyon_en_yuksek_kar[symbol]
                     
-                    # Eğer kâr en az %5'i görmüşse ve zirveden itibaren %5 veya daha fazla gerilediyse
                     if en_yuksek_kar >= 5.0 and (en_yuksek_kar - kar_yuzdesi >= 5.0):
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
                         print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Anlık kâr: %{kar_yuzdesi:.2f}. Pozisyon kârla kapatıldı.", flush=True)
                         continue
-                    --------------------------------------------------------------------------------
                     
                     # Teknik Trend Kontrolleri
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
@@ -211,7 +208,7 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Dinamik Havuz ve Formasyon / Hacim Filtreleri (Aynı kalıyor)
+        # 2. Dinamik Havuz ve Formasyon / Hacim Filtreleri
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
@@ -259,7 +256,7 @@ def otomatik_analiz():
                 
                 ortalama_hacim = df_1h['volume'].mean()
                 son_hacim = df_1h['volume'].iloc[-1]
-                if son_hacim < (ortalama_1h := ortalama_hacim * 1.5):
+                if son_hacim < (ortalama_hacim * 1.5):
                     continue
                 
                 df_1h['candle_size'] = abs(df_1h['close'] - df_1h['open'])
