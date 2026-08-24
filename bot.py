@@ -27,16 +27,30 @@ def hesapla_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def hesapla_bollinger_ve_sikisma(df, period=20, std_dev=2):
-    df['middle_band'] = df['close'].rolling(window=period).mean()
-    rolling_std = df['close'].rolling(window=period).std()
-    df['upper_band'] = df['middle_band'] + (std_dev * rolling_std)
-    df['lower_band'] = df['middle_band'] - (std_dev * rolling_std)
-    
-    # Bollinger Band Genişliği (Bandwidth)
+def hesapla_obv(close, volume):
+    obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    return obv
+
+def formasyon_ve_sikisma_tara(df):
+    """
+    Bayrak (Flag) ve Çanak-Kulp (Cup & Handle) yapılarına benzer 
+    fiyat sıkışması ve hacim/OBV uyumunu tarayan fonksiyon.
+    """
+    # Bollinger Bandı Sıkışması
+    df['middle_band'] = df['close'].rolling(window=20).mean()
+    rolling_std = df['close'].rolling(window=20).std()
+    df['upper_band'] = df['middle_band'] + (2 * rolling_std)
+    df['lower_band'] = df['middle_band'] - (2 * rolling_std)
     df['bandwidth'] = (df['upper_band'] - df['lower_band']) / df['middle_band']
-    # Sıkışma Kontrolü: Band genişliği son 50 mumun ortalamasının altındaysa sıkışma var demektir
+    
+    # Sıkışma (Daralma) kontrolü
     df['squeeze'] = df['bandwidth'] < df['bandwidth'].rolling(window=50).mean()
+    
+    # OBV (Denge Hacmi) Trend Teyidi
+    df['obv'] = hesapla_obv(df['close'], df['volume'])
+    df['obv_ma'] = df['obv'].rolling(window=10).mean()
+    df['obv_trend'] = df['obv'] > df['obv_ma']
+    
     return df
 
 def hesapla_supertrend(df, period=10, multiplier=3):
@@ -87,11 +101,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Sıkışma, Mum Boyu ve Daraltılmış RSI Filtreli Bot Aktif", 200
+    return "Formasyon, OBV ve Kademeli Stop Teyitli Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Erken Patlama ve Kademeli Stop Yönetimi Başlatıldı ---", flush=True)
+    print("--- Formasyon Destekli Akıllı Tarama ve Pozisyon Yönetimi Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -178,7 +192,7 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Dinamik Havuz ve Gelişmiş Erken Patlama Filtreleri
+        # 2. Dinamik Havuz ve Formasyon / Hacim Filtreleri
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
@@ -224,27 +238,26 @@ def otomatik_analiz():
                 ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
                 df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
-                # A. Gerçek Hacim Kontrolü (> 1.5x)
+                # A. Hacim ve Tükeniş Mum Filtresi
                 ortalama_hacim = df_1h['volume'].mean()
                 son_hacim = df_1h['volume'].iloc[-1]
                 if son_hacim < (ortalama_hacim * 1.5):
                     continue
                 
-                # B. Mum Boyu Kontrolü (Devasa/Tükeniş mumu filtresi)
                 df_1h['candle_size'] = abs(df_1h['close'] - df_1h['open'])
                 avg_candle_size = df_1h['candle_size'].rolling(window=15).mean().iloc[-1]
-                last_candle_size = df_1h['candle_size'].iloc[-1]
-                if last_candle_size > (avg_candle_size * 2.5):
-                    continue # Mum boyu ortalamanın 2.5 katından büyükse (zaten patlamışsa) es geç
+                if df_1h['candle_size'].iloc[-1] > (avg_candle_size * 2.5):
+                    continue 
                 
-                # C. Bollinger Sıkışması ve RSI Kontrolleri
-                df_1h = hesapla_bollinger_ve_sikisma(df_1h, period=20)
-                is_squeezing = df_1h['squeeze'].iloc[-1]
+                # B. Formasyon ve Sıkışma / OBV Teyidi
+                df_1h = formasyon_ve_sikisma_tara(df_1h)
+                obv_onay = df_1h['obv_trend'].iloc[-1]
                 
+                # C. Daraltılmış RSI Bandı (Long: 50-60, Short: 40-50)
                 df_1h['rsi'] = hesapla_rsi(df_1h['close'], period=14)
                 current_rsi = df_1h['rsi'].iloc[-1]
                 
-                # D. 4h ve 1h Trend Kontrolleri
+                # D. Trend Teyitleri (4h EMA50 ve 1h SuperTrend)
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
                 df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
@@ -260,12 +273,12 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h) or pd.isna(current_rsi):
                     continue
                 
-                # Long Sinyal: Sıkışma veya erken momentum aşaması + Daraltılmış RSI (50 - 60 arası)
-                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and (50 <= current_rsi <= 60):
+                # Long Sinyal: Trend + OBV Hacim Teyidi + RSI (50-60)
+                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and obv_onay and (50 <= current_rsi <= 60):
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
-                # Short Sinyal: Sıkışma veya erken düşüş aşaması + Daraltılmış RSI (40 - 50 arası)
-                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and (40 <= current_rsi <= 50):
+                # Short Sinyal: Trend + OBV Teyidi + RSI (40-50)
+                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not obv_onay and (40 <= current_rsi <= 50):
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
             except Exception:
@@ -293,7 +306,7 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! ERKEN PATLAMA İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
+                print(f"!!! FORMASYON ONAYLI İŞLEM AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -313,7 +326,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Erken patlama filtreleri ve güncellenmiş RSI döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Formasyon ve OBV destekli analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
