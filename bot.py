@@ -10,7 +10,7 @@ app = Flask(__name__)
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
-MAX_POSITIONS = 3  # Maksimum pozisyon sınırı 3'e çıkarıldı
+MAX_POSITIONS = 3  
 
 pozisyon_en_yuksek_kar = {}
 
@@ -93,11 +93,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Maks 3 Pozisyon ve Zirve Korumalı Bot Aktif", 200
+    return "Isolated Mod, Dinamik Kaldıraç (3x-10x) ve Zirve Korumalı Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- 3 Pozisyon Limitli Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- Isolated ve Dinamik Kaldıraçlı Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -284,11 +284,27 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h) or pd.isna(current_rsi):
                     continue
                 
+                # Kalite Puanı Hesaplama (Analiz Kalitesine Göre Kaldıraç Tayini İçin)
+                kalite_puani = 0
+                
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h and obv_onay and (50 <= current_rsi <= 60):
-                    en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
+                    # Long Sinyal Kalite Kriterleri
+                    kalite_puani += 1 # Temel şart sağlandı
+                    if current_rsi >= 53 and current_rsi <= 57: kalite_puani += 1 # Kusursuz RSI bölgesi
+                    if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1 # Güçlü hacim patlaması
+                    if df_1h['squeeze'].iloc[-1]: kalite_puani += 1 # Bollinger sıkışmasından çıkış
+                    
+                    en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': kalite_puani}
                     break
+                    
                 elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not obv_onay and (40 <= current_rsi <= 50):
-                    en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
+                    # Short Sinyal Kalite Kriterleri
+                    kalite_puani += 1
+                    if current_rsi >= 43 and current_rsi <= 47: kalite_puani += 1
+                    if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1
+                    if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
+                    
+                    en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price, 'score': kalite_puani}
                     break
             except Exception:
                 continue
@@ -297,7 +313,32 @@ def otomatik_analiz():
             symbol = en_iyi_fırsat['symbol']
             side = en_iyi_fırsat['side']
             current_price = en_iyi_fırsat['price']
+            score = en_iyi_fırsat['score']
             
+            # Kalite Puanına Göre 3x ile 10x Arası Kaldıraç Belirleme
+            # Puan 1-2 ise 3x-5x, 3 ise 7x, 4 ise 10x
+            if score >= 4:
+                hesaplanan_kaldirac = 10
+            elif score == 3:
+                hesaplanan_kaldirac = 7
+            elif score == 2:
+                hesaplanan_kaldirac = 5
+            else:
+                hesaplanan_kaldirac = 3
+                
+            try:
+                # Margin Modunu ISOLATED yap
+                exchange.set_margin_mode('isolated', symbol)
+            except Exception as margin_err:
+                print(f"[{symbol}] Margin modu zaten isolated veya ayarlanamadı: {margin_err}", flush=True)
+                
+            try:
+                # Dinamik Kaldıracı Ayarla
+                exchange.set_leverage(hesaplanan_kaldirac, symbol)
+                print(f"[{symbol}] Kaldıraç başarıyla ayarlandı: {hesaplanan_kaldirac}x (Kalite Puanı: {score})", flush=True)
+            except Exception as lev_err:
+                print(f"[{symbol}] Kaldıraç ayarlama hatası: {lev_err}", flush=True)
+
             market_data = exchange.load_markets()
             market = market_data.get(symbol, {})
             
@@ -310,11 +351,11 @@ def otomatik_analiz():
             amount = max(round(raw_amount, precision), min_amount)
             
             toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
-            max_aktif_limit = total_balance * 0.6  # 3 pozisyon için bütçe sınırı esnetildi
+            max_aktif_limit = total_balance * 0.6
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! 3. POZİSYON LİMİTİYLE YENİ İŞLEM AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
+                print(f"!!! ISOLATED İŞLEM AÇILDI: {symbol} | Yön: {side.upper()} | Kaldıraç: {hesaplanan_kaldirac}x | Miktar: {amount} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -334,7 +375,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "3 Pozisyon limitli analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Isolated ve dinamik kaldıraçlı analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
