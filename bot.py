@@ -12,6 +12,9 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
 MAX_POSITIONS = 2  
 
+# Pozisyonların anlık maksimum kâr yüzdelerini hafızada tutmak için global sözlük
+pozisyon_en_yuksek_kar = {}
+
 def get_exchange():
     return ccxt.binance({
         'apiKey': API_KEY,
@@ -32,25 +35,15 @@ def hesapla_obv(close, volume):
     return obv
 
 def formasyon_ve_sikisma_tara(df):
-    """
-    Bayrak (Flag) ve Çanak-Kulp (Cup & Handle) yapılarına benzer 
-    fiyat sıkışması ve hacim/OBV uyumunu tarayan fonksiyon.
-    """
-    # Bollinger Bandı Sıkışması
     df['middle_band'] = df['close'].rolling(window=20).mean()
     rolling_std = df['close'].rolling(window=20).std()
     df['upper_band'] = df['middle_band'] + (2 * rolling_std)
     df['lower_band'] = df['middle_band'] - (2 * rolling_std)
     df['bandwidth'] = (df['upper_band'] - df['lower_band']) / df['middle_band']
-    
-    # Sıkışma (Daralma) kontrolü
     df['squeeze'] = df['bandwidth'] < df['bandwidth'].rolling(window=50).mean()
-    
-    # OBV (Denge Hacmi) Trend Teyidi
     df['obv'] = hesapla_obv(df['close'], df['volume'])
     df['obv_ma'] = df['obv'].rolling(window=10).mean()
     df['obv_trend'] = df['obv'] > df['obv_ma']
-    
     return df
 
 def hesapla_supertrend(df, period=10, multiplier=3):
@@ -101,11 +94,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Formasyon, OBV ve Kademeli Stop Teyitli Bot Aktif", 200
+    return "Zirveden %5 Geri Çekilme Korumalı Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Formasyon Destekli Akıllı Tarama ve Pozisyon Yönetimi Başlatıldı ---", flush=True)
+    print("--- Zirve Kâr Koruma ve Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -117,7 +110,13 @@ def otomatik_analiz():
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
         print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
         
-        # 1. Kademeli Stop Yükseltme ve Trend Yönetimi
+        # Aktif olmayan pozisyonları hafızadan temizle
+        aktif_semboller = [p['symbol'] for p in acik_pozisyonlar]
+        for s in list(pozisyon_en_yuksek_kar.keys()):
+            if s not in aktif_semboller:
+                del pozisyon_en_yuksek_kar[s]
+
+        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -135,6 +134,27 @@ def otomatik_analiz():
                     else:
                         kar_yuzdesi = ((entry_price - current_price) / entry_price) * 100
                         
+                    close_side = 'sell' if side == 'long' else 'buy'
+                    
+                    # --- YENİ KURAL: Zirveden %5 veya daha fazla geri çekilme ve düşüş devam ediyorsa kapat ---
+                    if symbol not in pozisyon_en_yuksek_kar:
+                        pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi
+                    else:
+                        if kar_yuzdesi > pozisyon_en_yuksek_kar[symbol]:
+                            pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi # Yeni zirveyi kaydet
+                            
+                    en_yuksek_kar = pozisyon_en_yuksek_kar[symbol]
+                    
+                    # Eğer kâr en az %5'i görmüşse ve zirveden itibaren %5 veya daha fazla gerilediyse
+                    if en_yuksek_kar >= 5.0 and (en_yuksek_kar - kar_yuzdesi >= 5.0):
+                        exchange.create_order(
+                            symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
+                        )
+                        print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Anlık kâr: %{kar_yuzdesi:.2f}. Pozisyon kârla kapatıldı.", flush=True)
+                        continue
+                    --------------------------------------------------------------------------------
+                    
+                    # Teknik Trend Kontrolleri
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                     df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
@@ -149,8 +169,6 @@ def otomatik_analiz():
                     elif side == 'short' and (st_bullish or current_price > ema50_val):
                         trend_tersine_dondu = True
                         
-                    close_side = 'sell' if side == 'long' else 'buy'
-                    
                     if trend_tersine_dondu:
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
@@ -158,6 +176,7 @@ def otomatik_analiz():
                         print(f"[{symbol}] Trend tersine döndü! Pozisyon kapatıldı. Kâr/Zarar: %{kar_yuzdesi:.2f}", flush=True)
                         continue
                         
+                    # Kademeli Stop Güncellemeleri
                     try:
                         hedef_stop_fiyat = None
                         if kar_yuzdesi >= 20:
@@ -184,7 +203,7 @@ def otomatik_analiz():
                     except Exception as stop_up_err:
                         print(f"Kademeli stop güncelleme hatası: {stop_up_err}", flush=True)
                         
-                    print(f"[{symbol}] Pozisyon takipte ({side.upper()}). Giriş: {entry_price}, Anlık: {current_price}, Kâr: %{kar_yuzdesi:.2f}", flush=True)
+                    print(f"[{symbol}] Pozisyon takipte ({side.upper()}). Giriş: {entry_price}, Anlık: {current_price}, Kâr: %{kar_yuzdesi:.2f} (En Yüksek: %{en_yuksek_kar:.2f})", flush=True)
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
@@ -192,7 +211,7 @@ def otomatik_analiz():
             print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
 
-        # 2. Dinamik Havuz ve Formasyon / Hacim Filtreleri
+        # 2. Dinamik Havuz ve Formasyon / Hacim Filtreleri (Aynı kalıyor)
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
@@ -238,10 +257,9 @@ def otomatik_analiz():
                 ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
                 df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 
-                # A. Hacim ve Tükeniş Mum Filtresi
                 ortalama_hacim = df_1h['volume'].mean()
                 son_hacim = df_1h['volume'].iloc[-1]
-                if son_hacim < (ortalama_hacim * 1.5):
+                if son_hacim < (ortalama_1h := ortalama_hacim * 1.5):
                     continue
                 
                 df_1h['candle_size'] = abs(df_1h['close'] - df_1h['open'])
@@ -249,15 +267,12 @@ def otomatik_analiz():
                 if df_1h['candle_size'].iloc[-1] > (avg_candle_size * 2.5):
                     continue 
                 
-                # B. Formasyon ve Sıkışma / OBV Teyidi
                 df_1h = formasyon_ve_sikisma_tara(df_1h)
                 obv_onay = df_1h['obv_trend'].iloc[-1]
                 
-                # C. Daraltılmış RSI Bandı (Long: 50-60, Short: 40-50)
                 df_1h['rsi'] = hesapla_rsi(df_1h['close'], period=14)
                 current_rsi = df_1h['rsi'].iloc[-1]
                 
-                # D. Trend Teyitleri (4h EMA50 ve 1h SuperTrend)
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
                 df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
@@ -273,18 +288,15 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h) or pd.isna(current_rsi):
                     continue
                 
-                # Long Sinyal: Trend + OBV Hacim Teyidi + RSI (50-60)
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h and obv_onay and (50 <= current_rsi <= 60):
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price}
                     break
-                # Short Sinyal: Trend + OBV Teyidi + RSI (40-50)
                 elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not obv_onay and (40 <= current_rsi <= 50):
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price}
                     break
             except Exception:
                 continue
 
-        # 3. İşlem Emri ve İlk Güvenlik Stopu Girişi
         if en_iyi_fırsat:
             symbol = en_iyi_fırsat['symbol']
             side = en_iyi_fırsat['side']
@@ -306,7 +318,7 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! FORMASYON ONAYLI İŞLEM AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
+                print(f"!!! YENİ FORMASYON İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -326,7 +338,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Formasyon ve OBV destekli analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Zirve kar koruma ve analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
