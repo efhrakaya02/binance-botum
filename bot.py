@@ -10,9 +10,8 @@ app = Flask(__name__)
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
-MAX_POSITIONS = 2  
+MAX_POSITIONS = 3  # Maksimum pozisyon sınırı 3'e çıkarıldı
 
-# Pozisyonların anlık maksimum kâr yüzdelerini hafızada tutmak için global sözlük
 pozisyon_en_yuksek_kar = {}
 
 def get_exchange():
@@ -94,11 +93,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Zirveden %5 Geri Çekilme Korumalı Bot Aktif", 200
+    return "Maks 3 Pozisyon ve Zirve Korumalı Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Zirve Kâr Koruma ve Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- 3 Pozisyon Limitli Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -311,11 +310,11 @@ def otomatik_analiz():
             amount = max(round(raw_amount, precision), min_amount)
             
             toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
-            max_aktif_limit = total_balance * 0.5
+            max_aktif_limit = total_balance * 0.6  # 3 pozisyon için bütçe sınırı esnetildi
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! YENİ FORMASYON İŞLEMİ AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
+                print(f"!!! 3. POZİSYON LİMİTİYLE YENİ İŞLEM AÇILDI: {symbol} - Yön: {side.upper()} - Miktar: {amount} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -335,7 +334,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Zirve kar koruma ve analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "3 Pozisyon limitli analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
