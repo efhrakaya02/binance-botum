@@ -12,6 +12,13 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
 MAX_POSITIONS = 3  
 
+# VUR-KAÇ (SCALP) PARAMETRELERI
+SCALP_ENABLED = True
+SCALP_MARGIN_SIZE = 15.0  # 15 USD sermaye
+SCALP_LEVERAGE = 5
+SCALP_TARGET_PROFIT_PCT = 1.0  # Fiyatta %1 kâr (5x ile %5 kazanç)
+SCALP_STOP_LOSS_PCT = 0.5      # Fiyatta %0,5 zararda stop (5x ile %2,5 zarar)
+
 pozisyon_en_yuksek_kar = {}
 
 def get_exchange():
@@ -93,11 +100,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Isolated Mod, Dinamik Kaldıraç (3x-10x) ve Zirve Korumalı Bot Aktif", 200
+    return "Ana Fırsat Modülü + Vur-Kaç (5x Scalp) Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Isolated ve Dinamik Kaldıraçlı Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -114,7 +121,7 @@ def otomatik_analiz():
             if s not in aktif_semboller:
                 del pozisyon_en_yuksek_kar[s]
 
-        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi
+        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi (Ana Pozisyonlar İçin)
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -122,6 +129,10 @@ def otomatik_analiz():
                 entry_price = float(p['entryPrice'])
                 side = p['side']
                 contracts = float(p['contracts'])
+                
+                # Scalp (Vur-Kaç) pozisyonlarını özel olarak yönetmek için sembol ya da miktar takibi yapabiliriz
+                # Eğer bu pozisyon 15 USD scalp sermayesine yakınsa ayrı kural uygulayalım
+                is_scalp_position = (abs(initial_margin - SCALP_MARGIN_SIZE) < 3.0)
                 
                 if initial_margin > 0 and entry_price > 0:
                     ticker = exchange.fetch_ticker(symbol)
@@ -134,7 +145,25 @@ def otomatik_analiz():
                         
                     close_side = 'sell' if side == 'long' else 'buy'
                     
-                    # Zirveden %5 veya daha fazla geri çekilme koruması
+                    # --- VUR-KAÇ (SCALP) POZİSYON YÖNETİMİ (%1 Kâr veya %0.5 Stop) ---
+                    if is_scalp_position:
+                        if kar_yuzdesi >= SCALP_TARGET_PROFIT_PCT:
+                            exchange.create_order(
+                                symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
+                            )
+                            print(f"[SCALP] {symbol} hedef kâr oranına (%{SCALP_TARGET_PROFIT_PCT}) ulaştı! Pozisyon kârla kapatıldı. Kâr: %{kar_yuzdesi:.2f}", flush=True)
+                            continue
+                        elif kar_yuzdesi <= -SCALP_STOP_LOSS_PCT:
+                            exchange.create_order(
+                                symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
+                            )
+                            print(f"[SCALP] {symbol} stop loss sınırına (%-{SCALP_STOP_LOSS_PCT}) ulaştı! Pozisyon kapatıldı. Zarar: %{kar_yuzdesi:.2f}", flush=True)
+                            continue
+                        else:
+                            print(f"[SCALP Takipte] {symbol} | Yön: {side.upper()} | Anlık Kâr: %{kar_yuzdesi:.2f}", flush=True)
+                            continue # Ana trend kontrollerine sokma, bu bir scalp pozisyonudur
+
+                    # --- ANA TREND POZİSYON YÖNETİMİ ---
                     if symbol not in pozisyon_en_yuksek_kar:
                         pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi
                     else:
@@ -147,10 +176,9 @@ def otomatik_analiz():
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Anlık kâr: %{kar_yuzdesi:.2f}. Pozisyon kârla kapatıldı.", flush=True)
+                        print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Anlık kâr: %{kar_yuzdesi:.2f}. Kapatıldı.", flush=True)
                         continue
                     
-                    # Teknik Trend Kontrolleri
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                     df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
@@ -172,7 +200,6 @@ def otomatik_analiz():
                         print(f"[{symbol}] Trend tersine döndü! Pozisyon kapatıldı. Kâr/Zarar: %{kar_yuzdesi:.2f}", flush=True)
                         continue
                         
-                    # Kademeli Stop Güncellemeleri
                     try:
                         hedef_stop_fiyat = None
                         if kar_yuzdesi >= 20:
@@ -195,22 +222,90 @@ def otomatik_analiz():
                                 'reduceOnly': True
                             }
                             exchange.create_order(symbol, 'STOP_MARKET', close_side, contracts, params=stop_params)
-                            print(f"[{symbol}] Kademeli Stop Güncellendi! Kâr: %{kar_yuzdesi:.2f}, Yeni Stop: {hedef_stop_fiyat:.4f}", flush=True)
+                            print(f"[{symbol}] Kademeli Stop Güncellendi! Yeni Stop: {hedef_stop_fiyat:.4f}", flush=True)
                     except Exception as stop_up_err:
                         print(f"Kademeli stop güncelleme hatası: {stop_up_err}", flush=True)
                         
-                    print(f"[{symbol}] Pozisyon takipte ({side.upper()}). Giriş: {entry_price}, Anlık: {current_price}, Kâr: %{kar_yuzdesi:.2f} (En Yüksek: %{en_yuksek_kar:.2f})", flush=True)
+                    print(f"[{symbol}] Pozisyon takipte ({side.upper()}). Kâr: %{kar_yuzdesi:.2f}", flush=True)
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
-        if len(acik_pozisyonlar) >= MAX_POSITIONS:
-            print(f"Maksimum pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
-            return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyona ulaşıldı."})
+        # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI (5 Dakikalık Zaman Dilimi)
+        scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
+        
+        if SCALP_ENABLED and not scalp_aktif_var:
+            try:
+                tickers = exchange.fetch_tickers()
+                # Hacmi yüksek majör/popüler coinlerden rastgele veya hacim sırasına göre hızlı tarama yapalım
+                populer_coinler = [s for s, t in tickers.items() if 'USDT' in s and not any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])][:20]
+                
+                for symbol in populer_coinler:
+                    if symbol in aktif_semboller:
+                        continue
+                    
+                    # 5 dakikalık mum verilerini çek
+                    ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=30)
+                    if len(ohlcv_5m) < 30:
+                        continue
+                        
+                    df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_5m['rsi'] = hesapla_rsi(df_5m['close'], period=14)
+                    
+                    # Bollinger Bantları (5m)
+                    df_5m['middle'] = df_5m['close'].rolling(window=20).mean()
+                    std_5m = df_5m['close'].rolling(window=20).std()
+                    df_5m['upper'] = df_5m['middle'] + (2 * std_5m)
+                    df_5m['lower'] = df_5m['middle'] - (2 * std_5m)
+                    
+                    cur_close = df_5m['close'].iloc[-1]
+                    cur_lower = df_5m['lower'].iloc[-1]
+                    cur_upper = df_5m['upper'].iloc[-1]
+                    cur_rsi = df_5m['rsi'].iloc[-1]
+                    prev_close = df_5m['close'].iloc[-2]
+                    prev_lower = df_5m['lower'].iloc[-2]
+                    
+                    scalp_yon = None
+                    # Long Şartı: Fiyat alt bandı iğneleyip veya altına sarkıp içeri geri dönmüş ya da RSI aşırı satımdan dönüyor
+                    if (prev_close <= prev_lower or cur_close <= cur_lower) or (cur_rsi < 32):
+                        scalp_yon = 'buy'
+                    # Short Şartı: Fiyat üst banda çarpıp geri dönmüş ya da RSI aşırı alımdan dönüyor
+                    elif (cur_close >= cur_upper) or (cur_rsi > 68):
+                        scalp_yon = 'sell'
+                        
+                    if scalp_yon:
+                        try:
+                            exchange.set_margin_mode('isolated', symbol)
+                        except:
+                            pass
+                        try:
+                            exchange.set_leverage(SCALP_LEVERAGE, symbol)
+                        except:
+                            pass
+                            
+                        market_data = exchange.load_markets()
+                        market = market_data.get(symbol, {})
+                        precision = int(market.get('precision', {}).get('amount', 3))
+                        min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
+                        
+                        notional_target = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
+                        raw_amount = notional_target / cur_close
+                        amount = max(round(raw_amount, precision), min_amount)
+                        
+                        exchange.create_order(symbol, 'market', scalp_yon, amount)
+                        print(f"!!! VUR-KAÇ (SCALP) İŞLEMİ AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Kaldıraç: {SCALP_LEVERAGE}x | Miktar: {amount} !!!", flush=True)
+                        break # Her döngüde 1 tane açıp çık
+            except Exception as scalp_err:
+                print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
 
-        # 2. Dinamik Havuz ve Formasyon / Hacim Filtreleri
+        # 3. ANA FIRSAT MODÜLÜ (Eğer normal pozisyon limiti dolmadıysa)
+        normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
+        
+        if normal_acik_sayisi >= MAX_POSITIONS:
+            print(f"Maksimum ana pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
+            return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyonlara ulaşıldı."})
+
         tickers = exchange.fetch_tickers()
         coin_listesi = []
-        
         for symbol, t in tickers.items():
             if 'USDT' in symbol and not any(tradfi in symbol for tradfi in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
                 degisim_yuzdesi = 0.0
@@ -224,7 +319,6 @@ def otomatik_analiz():
                     if open_p > 0 and last_p > 0:
                         degisim_yuzdesi = ((last_p - open_p) / open_p) * 100
                     vol = t.get('quoteVolume', 0) or 0
-
                 coin_listesi.append({'symbol': symbol, 'change': degisim_yuzdesi, 'volume': vol})
         
         if len(coin_listesi) == 0:
@@ -265,7 +359,6 @@ def otomatik_analiz():
                 
                 df_1h = formasyon_ve_sikisma_tara(df_1h)
                 obv_onay = df_1h['obv_trend'].iloc[-1]
-                
                 df_1h['rsi'] = hesapla_rsi(df_1h['close'], period=14)
                 current_rsi = df_1h['rsi'].iloc[-1]
                 
@@ -284,26 +377,19 @@ def otomatik_analiz():
                 if pd.isna(ema50_1h) or pd.isna(current_rsi):
                     continue
                 
-                # Kalite Puanı Hesaplama (Analiz Kalitesine Göre Kaldıraç Tayini İçin)
                 kalite_puani = 0
-                
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h and obv_onay and (50 <= current_rsi <= 60):
-                    # Long Sinyal Kalite Kriterleri
-                    kalite_puani += 1 # Temel şart sağlandı
-                    if current_rsi >= 53 and current_rsi <= 57: kalite_puani += 1 # Kusursuz RSI bölgesi
-                    if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1 # Güçlü hacim patlaması
-                    if df_1h['squeeze'].iloc[-1]: kalite_puani += 1 # Bollinger sıkışmasından çıkış
-                    
+                    kalite_puani += 1
+                    if current_rsi >= 53 and current_rsi <= 57: kalite_puani += 1
+                    if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1
+                    if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': kalite_puani}
                     break
-                    
                 elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not obv_onay and (40 <= current_rsi <= 50):
-                    # Short Sinyal Kalite Kriterleri
                     kalite_puani += 1
                     if current_rsi >= 43 and current_rsi <= 47: kalite_puani += 1
                     if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1
                     if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
-                    
                     en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price, 'score': kalite_puani}
                     break
             except Exception:
@@ -315,8 +401,6 @@ def otomatik_analiz():
             current_price = en_iyi_fırsat['price']
             score = en_iyi_fırsat['score']
             
-            # Kalite Puanına Göre 3x ile 10x Arası Kaldıraç Belirleme
-            # Puan 1-2 ise 3x-5x, 3 ise 7x, 4 ise 10x
             if score >= 4:
                 hesaplanan_kaldirac = 10
             elif score == 3:
@@ -327,17 +411,14 @@ def otomatik_analiz():
                 hesaplanan_kaldirac = 3
                 
             try:
-                # Margin Modunu ISOLATED yap
                 exchange.set_margin_mode('isolated', symbol)
-            except Exception as margin_err:
-                print(f"[{symbol}] Margin modu zaten isolated veya ayarlanamadı: {margin_err}", flush=True)
+            except Exception:
+                pass
                 
             try:
-                # Dinamik Kaldıracı Ayarla
                 exchange.set_leverage(hesaplanan_kaldirac, symbol)
-                print(f"[{symbol}] Kaldıraç başarıyla ayarlandı: {hesaplanan_kaldirac}x (Kalite Puanı: {score})", flush=True)
-            except Exception as lev_err:
-                print(f"[{symbol}] Kaldıraç ayarlama hatası: {lev_err}", flush=True)
+            except Exception:
+                pass
 
             market_data = exchange.load_markets()
             market = market_data.get(symbol, {})
@@ -355,7 +436,7 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! ISOLATED İŞLEM AÇILDI: {symbol} | Yön: {side.upper()} | Kaldıraç: {hesaplanan_kaldirac}x | Miktar: {amount} !!!", flush=True)
+                print(f"!!! ANA FIRSAT İŞLEMİ AÇILDI: {symbol} | Yön: {side.upper()} | Kaldıraç: {hesaplanan_kaldirac}x | Miktar: {amount} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -375,7 +456,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Isolated ve dinamik kaldıraçlı analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Analiz, Scalp ve Pozisyon Yönetimi döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
