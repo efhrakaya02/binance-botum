@@ -12,7 +12,7 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
 MAX_POSITIONS = 3  
 
-# VUR-KAÇ (SCALP) PARAMETRELERI
+# GÜNCELLENMİŞ VUR-KAÇ (SCALP) PARAMETRELERI (Daha Garanti / Filtrelenmiş)
 SCALP_ENABLED = True
 SCALP_MARGIN_SIZE = 15.0  # 15 USD sermaye
 SCALP_LEVERAGE = 5
@@ -100,11 +100,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Ana Fırsat Modülü + Vur-Kaç (5x Scalp) Botu Aktif", 200
+    return "Filtrelenmiş Yüksek Kaliteli Scalp + Ana Fırsat Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
+    print("--- Filtrelenmiş Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -130,8 +130,6 @@ def otomatik_analiz():
                 side = p['side']
                 contracts = float(p['contracts'])
                 
-                # Scalp (Vur-Kaç) pozisyonlarını özel olarak yönetmek için sembol ya da miktar takibi yapabiliriz
-                # Eğer bu pozisyon 15 USD scalp sermayesine yakınsa ayrı kural uygulayalım
                 is_scalp_position = (abs(initial_margin - SCALP_MARGIN_SIZE) < 3.0)
                 
                 if initial_margin > 0 and entry_price > 0:
@@ -161,7 +159,7 @@ def otomatik_analiz():
                             continue
                         else:
                             print(f"[SCALP Takipte] {symbol} | Yön: {side.upper()} | Anlık Kâr: %{kar_yuzdesi:.2f}", flush=True)
-                            continue # Ana trend kontrollerine sokma, bu bir scalp pozisyonudur
+                            continue 
 
                     # --- ANA TREND POZİSYON YÖNETİMİ ---
                     if symbol not in pozisyon_en_yuksek_kar:
@@ -176,7 +174,7 @@ def otomatik_analiz():
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Anlık kâr: %{kar_yuzdesi:.2f}. Kapatıldı.", flush=True)
+                        print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Kapatıldı.", flush=True)
                         continue
                     
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
@@ -230,47 +228,78 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
-        # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI (5 Dakikalık Zaman Dilimi)
+        # 2. ÇOKLU ZAMAN DİLMİYLE FİLTRELENMİŞ VUR-KAÇ (SCALP) FIRSAT TARAMASI
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
         
         if SCALP_ENABLED and not scalp_aktif_var:
             try:
                 tickers = exchange.fetch_tickers()
-                # Hacmi yüksek majör/popüler coinlerden rastgele veya hacim sırasına göre hızlı tarama yapalım
-                populer_coinler = [s for s, t in tickers.items() if 'USDT' in s and not any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])][:20]
+                populer_coinler = [s for s, t in tickers.items() if 'USDT' in s and not any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])]
                 
-                for symbol in populer_coinler:
+                for symbol in populer_coinler[:25]:
                     if symbol in aktif_semboller:
                         continue
                     
-                    # 5 dakikalık mum verilerini çek
-                    ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=30)
-                    if len(ohlcv_5m) < 30:
+                    # 5 dakikalık veriler (Hassas tetikleme için)
+                    ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=40)
+                    if len(ohlcv_5m) < 40:
+                        continue
+                    df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    
+                    # Hacim Filtresi: Son mum ortalama hacmin en az 1.8 katı olmalı
+                    avg_vol_5m = df_5m['volume'].mean()
+                    if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.8):
                         continue
                         
-                    df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df_5m['rsi'] = hesapla_rsi(df_5m['close'], period=14)
+                    df_5m['ema20'] = df_5m['close'].ewm(span=20, adjust=False).mean()
                     
-                    # Bollinger Bantları (5m)
-                    df_5m['middle'] = df_5m['close'].rolling(window=20).mean()
                     std_5m = df_5m['close'].rolling(window=20).std()
+                    df_5m['middle'] = df_5m['close'].rolling(window=20).mean()
                     df_5m['upper'] = df_5m['middle'] + (2 * std_5m)
                     df_5m['lower'] = df_5m['middle'] - (2 * std_5m)
                     
                     cur_close = df_5m['close'].iloc[-1]
+                    prev_close = df_5m['close'].iloc[-2]
                     cur_lower = df_5m['lower'].iloc[-1]
                     cur_upper = df_5m['upper'].iloc[-1]
                     cur_rsi = df_5m['rsi'].iloc[-1]
-                    prev_close = df_5m['close'].iloc[-2]
-                    prev_lower = df_5m['lower'].iloc[-2]
+                    ema20_5m = df_5m['ema20'].iloc[-1]
+                    
+                    # 15 dakikalık veriler (Trend ve Güvenilirlik Onayı için)
+                    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
+                    if len(ohlcv_15m) < 30:
+                        continue
+                    df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_15m['rsi'] = hesapla_rsi(df_15m['close'], period=14)
+                    df_15m['ema20'] = df_15m['close'].ewm(span=20, adjust=False).mean()
+                    
+                    rsi_15m = df_15m['rsi'].iloc[-1]
+                    close_15m = df_15m['close'].iloc[-1]
+                    ema20_15m = df_15m['ema20'].iloc[-1]
                     
                     scalp_yon = None
-                    # Long Şartı: Fiyat alt bandı iğneleyip veya altına sarkıp içeri geri dönmüş ya da RSI aşırı satımdan dönüyor
-                    if (prev_close <= prev_lower or cur_close <= cur_lower) or (cur_rsi < 32):
+                    
+                    # GARANTİ LONG ŞARTI: 
+                    # 1. 5m'de fiyat alt banda iğne atıp içeri dönmüş VEYA RSI 30 altına sarkıp toparlanmış.
+                    # 2. 5m'de fiyat EMA20 üstünde veya hızla üstüne çıkıyor.
+                    # 3. 15m'de RSI < 55 ve fiyat EMA20_15m civarında veya üstünde (trend destekli).
+                    long_sart_5m = ((prev_close <= cur_lower or cur_close <= cur_lower) or cur_rsi < 32) and (cur_close >= ema20_5m)
+                    long_sart_15m = (rsi_15m < 55) and (close_15m >= ema20_15m * 0.995)
+                    
+                    if long_sart_5m and long_sart_15m:
                         scalp_yon = 'buy'
-                    # Short Şartı: Fiyat üst banda çarpıp geri dönmüş ya da RSI aşırı alımdan dönüyor
-                    elif (cur_close >= cur_upper) or (cur_rsi > 68):
-                        scalp_yon = 'sell'
+                        
+                    # GARANTİ SHORT ŞARTI:
+                    # 1. 5m'de fiyat üst banda çarpıp geri dönmüş VEYA RSI 68 üstünden aşağı kesmiş.
+                    # 2. 5m'de fiyat EMA20 altında veya altında kalmaya devam ediyor.
+                    # 3. 15m'de RSI > 45 ve fiyat EMA20_15m civarında veya altında.
+                    else:
+                        short_sart_5m = ((cur_close >= cur_upper) or cur_rsi > 68) and (cur_close <= ema20_5m)
+                        short_sart_15m = (rsi_15m > 45) and (close_15m <= ema20_15m * 1.005)
+                        
+                        if short_sart_5m and short_sart_15m:
+                            scalp_yon = 'sell'
                         
                     if scalp_yon:
                         try:
@@ -292,12 +321,12 @@ def otomatik_analiz():
                         amount = max(round(raw_amount, precision), min_amount)
                         
                         exchange.create_order(symbol, 'market', scalp_yon, amount)
-                        print(f"!!! VUR-KAÇ (SCALP) İŞLEMİ AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Kaldıraç: {SCALP_LEVERAGE}x | Miktar: {amount} !!!", flush=True)
-                        break # Her döngüde 1 tane açıp çık
+                        print(f"!!! FİLTRELİ VUR-KAÇ (SCALP) AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | 5m RSI: {cur_rsi:.1f} | 15m RSI: {rsi_15m:.1f} !!!", flush=True)
+                        break 
             except Exception as scalp_err:
                 print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
 
-        # 3. ANA FIRSAT MODÜLÜ (Eğer normal pozisyon limiti dolmadıysa)
+        # 3. ANA FIRSAT MODÜLÜ
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
@@ -456,7 +485,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Analiz, Scalp ve Pozisyon Yönetimi döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Filtreli Scalp ve Analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
