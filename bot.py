@@ -12,9 +12,9 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
 MAX_POSITIONS = 3  
 
-# GÜNCELLENMİŞ VUR-KAÇ (SCALP) PARAMETRELERI (Daha Garanti / Filtrelenmiş)
+# GÜNCELLENMİŞ VUR-KAÇ (SCALP) PARAMETRELERI
 SCALP_ENABLED = True
-SCALP_MARGIN_SIZE = 15.0  # 15 USD sermaye
+SCALP_MARGIN_SIZE = 15.0  # 15 USD sermaye (Ayrı bütçe)
 SCALP_LEVERAGE = 5
 SCALP_TARGET_PROFIT_PCT = 1.0  # Fiyatta %1 kâr (5x ile %5 kazanç)
 SCALP_STOP_LOSS_PCT = 0.5      # Fiyatta %0,5 zararda stop (5x ile %2,5 zarar)
@@ -100,11 +100,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Filtrelenmiş Yüksek Kaliteli Scalp + Ana Fırsat Botu Aktif", 200
+    return "Bağımsız Scalp + Ana Fırsat Hibrit Botu Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Filtrelenmiş Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
+    print("--- Eş Zamanlı Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -114,14 +114,14 @@ def otomatik_analiz():
         
         positions = exchange.fetch_positions()
         acik_pozisyonlar = [p for p in positions if float(p['contracts']) > 0]
-        print(f"Aktif Açık Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
+        print(f"Aktif Açık Toplam Pozisyon Sayısı: {len(acik_pozisyonlar)}", flush=True)
         
         aktif_semboller = [p['symbol'] for p in acik_pozisyonlar]
         for s in list(pozisyon_en_yuksek_kar.keys()):
             if s not in aktif_semboller:
                 del pozisyon_en_yuksek_kar[s]
 
-        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi (Ana Pozisyonlar İçin)
+        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi (Tüm Açık Pozisyonlar İçin)
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -143,7 +143,7 @@ def otomatik_analiz():
                         
                     close_side = 'sell' if side == 'long' else 'buy'
                     
-                    # --- VUR-KAÇ (SCALP) POZİSYON YÖNETİMİ (%1 Kâr veya %0.5 Stop) ---
+                    # --- VUR-KAÇ (SCALP) POZİSYON YÖNETİMİ ---
                     if is_scalp_position:
                         if kar_yuzdesi >= SCALP_TARGET_PROFIT_PCT:
                             exchange.create_order(
@@ -228,7 +228,7 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
-        # 2. ÇOKLU ZAMAN DİLMİYLE FİLTRELENMİŞ VUR-KAÇ (SCALP) FIRSAT TARAMASI
+        # 2. BAĞIMSIZ 1. MODÜL: VUR-KAÇ (SCALP) FIRSAT TARAMASI (Diğerlerinden Bağımsız Çalışır)
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
         
         if SCALP_ENABLED and not scalp_aktif_var:
@@ -240,13 +240,11 @@ def otomatik_analiz():
                     if symbol in aktif_semboller:
                         continue
                     
-                    # 5 dakikalık veriler (Hassas tetikleme için)
                     ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=40)
                     if len(ohlcv_5m) < 40:
                         continue
                     df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
-                    # Hacim Filtresi: Son mum ortalama hacmin en az 1.8 katı olmalı
                     avg_vol_5m = df_5m['volume'].mean()
                     if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.8):
                         continue
@@ -266,7 +264,6 @@ def otomatik_analiz():
                     cur_rsi = df_5m['rsi'].iloc[-1]
                     ema20_5m = df_5m['ema20'].iloc[-1]
                     
-                    # 15 dakikalık veriler (Trend ve Güvenilirlik Onayı için)
                     ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
                     if len(ohlcv_15m) < 30:
                         continue
@@ -280,20 +277,11 @@ def otomatik_analiz():
                     
                     scalp_yon = None
                     
-                    # GARANTİ LONG ŞARTI: 
-                    # 1. 5m'de fiyat alt banda iğne atıp içeri dönmüş VEYA RSI 30 altına sarkıp toparlanmış.
-                    # 2. 5m'de fiyat EMA20 üstünde veya hızla üstüne çıkıyor.
-                    # 3. 15m'de RSI < 55 ve fiyat EMA20_15m civarında veya üstünde (trend destekli).
                     long_sart_5m = ((prev_close <= cur_lower or cur_close <= cur_lower) or cur_rsi < 32) and (cur_close >= ema20_5m)
                     long_sart_15m = (rsi_15m < 55) and (close_15m >= ema20_15m * 0.995)
                     
                     if long_sart_5m and long_sart_15m:
                         scalp_yon = 'buy'
-                        
-                    # GARANTİ SHORT ŞARTI:
-                    # 1. 5m'de fiyat üst banda çarpıp geri dönmüş VEYA RSI 68 üstünden aşağı kesmiş.
-                    # 2. 5m'de fiyat EMA20 altında veya altında kalmaya devam ediyor.
-                    # 3. 15m'de RSI > 45 ve fiyat EMA20_15m civarında veya altında.
                     else:
                         short_sart_5m = ((cur_close >= cur_upper) or cur_rsi > 68) and (cur_close <= ema20_5m)
                         short_sart_15m = (rsi_15m > 45) and (close_15m <= ema20_15m * 1.005)
@@ -326,12 +314,12 @@ def otomatik_analiz():
             except Exception as scalp_err:
                 print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
 
-        # 3. ANA FIRSAT MODÜLÜ
+        # 3. BAĞIMSIZ 2. MODÜL: ANA FIRSAT MODÜLÜ (Scalp Açık Olsa Dahi Sürekli Taramaya Devam Eder)
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
             print(f"Maksimum ana pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
-            return jsonify({"durum": "Beklemede", "mesaj": "Maksimum pozisyonlara ulaşıldı."})
+            return jsonify({"durum": "Beklemede", "mesaj": "Scalp çalışıyor, ana pozisyonlar dolu."})
 
         tickers = exchange.fetch_tickers()
         coin_listesi = []
@@ -485,7 +473,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Filtreli Scalp ve Analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Bağımsız Scalp ve Ana Fırsat döngüsü paralel yürütüldü."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
