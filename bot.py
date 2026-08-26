@@ -17,9 +17,14 @@ SCALP_ENABLED = True
 SCALP_MARGIN_SIZE = 15.0  # Scalp için net 15 USDT anapara
 SCALP_LEVERAGE = 5
 SCALP_TARGET_PROFIT_PCT = 1.0  
-SCALP_STOP_LOSS_PCT = 0.5         
+SCALP_STOP_LOSS_PCT = 0.5               
 
 pozisyon_en_yuksek_kar = {}
+
+# SOĞUMA SÜRESİ (COOLDOWN) MEKANİZMASI İÇİN SÖZLÜK
+# {symbol: son_kapanis_zaman_milisaniye}
+cooldown_suresi_ms = 4 * 3600 * 1000  # 4 Saatlik soğuma süresi
+son_kapanis_zamanlari = {}
 
 def get_exchange():
     return ccxt.binance({
@@ -30,7 +35,6 @@ def get_exchange():
     })
 
 def gecerli_kripto_mu(symbol):
-    # TradFi / Hisse senedi / Opsiyon / Vadeli özel kontratları ve istenmeyen formatları ele
     yasakli_ifadeler = ['UP/', 'DOWN/', 'BEAR/', 'BULL/', '_', 'BID', 'ASK']
     if not symbol.endswith('USDT'):
         return False
@@ -50,6 +54,44 @@ def hesapla_obv(close, volume):
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     return obv
 
+def hesapla_regresyon_bantlari(df, period=50, std_multiplier=2.0):
+    """
+        Doğrusal Regresyon ve Üst/Alt Bant Filtresi Hesaplar
+    """
+    df = df.copy()
+    y = df['close'].values
+    x = np.arange(len(y))
+    
+    # Kayan Lineer Regresyon (Rolling Linear Regression)
+    # Performans için son 'period' kadar veri üzerinden hesaplanır
+    reg_upper = []
+    reg_lower = []
+    reg_mid = []
+    
+    for i in range(len(df)):
+        if i < period:
+            reg_mid.append(np.nan)
+            reg_upper.append(np.nan)
+            reg_lower.append(np.nan)
+        else:
+            y_window = y[i-period+1:i+1]
+            x_window = np.arange(period)
+            
+            slope, intercept = np.polyfit(x_window, y_window, 1)
+            mid_val = slope * (period - 1) + intercept
+            
+            residuals = y_window - (slope * x_window + intercept)
+            std_val = np.std(residuals)
+            
+            reg_mid.append(mid_val)
+            reg_upper.append(mid_val + (std_multiplier * std_val))
+            reg_lower.append(mid_val - (std_multiplier * std_val))
+            
+    df['reg_middle'] = reg_mid
+    df['reg_upper'] = reg_upper
+    df['reg_lower'] = reg_lower
+    return df
+
 def formasyon_ve_sikisma_tara(df):
     df['middle_band'] = df['close'].rolling(window=20).mean()
     rolling_std = df['close'].rolling(window=20).std()
@@ -60,6 +102,9 @@ def formasyon_ve_sikisma_tara(df):
     df['obv'] = hesapla_obv(df['close'], df['volume'])
     df['obv_ma'] = df['obv'].rolling(window=10).mean()
     df['obv_trend'] = df['obv'] > df['obv_ma']
+    
+    # Regresyon Bantlarını Entegre Et
+    df = hesapla_regresyon_bantlari(df, period=50, std_multiplier=2.0)
     return df
 
 def hesapla_supertrend(df, period=10, multiplier=3):
@@ -110,7 +155,7 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Tertemiz Süzülmüş ve Düzeltilmiş Hibrit Bot Aktif", 200
+    return "Tertemiz Süzülmüş, Regresyon Filtreli ve Cooldown'lu Hibrit Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
@@ -129,6 +174,8 @@ def otomatik_analiz():
         aktif_semboller = [p['symbol'] for p in acik_pozisyonlar]
         for s in list(pozisyon_en_yuksek_kar.keys()):
             if s not in aktif_semboller:
+                # Pozisyon kapandığı an soğuma süresini başlatmak için zamanı kaydet
+                son_kapanis_zamanlari[s] = int(time.time() * 1000)
                 del pozisyon_en_yuksek_kar[s]
 
         # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi
@@ -160,12 +207,14 @@ def otomatik_analiz():
                                 symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                             )
                             print(f"[SCALP] {symbol} hedef kâr oranına ulaştı! Kapatıldı. Kâr: %{kar_yuzdesi:.2f}", flush=True)
+                            son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                             continue
                         elif kar_yuzdesi <= -SCALP_STOP_LOSS_PCT:
                             exchange.create_order(
                                 symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                             )
                             print(f"[SCALP] {symbol} stop loss sınırına ulaştı! Kapatıldı. Zarar: %{kar_yuzdesi:.2f}", flush=True)
+                            son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                             continue
                         else:
                             print(f"[SCALP Takipte] {symbol} | Yön: {side.upper()} | Anlık Kâr: %{kar_yuzdesi:.2f}", flush=True)
@@ -185,6 +234,7 @@ def otomatik_analiz():
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
                         print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Kapatıldı.", flush=True)
+                        son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                         continue
                     
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
@@ -206,6 +256,7 @@ def otomatik_analiz():
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
                         print(f"[{symbol}] Trend tersine döndü! Pozisyon kapatıldı. Kâr/Zarar: %{kar_yuzdesi:.2f}", flush=True)
+                        son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                         continue
                         
                     try:
@@ -239,6 +290,13 @@ def otomatik_analiz():
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
         gecerli_coin_listesi = [s for s in markets.keys() if gecerli_kripto_mu(s)]
+
+        # --- SOĞUMA SÜRESİ (COOLDOWN) KONTROLÜ FONKSİYONU ---
+        simdiki_zaman = int(time.time() * 1000)
+        gecerli_coin_listesi = [
+            s for s in gecerli_coin_listesi 
+            if s not in son_kapanis_zamanlari or (simdiki_zaman - son_kapanis_zamanlari[s]) > cooldown_suresi_ms
+        ]
 
         # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
@@ -307,8 +365,6 @@ def otomatik_analiz():
                             pass
                             
                         market = markets.get(symbol, {})
-                        
-                        # --- HASSASİYET VE MİKTAR DÜZELTME KISMI ---
                         precision = market.get('precision', {})
                         amount_precision = int(precision.get('amount', 3)) if isinstance(precision.get('amount'), int) else 3
                         
@@ -318,7 +374,6 @@ def otomatik_analiz():
                         notional_target = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
                         raw_amount = notional_target / cur_close
                         
-                        # ccxt built-in amount_to_precision fonksiyonu ile borsa kurallarına tam uyum
                         amount = float(exchange.amount_to_precision(symbol, max(raw_amount, min_amount)))
                         
                         exchange.create_order(symbol, 'market', scalp_yon, amount)
@@ -397,24 +452,34 @@ def otomatik_analiz():
                 ema50_1h = df_1h['ema50'].iloc[-1]
                 st_bullish_1h = df_1h['supertrend'].iloc[-1]
                 
-                if pd.isna(ema50_1h) or pd.isna(current_rsi):
+                # Regresyon Bant Değerleri
+                reg_upper_val = df_1h['reg_upper'].iloc[-1]
+                reg_lower_val = df_1h['reg_lower'].iloc[-1]
+                
+                if pd.isna(ema50_1h) or pd.isna(current_rsi) or pd.isna(reg_upper_val):
                     continue
                 
                 kalite_puani = 0
+                # LONG SŞARTI: Fiyat alt regresyon bandına yakınsa veya altındaysa ekstra güçlü sayılır
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h and (45 <= current_rsi <= 65):
-                    kalite_puani += 1
-                    if obv_onay: kalite_puani += 1
-                    if current_rsi >= 50 and current_rsi <= 60: kalite_puani += 1
-                    if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
-                    en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': max(1, kalite_puani)}
-                    break
+                    # Regresyon Filtresi: Fiyat üst banda yapışıkken Long açmayı engelle (aşırı alım filtresi)
+                    if current_price < reg_upper_val:
+                        kalite_puani += 1
+                        if obv_onay: kalite_puani += 1
+                        if current_rsi >= 50 and current_rsi <= 60: kalite_puani += 1
+                        if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
+                        en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': max(1, kalite_puani)}
+                        break
+                # SHORT ŞARTI: Fiyat üst regresyon bandına yakınsa veya üzerindeyse ekstra güçlü sayılır
                 elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and (35 <= current_rsi <= 55):
-                    kalite_puani += 1
-                    if not obv_onay: kalite_puani += 1
-                    if current_rsi >= 40 and current_rsi <= 50: kalite_puani += 1
-                    if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
-                    en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price, 'score': max(1, kalite_puani)}
-                    break
+                    # Regresyon Filtresi: Fiyat alt banda yapışıkken Short açmayı engelle (aşırı satım filtresi)
+                    if current_price > reg_lower_val:
+                        kalite_puani += 1
+                        if not obv_onay: kalite_puani += 1
+                        if current_rsi >= 40 and current_rsi <= 50: kalite_puani += 1
+                        if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
+                        en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price, 'score': max(1, kalite_puani)}
+                        break
             except Exception:
                 continue
 
@@ -431,7 +496,7 @@ def otomatik_analiz():
             elif score == 2:
                 hesaplanan_kaldirac = 5
             else:
-                hesaplanan_kaldirac = 10  # Düşük puanlar için güvenli düşük kaldıraç
+                hesaplanan_kaldirac = 10  
                 
             try:
                 exchange.set_margin_mode('isolated', symbol)
@@ -447,7 +512,6 @@ def otomatik_analiz():
             notional_target = ORDER_SIZE * hesaplanan_kaldirac
             raw_amount = notional_target / current_price
             
-            # Hassasiyet düzeltmesi (CCXT dahili amount_to_precision fonksiyonu ile)
             limits = market.get('limits', {})
             min_amount = limits.get('amount', {}).get('min', 0.001)
             amount = float(exchange.amount_to_precision(symbol, max(raw_amount, min_amount)))
@@ -477,7 +541,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Tertemiz süzülmüş analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Regresyon filtreli ve Cooldown mekanizmalı analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
