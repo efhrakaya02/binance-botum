@@ -4,28 +4,46 @@ import pandas as pd
 import numpy as np
 import time
 import threading
+
 from datetime import datetime, timezone
 from flask import Flask, jsonify
 
+
 # ============================================================
-# BINANCE FUTURES - GELİŞMİŞ FIRSAT + SCALP BOTU
-# Railway / Flask / 1 Dakikalık Cron
+# BINANCE FUTURES BOT
+# FIRSAT + SCALP
+#
+# SCALP:
+#   TP = +3% ROI
+#   SL = -1.5% ROI
+#
+# SCALP POZİSYONLARI SÜREKLİ İZLENİR.
+# CRON'U BEKLEMEZ.
 # ============================================================
 
+
 app = Flask(__name__)
+
+
+# ============================================================
+# API
+# ============================================================
 
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 
+
 if not API_KEY or not SECRET_KEY:
+
     print(
-        "UYARI: BINANCE_API_KEY veya BINANCE_SECRET_KEY eksik!",
+        "UYARI: BINANCE_API_KEY veya "
+        "BINANCE_SECRET_KEY eksik!",
         flush=True
     )
 
 
 # ============================================================
-# ANA PARAMETRELER
+# ANA AYARLAR
 # ============================================================
 
 OPPORTUNITY_MARGIN = 15.0
@@ -49,30 +67,42 @@ cooldown_ms = (
     * 1000
 )
 
+
+# ============================================================
+# SCALP AYARLARI
+# ============================================================
+
+SCALP_TP_ROI = 3.0
+SCALP_SL_ROI = -1.5
+
+
+# Sürekli scalp kontrol aralığı.
+#
+# 0.5 saniye çok agresif olabilir.
+# 1 saniye makul.
+#
+# Railway üzerinde çalışan servis pozisyonları
+# cron'dan bağımsız olarak kontrol eder.
+#
+SCALP_MONITOR_INTERVAL = 1.0
+
+
+# ============================================================
+# HAFIZA
+# ============================================================
+
 son_kapanis_zamanlari = {}
 
 pozisyon_en_yuksek_kar = {}
 
 pozisyon_stoplari = {}
 
+# Scalp pozisyonlarında aynı anda iki farklı thread
+# işlem kapatmaya çalışmasın.
+scalp_close_lock = threading.Lock()
+
+# Genel analiz aynı anda iki kere çalışmasın.
 analiz_lock = threading.Lock()
-
-
-# ============================================================
-# SCALP PARAMETRELERİ
-# ============================================================
-
-# İSTEDİĞİN YENİ SİSTEM:
-#
-# ROI +3%  -> KÂR AL / KAPAT
-# ROI +1%  -> STOP ENTRY'YE
-# ROI -1%  -> STOP / KAPAT
-#
-# ROI burada kaldıraç dahil pozisyon ROI'sidir.
-
-SCALP_TP_ROI = 3.0
-SCALP_ENTRY_LOCK_ROI = 1.0
-SCALP_SL_ROI = -1.0
 
 
 # ============================================================
@@ -92,24 +122,27 @@ MACRO_BLOCK_WINDOWS = os.getenv(
 def get_exchange():
 
     return ccxt.binance({
+
         "apiKey": API_KEY,
+
         "secret": SECRET_KEY,
+
         "enableRateLimit": True,
+
         "options": {
+
             "defaultType": "future",
+
             "adjustForTimeDifference": True
         }
     })
 
 
 # ============================================================
-# SEMBOL YARDIMCILARI
+# SEMBOL
 # ============================================================
 
 def sembol_duzelt(symbol):
-
-    if not symbol:
-        return symbol
 
     if symbol == "BCC/USDT":
         return "BCH/USDT"
@@ -117,34 +150,10 @@ def sembol_duzelt(symbol):
     return symbol
 
 
-def sembol_temizle(symbol):
-
-    if not symbol:
-        return symbol
-
-    symbol = str(symbol)
-
-    # CCXT unified futures:
-    # BTC/USDT:USDT
-    # BTC/USDT
-    #
-    # İndikatör fonksiyonlarında standart
-    # BTC/USDT kullanacağız.
-
-    if ":USDT" in symbol:
-        symbol = symbol.replace(":USDT", "")
-
-    return sembol_duzelt(symbol)
-
-
 def gecerli_kripto_mu(symbol):
 
-    if not symbol:
-        return False
-
-    symbol = sembol_temizle(symbol)
-
     yasakli = [
+
         "UP/",
         "DOWN/",
         "BEAR/",
@@ -166,46 +175,7 @@ def gecerli_kripto_mu(symbol):
 
 
 # ============================================================
-# MARKET SEMBOLÜ BUL
-# ============================================================
-
-def market_symbol_bul(exchange, symbol):
-
-    symbol = sembol_temizle(symbol)
-
-    markets = exchange.markets
-
-    # Önce direkt
-    if symbol in markets:
-        return symbol
-
-    # Futures CCXT formatı
-    futures_symbol = symbol + ":USDT"
-
-    if futures_symbol in markets:
-        return futures_symbol
-
-    # Genel arama
-    for key, market in markets.items():
-
-        try:
-
-            unified = market.get("symbol")
-
-            if unified == symbol:
-                return key
-
-            if unified == futures_symbol:
-                return key
-
-        except Exception:
-            continue
-
-    return None
-
-
-# ============================================================
-# TEKNİK İNDİKATÖRLER
+# EMA
 # ============================================================
 
 def ema(series, period):
@@ -216,7 +186,14 @@ def ema(series, period):
     ).mean()
 
 
-def hesapla_rsi(series, period=14):
+# ============================================================
+# RSI
+# ============================================================
+
+def hesapla_rsi(
+    series,
+    period=14
+):
 
     delta = series.diff()
 
@@ -254,21 +231,31 @@ def hesapla_rsi(series, period=14):
     )
 
 
-def hesapla_atr(df, period=14):
+# ============================================================
+# ATR
+# ============================================================
+
+def hesapla_atr(
+    df,
+    period=14
+):
 
     high_low = (
         df["high"]
-        - df["low"]
+        -
+        df["low"]
     )
 
     high_close = abs(
         df["high"]
-        - df["close"].shift()
+        -
+        df["close"].shift()
     )
 
     low_close = abs(
         df["low"]
-        - df["close"].shift()
+        -
+        df["close"].shift()
     )
 
     tr = pd.concat(
@@ -286,35 +273,61 @@ def hesapla_atr(df, period=14):
     ).mean()
 
 
-def hesapla_adx(df, period=14):
+# ============================================================
+# ADX
+# ============================================================
+
+def hesapla_adx(
+    df,
+    period=14
+):
 
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
     up_move = high.diff()
+
     down_move = -low.diff()
 
     plus_dm = np.where(
-        (up_move > down_move)
-        & (up_move > 0),
+
+        (
+            (up_move > down_move)
+            &
+            (up_move > 0)
+        ),
+
         up_move,
+
         0
     )
 
     minus_dm = np.where(
-        (down_move > up_move)
-        & (down_move > 0),
+
+        (
+            (down_move > up_move)
+            &
+            (down_move > 0)
+        ),
+
         down_move,
+
         0
     )
 
     tr1 = high - low
+
     tr2 = abs(
-        high - close.shift()
+        high
+        -
+        close.shift()
     )
+
     tr3 = abs(
-        low - close.shift()
+        low
+        -
+        close.shift()
     )
 
     tr = pd.concat(
@@ -342,24 +355,34 @@ def hesapla_adx(df, period=14):
     )
 
     plus_di = (
+
         100
+
         *
+
         plus_dm.ewm(
             alpha=1 / period,
             adjust=False
         ).mean()
+
         /
+
         atr
     )
 
     minus_di = (
+
         100
+
         *
+
         minus_dm.ewm(
             alpha=1 / period,
             adjust=False
         ).mean()
+
         /
+
         atr
     )
 
@@ -373,14 +396,19 @@ def hesapla_adx(df, period=14):
     )
 
     dx = (
+
         100
+
         *
+
         abs(
             plus_di
             -
             minus_di
         )
+
         /
+
         denominator
     )
 
@@ -389,8 +417,16 @@ def hesapla_adx(df, period=14):
         adjust=False
     ).mean()
 
-    return adx, plus_di, minus_di
+    return (
+        adx,
+        plus_di,
+        minus_di
+    )
 
+
+# ============================================================
+# MACD
+# ============================================================
 
 def hesapla_macd(df):
 
@@ -404,7 +440,11 @@ def hesapla_macd(df):
         26
     )
 
-    macd = ema12 - ema26
+    macd = (
+        ema12
+        -
+        ema26
+    )
 
     signal = macd.ewm(
         span=9,
@@ -424,6 +464,10 @@ def hesapla_macd(df):
     )
 
 
+# ============================================================
+# OBV
+# ============================================================
+
 def hesapla_obv(df):
 
     direction = np.sign(
@@ -436,6 +480,10 @@ def hesapla_obv(df):
         df["volume"]
     ).cumsum()
 
+
+# ============================================================
+# TEKNİK İNDİKATÖRLER
+# ============================================================
 
 def teknik_indikatorleri_hesapla(df):
 
@@ -519,12 +567,15 @@ def teknik_indikatorleri_hesapla(df):
     )
 
     df["bb_width"] = (
+
         (
             df["bb_upper"]
             -
             df["bb_lower"]
         )
+
         /
+
         df["bb_mid"]
     )
 
@@ -535,11 +586,13 @@ def teknik_indikatorleri_hesapla(df):
     )
 
     df["squeeze"] = (
+
         df["bb_width"]
+
         <
+
         df["bb_width_ma"]
-        *
-        0.85
+        * 0.85
     )
 
     df["volume_ma20"] = (
@@ -549,8 +602,11 @@ def teknik_indikatorleri_hesapla(df):
     )
 
     df["volume_ratio"] = (
+
         df["volume"]
+
         /
+
         df["volume_ma20"]
     )
 
@@ -571,8 +627,7 @@ def teknik_indikatorleri_hesapla(df):
     df["roc"] = (
         df["close"]
         .pct_change(5)
-        *
-        100
+        * 100
     )
 
     return df
@@ -591,27 +646,22 @@ def ohlcv_getir(
 
     try:
 
-        real_symbol = (
-            market_symbol_bul(
-                exchange,
-                symbol
-            )
-        )
-
-        if not real_symbol:
-            return None
-
         data = exchange.fetch_ohlcv(
-            real_symbol,
+            symbol,
             timeframe=timeframe,
             limit=limit
         )
 
-        if not data or len(data) < 50:
+        if (
+            not data
+            or len(data) < 50
+        ):
             return None
 
         df = pd.DataFrame(
+
             data,
+
             columns=[
                 "timestamp",
                 "open",
@@ -641,7 +691,7 @@ def ohlcv_getir(
 
 
 # ============================================================
-# MAKRO ENGEL
+# SAAT PARSE
 # ============================================================
 
 def dakika_saat_parse(text):
@@ -654,12 +704,19 @@ def dakika_saat_parse(text):
             .split(":")
         )
 
-        return int(h), int(m)
+        return (
+            int(h),
+            int(m)
+        )
 
     except Exception:
 
         return None
 
+
+# ============================================================
+# MAKRO ENGEL
+# ============================================================
 
 def makro_zaman_engeli_var_mi():
 
@@ -688,30 +745,38 @@ def makro_zaman_engeli_var_mi():
                     .split("-")
                 )
 
-                sh, sm = (
+                parsed_start = (
                     dakika_saat_parse(
                         start
                     )
                 )
 
-                eh, em = (
+                parsed_end = (
                     dakika_saat_parse(
                         end
                     )
                 )
 
                 if (
-                    sh is None
-                    or eh is None
+                    parsed_start is None
+                    or
+                    parsed_end is None
                 ):
                     continue
 
+                sh, sm = parsed_start
+                eh, em = parsed_end
+
                 start_min = (
-                    sh * 60 + sm
+                    sh * 60
+                    +
+                    sm
                 )
 
                 end_min = (
-                    eh * 60 + em
+                    eh * 60
+                    +
+                    em
                 )
 
                 if start_min <= end_min:
@@ -735,22 +800,22 @@ def makro_zaman_engeli_var_mi():
                         return True
 
             except Exception:
+
                 continue
 
-    # Funding dönemleri
-    #
-    # 00:00
-    # 08:00
-    # 16:00 UTC
-    #
-    # ±5 dakika
-
+    # Funding çevresi
     if (
-        now.hour in [0, 8, 16]
-        and (
+
+        (
             now.minute >= 55
-            or now.minute <= 5
+            or
+            now.minute <= 5
         )
+
+        and
+
+        now.hour in [0, 8, 16]
+
     ):
 
         return True
@@ -764,7 +829,7 @@ def makro_zaman_engeli_var_mi():
 
 def cooldown_aktif_mi(symbol):
 
-    symbol = sembol_temizle(
+    symbol = sembol_duzelt(
         symbol
     )
 
@@ -777,10 +842,18 @@ def cooldown_aktif_mi(symbol):
         return False
 
     return (
-        int(time.time() * 1000)
+
+        int(
+            time.time()
+            * 1000
+        )
+
         -
+
         son
+
         <
+
         cooldown_ms
     )
 
@@ -810,7 +883,8 @@ def pozisyon_tipi(p):
             -
             SCALP_MARGIN
         )
-        <= 2.5
+        <=
+        2.0
     ):
 
         return "scalp"
@@ -821,12 +895,1378 @@ def pozisyon_tipi(p):
             -
             OPPORTUNITY_MARGIN
         )
-        <= 3.0
+        <=
+        2.5
     ):
 
         return "opportunity"
 
     return "unknown"
+
+
+# ============================================================
+# ROI HESAPLA
+# ============================================================
+
+def roi_hesapla(
+    side,
+    current_price,
+    entry_price,
+    leverage
+):
+
+    if entry_price <= 0:
+        return 0.0
+
+    if side == "long":
+
+        price_change = (
+
+            current_price
+            -
+            entry_price
+        ) / entry_price
+
+    else:
+
+        price_change = (
+
+            entry_price
+            -
+            current_price
+        ) / entry_price
+
+    return (
+        price_change
+        *
+        100
+        *
+        leverage
+    )
+
+
+# ============================================================
+# ROI'DEN FİYAT HESAPLA
+# ============================================================
+
+def roi_icin_stop_fiyati(
+    side,
+    entry_price,
+    roi,
+    leverage
+):
+
+    if leverage <= 0:
+        leverage = 1
+
+    price_change_pct = (
+        roi
+        /
+        leverage
+    )
+
+    if side == "long":
+
+        return (
+
+            entry_price
+            *
+            (
+                1
+                +
+                price_change_pct
+                / 100
+            )
+        )
+
+    else:
+
+        return (
+
+            entry_price
+            *
+            (
+                1
+                -
+                price_change_pct
+                / 100
+            )
+        )
+
+
+# ============================================================
+# SCALP SL FİYATI
+# ============================================================
+
+def scalp_stop_fiyati(
+    side,
+    entry_price,
+    leverage
+):
+
+    return roi_icin_stop_fiyati(
+
+        side,
+        entry_price,
+        SCALP_SL_ROI,
+        leverage
+    )
+
+
+# ============================================================
+# STOP EMİRLERİ
+# ============================================================
+
+def mevcut_stop_emirlerini_getir(
+    exchange,
+    symbol
+):
+
+    try:
+
+        orders = (
+            exchange.fetch_open_orders(
+                symbol
+            )
+        )
+
+        result = []
+
+        for order in orders:
+
+            order_type = (
+                order.get("type")
+                or ""
+            ).upper()
+
+            if order_type in [
+
+                "STOP_MARKET",
+                "STOP",
+                "TAKE_PROFIT_MARKET",
+                "TAKE_PROFIT"
+
+            ]:
+
+                result.append(
+                    order
+                )
+
+        return result
+
+    except Exception as e:
+
+        print(
+            f"[STOP LISTE HATA] "
+            f"{symbol}: {e}",
+            flush=True
+        )
+
+        return []
+
+
+# ============================================================
+# STOP EMRİ KOY
+# ============================================================
+
+def stop_emri_koy(
+    exchange,
+    symbol,
+    side,
+    amount,
+    stop_price
+):
+
+    close_side = (
+
+        "sell"
+
+        if side == "buy"
+
+        else
+
+        "buy"
+    )
+
+    try:
+
+        stop_price = float(
+
+            exchange
+            .price_to_precision(
+                symbol,
+                stop_price
+            )
+        )
+
+        order = exchange.create_order(
+
+            symbol,
+
+            "STOP_MARKET",
+
+            close_side,
+
+            amount,
+
+            None,
+
+            {
+
+                "stopPrice":
+                    stop_price,
+
+                "reduceOnly":
+                    True,
+
+                "workingType":
+                    "MARK_PRICE"
+            }
+        )
+
+        print(
+
+            f"[STOP] {symbol} "
+            f"-> {stop_price}",
+
+            flush=True
+        )
+
+        return order
+
+    except Exception as e:
+
+        print(
+
+            f"[STOP HATA] "
+            f"{symbol}: {e}",
+
+            flush=True
+        )
+
+        return None
+
+
+# ============================================================
+# STOP GÜNCELLE
+# ============================================================
+
+def stop_guncelle(
+    exchange,
+    symbol,
+    side,
+    amount,
+    yeni_stop
+):
+
+    try:
+
+        ticker = (
+            exchange.fetch_ticker(
+                symbol
+            )
+        )
+
+        current_price = float(
+            ticker["last"]
+        )
+
+        mevcut = (
+            pozisyon_stoplari
+            .get(symbol)
+        )
+
+        if mevcut is not None:
+
+            if side == "buy":
+
+                if yeni_stop <= mevcut:
+
+                    return False
+
+            else:
+
+                if yeni_stop >= mevcut:
+
+                    return False
+
+        if side == "buy":
+
+            if yeni_stop >= current_price:
+
+                yeni_stop = (
+                    current_price
+                    * 0.998
+                )
+
+        else:
+
+            if yeni_stop <= current_price:
+
+                yeni_stop = (
+                    current_price
+                    * 1.002
+                )
+
+        eski_stoplar = (
+            mevcut_stop_emirlerini_getir(
+                exchange,
+                symbol
+            )
+        )
+
+        for order in eski_stoplar:
+
+            try:
+
+                exchange.cancel_order(
+                    order["id"],
+                    symbol
+                )
+
+            except Exception:
+
+                pass
+
+        order = stop_emri_koy(
+
+            exchange,
+            symbol,
+            side,
+            amount,
+            yeni_stop
+        )
+
+        if order:
+
+            pozisyon_stoplari[
+                symbol
+            ] = yeni_stop
+
+            return True
+
+    except Exception as e:
+
+        print(
+
+            f"[STOP GÜNCELLEME HATA] "
+            f"{symbol}: {e}",
+
+            flush=True
+        )
+
+    return False
+
+
+# ============================================================
+# SCALP POZİSYONUNU KAPAT
+# ============================================================
+
+def scalp_pozisyon_kapat(
+    exchange,
+    position,
+    reason,
+    roi
+):
+
+    symbol = sembol_duzelt(
+        position["symbol"]
+    )
+
+    side = position["side"]
+
+    try:
+
+        contracts = float(
+            position.get(
+                "contracts"
+            )
+            or 0
+        )
+
+    except Exception:
+
+        contracts = 0
+
+    if contracts <= 0:
+        return False
+
+    close_side = (
+
+        "sell"
+
+        if side == "long"
+
+        else
+
+        "buy"
+    )
+
+    # Aynı anda iki farklı thread
+    # aynı scalpı kapatmasın.
+    if not scalp_close_lock.acquire(
+        blocking=False
+    ):
+
+        return False
+
+    try:
+
+        # Pozisyon gerçekten hâlâ açık mı?
+        try:
+
+            positions = (
+                exchange.fetch_positions(
+                    [symbol]
+                )
+            )
+
+            still_open = None
+
+            for p in positions:
+
+                try:
+
+                    c = float(
+                        p.get(
+                            "contracts"
+                        )
+                        or 0
+                    )
+
+                except Exception:
+
+                    c = 0
+
+                if c > 0:
+
+                    still_open = p
+                    break
+
+            if still_open is None:
+
+                print(
+
+                    f"[SCALP] {symbol} "
+                    f"zaten kapalı.",
+
+                    flush=True
+                )
+
+                return True
+
+            contracts = float(
+                still_open.get(
+                    "contracts"
+                )
+                or contracts
+            )
+
+            side = still_open[
+                "side"
+            ]
+
+            close_side = (
+
+                "sell"
+
+                if side == "long"
+
+                else
+
+                "buy"
+            )
+
+        except Exception:
+
+            pass
+
+        # Önce stop emirlerini iptal et.
+        old_stops = (
+            mevcut_stop_emirlerini_getir(
+                exchange,
+                symbol
+            )
+        )
+
+        for order in old_stops:
+
+            try:
+
+                exchange.cancel_order(
+                    order["id"],
+                    symbol
+                )
+
+            except Exception:
+
+                pass
+
+        # MARKET KAPAT
+        exchange.create_order(
+
+            symbol,
+
+            "market",
+
+            close_side,
+
+            contracts,
+
+            None,
+
+            {
+                "reduceOnly":
+                    True
+            }
+        )
+
+        print(
+
+            f"!!! SCALP KAPATILDI !!! "
+            f"{symbol} "
+            f"{reason} "
+            f"ROI=%{roi:.2f}",
+
+            flush=True
+        )
+
+        son_kapanis_zamanlari[
+            symbol
+        ] = int(
+            time.time()
+            * 1000
+        )
+
+        pozisyon_en_yuksek_kar.pop(
+            symbol,
+            None
+        )
+
+        pozisyon_stoplari.pop(
+            symbol,
+            None
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+
+            f"[SCALP KAPATMA HATA] "
+            f"{symbol}: {e}",
+
+            flush=True
+        )
+
+        return False
+
+    finally:
+
+        try:
+            scalp_close_lock.release()
+        except Exception:
+            pass
+
+
+# ============================================================
+# SCALP POZİSYONUNU KONTROL ET
+# ============================================================
+
+def scalp_pozisyon_kontrol(
+    exchange,
+    position
+):
+
+    try:
+
+        symbol = sembol_duzelt(
+            position["symbol"]
+        )
+
+        side = position["side"]
+
+        entry = float(
+            position["entryPrice"]
+        )
+
+        leverage = float(
+            position.get(
+                "leverage"
+            )
+            or 1
+        )
+
+        contracts = float(
+            position.get(
+                "contracts"
+            )
+            or 0
+        )
+
+        if contracts <= 0:
+            return
+
+        ticker = (
+            exchange.fetch_ticker(
+                symbol
+            )
+        )
+
+        current = float(
+            ticker["last"]
+        )
+
+        roi = roi_hesapla(
+
+            side,
+
+            current,
+
+            entry,
+
+            leverage
+        )
+
+        # ====================================================
+        # EN YÜKSEK ROI
+        # ====================================================
+
+        old_high = (
+            pozisyon_en_yuksek_kar
+            .get(
+                symbol,
+                roi
+            )
+        )
+
+        if roi > old_high:
+
+            pozisyon_en_yuksek_kar[
+                symbol
+            ] = roi
+
+        highest = (
+            pozisyon_en_yuksek_kar
+            .get(
+                symbol,
+                roi
+            )
+        )
+
+        print(
+
+            f"[SCALP MONITOR] "
+            f"{symbol} "
+            f"{side.upper()} "
+            f"ROI=%{roi:.2f} "
+            f"MAX=%{highest:.2f}",
+
+            flush=True
+        )
+
+        # ====================================================
+        # TP
+        #
+        # EN ÖNEMLİ KISIM:
+        #
+        # +3 ROI görüldüğü anda market kapat.
+        # ====================================================
+
+        if roi >= SCALP_TP_ROI:
+
+            scalp_pozisyon_kapat(
+
+                exchange,
+
+                position,
+
+                "TP +%3",
+
+                roi
+            )
+
+            return
+
+        # ====================================================
+        # SL
+        #
+        # -1.5 ROI
+        # ====================================================
+
+        if roi <= SCALP_SL_ROI:
+
+            scalp_pozisyon_kapat(
+
+                exchange,
+
+                position,
+
+                "SL -%1.5",
+
+                roi
+            )
+
+            return
+
+    except Exception as e:
+
+        print(
+
+            f"[SCALP MONITOR HATA] "
+            f"{position.get('symbol')}: {e}",
+
+            flush=True
+        )
+
+
+# ============================================================
+# SÜREKLİ SCALP MONİTÖRÜ
+# ============================================================
+
+def scalp_monitor_loop():
+
+    print(
+        "[SCALP MONITOR] "
+        "Sürekli scalp izleme sistemi başlatıldı.",
+        flush=True
+    )
+
+    while True:
+
+        try:
+
+            # API bilgisi yoksa bekle
+            if not API_KEY or not SECRET_KEY:
+
+                time.sleep(
+                    SCALP_MONITOR_INTERVAL
+                )
+
+                continue
+
+            exchange = get_exchange()
+
+            positions = (
+                exchange.fetch_positions()
+            )
+
+            active_scalps = []
+
+            for p in positions:
+
+                try:
+
+                    contracts = float(
+                        p.get(
+                            "contracts"
+                        )
+                        or 0
+                    )
+
+                except Exception:
+
+                    contracts = 0
+
+                if contracts <= 0:
+                    continue
+
+                if (
+                    pozisyon_tipi(p)
+                    ==
+                    "scalp"
+                ):
+
+                    active_scalps.append(
+                        p
+                    )
+
+            for p in active_scalps:
+
+                scalp_pozisyon_kontrol(
+
+                    exchange,
+
+                    p
+                )
+
+        except Exception as e:
+
+            print(
+
+                f"[SCALP MONITOR GENEL HATA] "
+                f"{e}",
+
+                flush=True
+            )
+
+        time.sleep(
+            SCALP_MONITOR_INTERVAL
+        )
+
+
+# ============================================================
+# FIRSAT BAŞLANGIÇ STOP
+# ============================================================
+
+def baslangic_stop_hesapla(
+    side,
+    entry_price,
+    atr,
+    score
+):
+
+    if score >= 90:
+
+        atr_multiplier = 2.2
+
+    elif score >= 80:
+
+        atr_multiplier = 2.0
+
+    elif score >= 72:
+
+        atr_multiplier = 1.8
+
+    else:
+
+        atr_multiplier = 1.6
+
+    if side == "buy":
+
+        return (
+
+            entry_price
+            -
+            atr
+            *
+            atr_multiplier
+        )
+
+    else:
+
+        return (
+
+            entry_price
+            +
+            atr
+            *
+            atr_multiplier
+        )
+
+
+# ============================================================
+# FIRSAT TRAILING STOP
+# ============================================================
+
+def trailing_stop_fiyat(
+    side,
+    entry_price,
+    roi,
+    leverage
+):
+
+    if roi < 5:
+        return None
+
+    locked_roi = (
+
+        int(
+            roi // 5
+        )
+
+        - 1
+
+    ) * 5
+
+    if locked_roi < 0:
+        locked_roi = 0
+
+    price_pct = (
+
+        locked_roi
+        /
+        max(
+            leverage,
+            1
+        )
+    )
+
+    if side == "long":
+
+        return (
+
+            entry_price
+            *
+            (
+                1
+                +
+                price_pct
+                / 100
+            )
+        )
+
+    else:
+
+        return (
+
+            entry_price
+            *
+            (
+                1
+                -
+                price_pct
+                / 100
+            )
+        )
+
+
+# ============================================================
+# POZİSYONLARI YÖNET
+# ============================================================
+
+def pozisyonlari_yonet(
+    exchange,
+    positions
+):
+
+    active_symbols = []
+
+    for p in positions:
+
+        try:
+
+            contracts = float(
+                p.get(
+                    "contracts"
+                )
+                or 0
+            )
+
+        except Exception:
+
+            contracts = 0
+
+        if contracts <= 0:
+            continue
+
+        symbol = sembol_duzelt(
+            p["symbol"]
+        )
+
+        active_symbols.append(
+            symbol
+        )
+
+    # Kapananları hafızadan çıkar
+    for symbol in list(
+        pozisyon_en_yuksek_kar.keys()
+    ):
+
+        if symbol not in active_symbols:
+
+            son_kapanis_zamanlari[
+                symbol
+            ] = int(
+                time.time()
+                * 1000
+            )
+
+            pozisyon_en_yuksek_kar.pop(
+                symbol,
+                None
+            )
+
+            pozisyon_stoplari.pop(
+                symbol,
+                None
+            )
+
+    for p in positions:
+
+        try:
+
+            contracts = float(
+                p.get(
+                    "contracts"
+                )
+                or 0
+            )
+
+            if contracts <= 0:
+                continue
+
+            symbol = sembol_duzelt(
+                p["symbol"]
+            )
+
+            side = p["side"]
+
+            entry = float(
+                p["entryPrice"]
+            )
+
+            leverage = float(
+                p.get(
+                    "leverage"
+                )
+                or 1
+            )
+
+            ticker = (
+                exchange.fetch_ticker(
+                    symbol
+                )
+            )
+
+            current = float(
+                ticker["last"]
+            )
+
+            roi = roi_hesapla(
+
+                side,
+
+                current,
+
+                entry,
+
+                leverage
+            )
+
+            ptype = pozisyon_tipi(p)
+
+            if symbol not in (
+                pozisyon_en_yuksek_kar
+            ):
+
+                pozisyon_en_yuksek_kar[
+                    symbol
+                ] = roi
+
+            elif roi > (
+                pozisyon_en_yuksek_kar[
+                    symbol
+                ]
+            ):
+
+                pozisyon_en_yuksek_kar[
+                    symbol
+                ] = roi
+
+            highest = (
+                pozisyon_en_yuksek_kar[
+                    symbol
+                ]
+            )
+
+            print(
+
+                f"[POZİSYON] "
+                f"{symbol} "
+                f"{side.upper()} "
+                f"{ptype} "
+                f"ROI %{roi:.2f} "
+                f"Max %{highest:.2f}",
+
+                flush=True
+            )
+
+            # =================================================
+            # SCALP
+            # =================================================
+
+            if ptype == "scalp":
+
+                # Cron tarafından da kontrol edilir.
+                #
+                # Sürekli monitor ayrıca bunu kontrol ediyor.
+                #
+                if roi >= SCALP_TP_ROI:
+
+                    scalp_pozisyon_kapat(
+
+                        exchange,
+
+                        p,
+
+                        "TP +%3",
+
+                        roi
+                    )
+
+                    continue
+
+                if roi <= SCALP_SL_ROI:
+
+                    scalp_pozisyon_kapat(
+
+                        exchange,
+
+                        p,
+
+                        "SL -%1.5",
+
+                        roi
+                    )
+
+                    continue
+
+                continue
+
+            # =================================================
+            # FIRSAT
+            # =================================================
+
+            if ptype == "opportunity":
+
+                close_side = (
+
+                    "sell"
+
+                    if side == "long"
+
+                    else
+
+                    "buy"
+                )
+
+                # Çok sert ters hareket
+                if roi <= -25:
+
+                    exchange.create_order(
+
+                        symbol,
+
+                        "market",
+
+                        close_side,
+
+                        contracts,
+
+                        None,
+
+                        {
+                            "reduceOnly":
+                                True
+                        }
+                    )
+
+                    print(
+
+                        f"[ACİL KORUMA] "
+                        f"{symbol} "
+                        f"ROI %{roi:.2f}",
+
+                        flush=True
+                    )
+
+                    son_kapanis_zamanlari[
+                        symbol
+                    ] = int(
+                        time.time()
+                        * 1000
+                    )
+
+                    continue
+
+                # Trailing stop
+                new_stop = (
+                    trailing_stop_fiyat(
+
+                        side,
+
+                        entry,
+
+                        roi,
+
+                        leverage
+                    )
+                )
+
+                if new_stop is not None:
+
+                    stop_guncelle(
+
+                        exchange,
+
+                        symbol,
+
+                        (
+                            "buy"
+                            if side == "long"
+                            else "sell"
+                        ),
+
+                        contracts,
+
+                        new_stop
+                    )
+
+                # Zirveden geri çekilme
+                if highest >= 20:
+
+                    if (
+                        highest
+                        -
+                        roi
+                        >= 10
+                    ):
+
+                        exchange.create_order(
+
+                            symbol,
+
+                            "market",
+
+                            close_side,
+
+                            contracts,
+
+                            None,
+
+                            {
+                                "reduceOnly":
+                                    True
+                            }
+                        )
+
+                        print(
+
+                            f"[TRAIL EXIT] "
+                            f"{symbol} "
+                            f"Max %{highest:.2f} "
+                            f"Current %{roi:.2f}",
+
+                            flush=True
+                        )
+
+                        son_kapanis_zamanlari[
+                            symbol
+                        ] = int(
+                            time.time()
+                            * 1000
+                        )
+
+                        continue
+
+        except Exception as e:
+
+            print(
+
+                f"[POZİSYON YÖNETİM HATA] "
+                f"{p.get('symbol')}: {e}",
+
+                flush=True
+            )
+
+
+# ============================================================
+# İLK STOP
+# ============================================================
+
+def ilk_stop_yerlestir(
+    exchange,
+    symbol,
+    side,
+    amount,
+    stop_price
+):
+
+    close_side = (
+
+        "sell"
+
+        if side == "buy"
+
+        else
+
+        "buy"
+    )
+
+    try:
+
+        stop_price = float(
+
+            exchange
+            .price_to_precision(
+                symbol,
+                stop_price
+            )
+        )
+
+        eski = (
+            mevcut_stop_emirlerini_getir(
+                exchange,
+                symbol
+            )
+        )
+
+        for order in eski:
+
+            try:
+
+                exchange.cancel_order(
+                    order["id"],
+                    symbol
+                )
+
+            except Exception:
+
+                pass
+
+        order = exchange.create_order(
+
+            symbol,
+
+            "STOP_MARKET",
+
+            close_side,
+
+            amount,
+
+            None,
+
+            {
+
+                "stopPrice":
+                    stop_price,
+
+                "reduceOnly":
+                    True,
+
+                "workingType":
+                    "MARK_PRICE"
+            }
+        )
+
+        pozisyon_stoplari[
+            symbol
+        ] = stop_price
+
+        print(
+
+            f"[İLK STOP] "
+            f"{symbol} "
+            f"{stop_price}",
+
+            flush=True
+        )
+
+        return order
+
+    except Exception as e:
+
+        print(
+
+            f"[İLK STOP HATA] "
+            f"{symbol}: {e}",
+
+            flush=True
+        )
+
+        return None
 
 
 # ============================================================
@@ -839,70 +2279,86 @@ def skorla_coin(
 ):
 
     result = {
-        "symbol": sembol_temizle(symbol),
-        "long_score": 0,
-        "short_score": 0,
-        "long_reasons": [],
-        "short_reasons": [],
-        "direction": None,
-        "score": 0,
-        "atr": None,
-        "price": None,
-        "rsi_5m": None,
-        "rsi_15m": None,
-        "rsi_1h": None,
-        "adx_1h": None,
-        "funding": 0
+
+        "symbol":
+            symbol,
+
+        "long_score":
+            0,
+
+        "short_score":
+            0,
+
+        "long_reasons":
+            [],
+
+        "short_reasons":
+            [],
+
+        "direction":
+            None,
+
+        "score":
+            0,
+
+        "atr":
+            None,
+
+        "price":
+            None,
+
+        "rsi_5m":
+            None,
+
+        "rsi_15m":
+            None,
+
+        "rsi_1h":
+            None,
+
+        "adx_1h":
+            None,
+
+        "funding":
+            0
     }
 
     try:
 
-        # ----------------------------------------------------
+        # ====================================================
         # FUNDING
-        # ----------------------------------------------------
-
-        funding = 0
+        # ====================================================
 
         try:
 
-            real_symbol = (
-                market_symbol_bul(
-                    exchange,
+            funding_data = (
+                exchange.fetch_funding_rate(
                     symbol
                 )
             )
 
-            if real_symbol:
+            funding = float(
 
-                funding_data = (
-                    exchange
-                    .fetch_funding_rate(
-                        real_symbol
-                    )
+                funding_data.get(
+                    "fundingRate",
+                    0
                 )
+                or 0
+            )
 
-                funding = float(
-                    funding_data.get(
-                        "fundingRate",
-                        0
-                    )
-                    or 0
-                )
+            result["funding"] = funding
 
-                result["funding"] = funding
+            if abs(funding) >= 0.0015:
 
-                # Aşırı funding
-                if abs(funding) >= 0.0015:
-
-                    return None
+                return None
 
         except Exception:
-            pass
 
+            funding = 0
 
-        # ----------------------------------------------------
-        # TIMEFRAME
-        # ----------------------------------------------------
+        # ====================================================
+        # VERİLER
+        # ====================================================
 
         df5 = ohlcv_getir(
             exchange,
@@ -933,15 +2389,19 @@ def skorla_coin(
         )
 
         if (
+
             df5 is None
-            or df15 is None
-            or df1 is None
-            or df4 is None
+            or
+            df15 is None
+            or
+            df1 is None
+            or
+            df4 is None
+
         ):
 
             return None
 
-        # Son kapanmış mum
         d5 = df5.iloc[-2]
         d15 = df15.iloc[-2]
         d1 = df1.iloc[-2]
@@ -964,11 +2424,12 @@ def skorla_coin(
         if not np.isfinite(atr):
             return None
 
-        # ----------------------------------------------------
+        # ====================================================
         # VOLATİLİTE
-        # ----------------------------------------------------
+        # ====================================================
 
         atr_pct = (
+
             atr
             /
             price
@@ -977,11 +2438,12 @@ def skorla_coin(
         )
 
         if atr_pct > 12:
+
             return None
 
-        # ----------------------------------------------------
+        # ====================================================
         # HACİM
-        # ----------------------------------------------------
+        # ====================================================
 
         volume_ratio_5 = float(
             d5["volume_ratio"]
@@ -992,74 +2454,92 @@ def skorla_coin(
         )
 
         if (
+
             not np.isfinite(
                 volume_ratio_5
             )
+
             or
+
             not np.isfinite(
                 volume_ratio_15
             )
+
         ):
+
             return None
 
         if (
-            volume_ratio_5 < 0.55
+
+            volume_ratio_5 < 0.65
+
             and
-            volume_ratio_15 < 0.55
+
+            volume_ratio_15 < 0.65
+
         ):
+
             return None
 
-        # ----------------------------------------------------
-        # 4H TREND
-        # ----------------------------------------------------
+        # ====================================================
+        # TREND
+        # ====================================================
 
         trend4_long = (
+
             d4["close"]
             >
             d4["ema50"]
+
             and
+
             d4["ema50"]
             >
             d4["ema200"]
         )
 
         trend4_short = (
+
             d4["close"]
             <
             d4["ema50"]
+
             and
+
             d4["ema50"]
             <
             d4["ema200"]
         )
 
-        # ----------------------------------------------------
-        # 1H TREND
-        # ----------------------------------------------------
-
         trend1_long = (
+
             d1["close"]
             >
             d1["ema50"]
+
             and
+
             d1["ema9"]
             >
             d1["ema21"]
         )
 
         trend1_short = (
+
             d1["close"]
             <
             d1["ema50"]
+
             and
+
             d1["ema9"]
             <
             d1["ema21"]
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # ADX
-        # ----------------------------------------------------
+        # ====================================================
 
         adx = float(
             d1["adx"]
@@ -1071,9 +2551,9 @@ def skorla_coin(
         if adx < 15:
             return None
 
-        # ----------------------------------------------------
+        # ====================================================
         # RSI
-        # ----------------------------------------------------
+        # ====================================================
 
         rsi1 = float(
             d1["rsi"]
@@ -1092,9 +2572,9 @@ def skorla_coin(
         result["rsi_5m"] = rsi5
         result["adx_1h"] = adx
 
-        # ----------------------------------------------------
+        # ====================================================
         # LONG
-        # ----------------------------------------------------
+        # ====================================================
 
         long_score = 0
         long_reasons = []
@@ -1120,7 +2600,7 @@ def skorla_coin(
             long_score += 16
 
             long_reasons.append(
-                "1H trend yukarı"
+                "1H EMA trendi yukarı"
             )
 
         elif d1["close"] > d1["ema50"]:
@@ -1207,15 +2687,7 @@ def skorla_coin(
 
             long_score += 3
 
-        if (
-            np.isfinite(
-                d1["recent_high"]
-            )
-            and
-            price
-            >
-            d1["recent_high"]
-        ):
+        if price > d1["recent_high"]:
 
             long_score += 10
 
@@ -1235,9 +2707,9 @@ def skorla_coin(
                 "Squeeze"
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # SHORT
-        # ----------------------------------------------------
+        # ====================================================
 
         short_score = 0
         short_reasons = []
@@ -1263,7 +2735,7 @@ def skorla_coin(
             short_score += 16
 
             short_reasons.append(
-                "1H trend aşağı"
+                "1H EMA trendi aşağı"
             )
 
         elif d1["close"] < d1["ema50"]:
@@ -1311,7 +2783,7 @@ def skorla_coin(
             short_score += 10
 
             short_reasons.append(
-                "RSI short uygun"
+                "RSI short için uygun"
             )
 
         elif 52 < rsi1 <= 58:
@@ -1350,15 +2822,7 @@ def skorla_coin(
 
             short_score += 3
 
-        if (
-            np.isfinite(
-                d1["recent_low"]
-            )
-            and
-            price
-            <
-            d1["recent_low"]
-        ):
+        if price < d1["recent_low"]:
 
             short_score += 10
 
@@ -1378,23 +2842,30 @@ def skorla_coin(
                 "Squeeze"
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # YÖN
-        # ----------------------------------------------------
+        # ====================================================
 
         if long_score >= short_score:
 
             direction = "buy"
+
             score = long_score
+
             reasons = long_reasons
 
         else:
 
             direction = "sell"
+
             score = short_score
+
             reasons = short_reasons
 
-        # İki taraf çok yakınsa işlem yok
+        # ====================================================
+        # ÇELİŞKİ
+        # ====================================================
+
         if abs(
             long_score
             -
@@ -1415,7 +2886,9 @@ def skorla_coin(
             direction
         )
 
-        result["score"] = score
+        result["score"] = (
+            score
+        )
 
         result["reasons"] = (
             reasons
@@ -1426,8 +2899,10 @@ def skorla_coin(
     except Exception as e:
 
         print(
+
             f"[SKOR HATA] "
             f"{symbol}: {e}",
+
             flush=True
         )
 
@@ -1470,21 +2945,12 @@ def miktar_hesapla(
     price
 ):
 
-    real_symbol = (
-        market_symbol_bul(
-            exchange,
-            symbol
-        )
-    )
-
-    if not real_symbol:
-        return 0
-
     market = exchange.market(
-        real_symbol
+        symbol
     )
 
     min_amount = (
+
         market
         .get("limits", {})
         .get("amount", {})
@@ -1492,6 +2958,7 @@ def miktar_hesapla(
     )
 
     if not min_amount:
+
         min_amount = 0.001
 
     notional = (
@@ -1514,15 +2981,19 @@ def miktar_hesapla(
     try:
 
         amount = float(
-            exchange.amount_to_precision(
-                real_symbol,
+
+            exchange
+            .amount_to_precision(
+                symbol,
                 amount
             )
         )
 
     except Exception:
 
-        amount = float(amount)
+        amount = float(
+            amount
+        )
 
     return amount
 
@@ -1537,32 +3008,18 @@ def isolated_ve_kaldirac_ayarla(
     leverage
 ):
 
-    real_symbol = (
-        market_symbol_bul(
-            exchange,
-            symbol
-        )
-    )
-
-    if not real_symbol:
-
-        print(
-            f"[MARGIN] Market bulunamadı: {symbol}",
-            flush=True
-        )
-
-        return False
-
     try:
 
         exchange.set_margin_mode(
             "isolated",
-            real_symbol
+            symbol
         )
 
         print(
+
             f"[MARGIN] "
             f"{symbol} -> ISOLATED",
+
             flush=True
         )
 
@@ -1571,16 +3028,20 @@ def isolated_ve_kaldirac_ayarla(
         text = str(e).lower()
 
         if (
+
             "no need" not in text
             and
             "already" not in text
             and
             "isolated" not in text
+
         ):
 
             print(
+
                 f"[MARGIN UYARI] "
                 f"{symbol}: {e}",
+
                 flush=True
             )
 
@@ -1588,879 +3049,30 @@ def isolated_ve_kaldirac_ayarla(
 
         exchange.set_leverage(
             leverage,
-            real_symbol
+            symbol
         )
 
         print(
+
             f"[LEVERAGE] "
-            f"{symbol} -> "
-            f"{leverage}x",
+            f"{symbol} -> {leverage}x",
+
             flush=True
         )
 
     except Exception as e:
 
         print(
+
             f"[LEVERAGE HATA] "
             f"{symbol}: {e}",
+
             flush=True
         )
 
         return False
 
     return True
-
-
-# ============================================================
-# STOP EMİRLERİ
-# ============================================================
-
-def mevcut_stop_emirlerini_getir(
-    exchange,
-    symbol
-):
-
-    real_symbol = (
-        market_symbol_bul(
-            exchange,
-            symbol
-        )
-    )
-
-    if not real_symbol:
-        return []
-
-    try:
-
-        orders = (
-            exchange.fetch_open_orders(
-                real_symbol
-            )
-        )
-
-        result = []
-
-        for order in orders:
-
-            order_type = (
-                order.get("type")
-                or ""
-            ).upper()
-
-            if order_type in [
-                "STOP_MARKET",
-                "STOP",
-                "TAKE_PROFIT_MARKET",
-                "TAKE_PROFIT"
-            ]:
-
-                result.append(
-                    order
-                )
-
-        return result
-
-    except Exception as e:
-
-        print(
-            f"[STOP LISTE HATA] "
-            f"{symbol}: {e}",
-            flush=True
-        )
-
-        return []
-
-
-def stop_emri_koy(
-    exchange,
-    symbol,
-    side,
-    amount,
-    stop_price
-):
-
-    real_symbol = (
-        market_symbol_bul(
-            exchange,
-            symbol
-        )
-    )
-
-    if not real_symbol:
-        return None
-
-    close_side = (
-        "sell"
-        if side == "buy"
-        else "buy"
-    )
-
-    try:
-
-        stop_price = float(
-            exchange.price_to_precision(
-                real_symbol,
-                stop_price
-            )
-        )
-
-        order = exchange.create_order(
-            real_symbol,
-            "STOP_MARKET",
-            close_side,
-            amount,
-            None,
-            {
-                "stopPrice": stop_price,
-                "reduceOnly": True,
-                "workingType": "MARK_PRICE"
-            }
-        )
-
-        print(
-            f"[STOP] "
-            f"{symbol} -> "
-            f"{stop_price}",
-            flush=True
-        )
-
-        return order
-
-    except Exception as e:
-
-        print(
-            f"[STOP HATA] "
-            f"{symbol}: {e}",
-            flush=True
-        )
-
-        return None
-
-
-def stop_guncelle(
-    exchange,
-    symbol,
-    side,
-    amount,
-    yeni_stop
-):
-
-    try:
-
-        ticker_symbol = (
-            market_symbol_bul(
-                exchange,
-                symbol
-            )
-        )
-
-        if not ticker_symbol:
-            return False
-
-        ticker = (
-            exchange.fetch_ticker(
-                ticker_symbol
-            )
-        )
-
-        current_price = float(
-            ticker["last"]
-        )
-
-        mevcut = (
-            pozisyon_stoplari
-            .get(
-                sembol_temizle(symbol)
-            )
-        )
-
-        # Stop kötüleşmesin
-        if mevcut is not None:
-
-            if side == "buy":
-
-                if yeni_stop <= mevcut:
-                    return False
-
-            else:
-
-                if yeni_stop >= mevcut:
-                    return False
-
-        # Fiyatın yanlış tarafına stop koyma
-        if side == "buy":
-
-            if yeni_stop >= current_price:
-
-                yeni_stop = (
-                    current_price
-                    *
-                    0.998
-                )
-
-        else:
-
-            if yeni_stop <= current_price:
-
-                yeni_stop = (
-                    current_price
-                    *
-                    1.002
-                )
-
-        eski_stoplar = (
-            mevcut_stop_emirlerini_getir(
-                exchange,
-                symbol
-            )
-        )
-
-        for order in eski_stoplar:
-
-            try:
-
-                exchange.cancel_order(
-                    order["id"],
-                    ticker_symbol
-                )
-
-            except Exception:
-                pass
-
-        order = stop_emri_koy(
-            exchange,
-            symbol,
-            side,
-            amount,
-            yeni_stop
-        )
-
-        if order:
-
-            pozisyon_stoplari[
-                sembol_temizle(symbol)
-            ] = yeni_stop
-
-            return True
-
-    except Exception as e:
-
-        print(
-            f"[STOP GÜNCELLEME HATA] "
-            f"{symbol}: {e}",
-            flush=True
-        )
-
-    return False
-
-
-# ============================================================
-# FIRSAT BAŞLANGIÇ STOP
-# ============================================================
-
-def baslangic_stop_hesapla(
-    side,
-    entry_price,
-    atr,
-    score
-):
-
-    if score >= 90:
-
-        atr_multiplier = 2.2
-
-    elif score >= 80:
-
-        atr_multiplier = 2.0
-
-    elif score >= 72:
-
-        atr_multiplier = 1.8
-
-    else:
-
-        atr_multiplier = 1.6
-
-    if side == "buy":
-
-        return (
-            entry_price
-            -
-            atr
-            *
-            atr_multiplier
-        )
-
-    return (
-        entry_price
-        +
-        atr
-        *
-        atr_multiplier
-    )
-
-
-# ============================================================
-# ROI
-# ============================================================
-
-def roi_hesapla(
-    side,
-    current_price,
-    entry_price,
-    leverage
-):
-
-    if entry_price <= 0:
-        return 0
-
-    if side == "long":
-
-        price_change = (
-            current_price
-            -
-            entry_price
-        ) / entry_price
-
-    else:
-
-        price_change = (
-            entry_price
-            -
-            current_price
-        ) / entry_price
-
-    return (
-        price_change
-        *
-        100
-        *
-        leverage
-    )
-
-
-# ============================================================
-# TRAILING STOP
-# ============================================================
-
-def trailing_stop_fiyat(
-    side,
-    entry_price,
-    roi,
-    leverage
-):
-
-    if roi < 5:
-        return None
-
-    locked_roi = (
-        int(
-            roi // 5
-        )
-        -
-        1
-    ) * 5
-
-    if locked_roi < 0:
-        locked_roi = 0
-
-    price_pct = (
-        locked_roi
-        /
-        max(
-            leverage,
-            1
-        )
-    )
-
-    if side == "long":
-
-        return (
-            entry_price
-            *
-            (
-                1
-                +
-                price_pct / 100
-            )
-        )
-
-    return (
-        entry_price
-        *
-        (
-            1
-            -
-            price_pct / 100
-        )
-    )
-
-
-# ============================================================
-# POZİSYON KAPAT
-# ============================================================
-
-def pozisyon_kapat(
-    exchange,
-    symbol,
-    side,
-    contracts,
-    sebep
-):
-
-    try:
-
-        real_symbol = (
-            market_symbol_bul(
-                exchange,
-                symbol
-            )
-        )
-
-        if not real_symbol:
-            return False
-
-        close_side = (
-            "sell"
-            if side == "long"
-            else "buy"
-        )
-
-        exchange.create_order(
-            real_symbol,
-            "market",
-            close_side,
-            contracts,
-            None,
-            {
-                "reduceOnly": True
-            }
-        )
-
-        temiz_symbol = (
-            sembol_temizle(symbol)
-        )
-
-        son_kapanis_zamanlari[
-            temiz_symbol
-        ] = int(
-            time.time() * 1000
-        )
-
-        pozisyon_en_yuksek_kar.pop(
-            temiz_symbol,
-            None
-        )
-
-        pozisyon_stoplari.pop(
-            temiz_symbol,
-            None
-        )
-
-        print(
-            f"[POZİSYON KAPATILDI] "
-            f"{symbol} "
-            f"{side.upper()} "
-            f"Sebep={sebep}",
-            flush=True
-        )
-
-        return True
-
-    except Exception as e:
-
-        print(
-            f"[POZİSYON KAPAT HATA] "
-            f"{symbol}: {e}",
-            flush=True
-        )
-
-        return False
-
-
-# ============================================================
-# POZİSYON YÖNETİMİ
-# ============================================================
-
-def pozisyonlari_yonet(
-    exchange,
-    positions
-):
-
-    aktif_semboller = []
-
-    for p in positions:
-
-        try:
-
-            contracts = float(
-                p.get("contracts")
-                or 0
-            )
-
-        except Exception:
-
-            contracts = 0
-
-        if contracts <= 0:
-            continue
-
-        symbol = sembol_temizle(
-            p["symbol"]
-        )
-
-        aktif_semboller.append(
-            symbol
-        )
-
-    # Kapananları hafızadan temizle
-    for symbol in list(
-        pozisyon_en_yuksek_kar.keys()
-    ):
-
-        if symbol not in aktif_semboller:
-
-            son_kapanis_zamanlari[
-                symbol
-            ] = int(
-                time.time() * 1000
-            )
-
-            pozisyon_en_yuksek_kar.pop(
-                symbol,
-                None
-            )
-
-            pozisyon_stoplari.pop(
-                symbol,
-                None
-            )
-
-    # --------------------------------------------------------
-    # AKTİF POZİSYONLAR
-    # --------------------------------------------------------
-
-    for p in positions:
-
-        try:
-
-            contracts = float(
-                p.get("contracts")
-                or 0
-            )
-
-            if contracts <= 0:
-                continue
-
-            symbol = sembol_temizle(
-                p["symbol"]
-            )
-
-            side = p["side"]
-
-            entry = float(
-                p["entryPrice"]
-            )
-
-            leverage = float(
-                p.get("leverage")
-                or 1
-            )
-
-            real_symbol = (
-                market_symbol_bul(
-                    exchange,
-                    symbol
-                )
-            )
-
-            if not real_symbol:
-                continue
-
-            ticker = (
-                exchange.fetch_ticker(
-                    real_symbol
-                )
-            )
-
-            current = float(
-                ticker["last"]
-            )
-
-            roi = roi_hesapla(
-                side,
-                current,
-                entry,
-                leverage
-            )
-
-            ptype = pozisyon_tipi(
-                p
-            )
-
-            # ------------------------------------------------
-            # MAX KAR
-            # ------------------------------------------------
-
-            if (
-                symbol
-                not in
-                pozisyon_en_yuksek_kar
-            ):
-
-                pozisyon_en_yuksek_kar[
-                    symbol
-                ] = roi
-
-            elif (
-                roi
-                >
-                pozisyon_en_yuksek_kar[
-                    symbol
-                ]
-            ):
-
-                pozisyon_en_yuksek_kar[
-                    symbol
-                ] = roi
-
-            highest = (
-                pozisyon_en_yuksek_kar[
-                    symbol
-                ]
-            )
-
-            print(
-                f"[POZİSYON] "
-                f"{symbol} "
-                f"{side.upper()} "
-                f"{ptype} "
-                f"ROI %{roi:.2f} "
-                f"Max %{highest:.2f}",
-                flush=True
-            )
-
-            # =================================================
-            # SCALP YÖNETİMİ
-            # =================================================
-
-            if ptype == "scalp":
-
-                # ---------------------------------------------
-                # +3% ROI -> KÂR AL
-                # ---------------------------------------------
-
-                if roi >= SCALP_TP_ROI:
-
-                    pozisyon_kapat(
-                        exchange,
-                        symbol,
-                        side,
-                        contracts,
-                        f"SCALP TP +%{SCALP_TP_ROI}"
-                    )
-
-                    continue
-
-                # ---------------------------------------------
-                # -1% ROI -> STOP
-                # ---------------------------------------------
-
-                if roi <= SCALP_SL_ROI:
-
-                    pozisyon_kapat(
-                        exchange,
-                        symbol,
-                        side,
-                        contracts,
-                        f"SCALP SL %{SCALP_SL_ROI}"
-                    )
-
-                    continue
-
-                # ---------------------------------------------
-                # +1% ROI -> ENTRY STOP
-                # ---------------------------------------------
-
-                if roi >= SCALP_ENTRY_LOCK_ROI:
-
-                    stop_guncelle(
-                        exchange,
-                        symbol,
-                        (
-                            "buy"
-                            if side == "long"
-                            else "sell"
-                        ),
-                        contracts,
-                        entry
-                    )
-
-                continue
-
-            # =================================================
-            # FIRSAT YÖNETİMİ
-            # =================================================
-
-            if ptype == "opportunity":
-
-                # Acil zarar koruması
-                if roi <= -25:
-
-                    pozisyon_kapat(
-                        exchange,
-                        symbol,
-                        side,
-                        contracts,
-                        "ACİL KORUMA -25%"
-                    )
-
-                    continue
-
-                # Dinamik trailing
-                new_stop = (
-                    trailing_stop_fiyat(
-                        side,
-                        entry,
-                        roi,
-                        leverage
-                    )
-                )
-
-                if new_stop is not None:
-
-                    stop_guncelle(
-                        exchange,
-                        symbol,
-                        (
-                            "buy"
-                            if side == "long"
-                            else "sell"
-                        ),
-                        contracts,
-                        new_stop
-                    )
-
-                # Zirveden geri çekilme
-                if highest >= 20:
-
-                    if (
-                        highest
-                        -
-                        roi
-                        >= 10
-                    ):
-
-                        pozisyon_kapat(
-                            exchange,
-                            symbol,
-                            side,
-                            contracts,
-                            "TRAIL EXIT"
-                        )
-
-                        continue
-
-        except Exception as e:
-
-            print(
-                f"[POZİSYON YÖNETİM HATA] "
-                f"{p.get('symbol')}: {e}",
-                flush=True
-            )
-
-
-# ============================================================
-# İLK STOP
-# ============================================================
-
-def ilk_stop_yerlestir(
-    exchange,
-    symbol,
-    side,
-    amount,
-    stop_price
-):
-
-    real_symbol = (
-        market_symbol_bul(
-            exchange,
-            symbol
-        )
-    )
-
-    if not real_symbol:
-        return None
-
-    try:
-
-        close_side = (
-            "sell"
-            if side == "buy"
-            else "buy"
-        )
-
-        stop_price = float(
-            exchange.price_to_precision(
-                real_symbol,
-                stop_price
-            )
-        )
-
-        eski = (
-            mevcut_stop_emirlerini_getir(
-                exchange,
-                symbol
-            )
-        )
-
-        for order in eski:
-
-            try:
-
-                exchange.cancel_order(
-                    order["id"],
-                    real_symbol
-                )
-
-            except Exception:
-                pass
-
-        order = exchange.create_order(
-            real_symbol,
-            "STOP_MARKET",
-            close_side,
-            amount,
-            None,
-            {
-                "stopPrice": stop_price,
-                "reduceOnly": True,
-                "workingType": "MARK_PRICE"
-            }
-        )
-
-        pozisyon_stoplari[
-            sembol_temizle(symbol)
-        ] = stop_price
-
-        print(
-            f"[İLK STOP] "
-            f"{symbol} -> "
-            f"{stop_price}",
-            flush=True
-        )
-
-        return order
-
-    except Exception as e:
-
-        print(
-            f"[İLK STOP HATA] "
-            f"{symbol}: {e}",
-            flush=True
-        )
-
-        return None
 
 
 # ============================================================
@@ -2475,8 +3087,10 @@ def en_iyi_firsat_bul(
     adaylar = []
 
     print(
+
         f"[FIRSAT] "
         f"{len(symbols)} coin analiz ediliyor...",
+
         flush=True
     )
 
@@ -2485,12 +3099,15 @@ def en_iyi_firsat_bul(
         if cooldown_aktif_mi(
             symbol
         ):
+
             continue
 
         try:
 
             result = skorla_coin(
+
                 exchange,
+
                 symbol
             )
 
@@ -2502,6 +3119,7 @@ def en_iyi_firsat_bul(
                 <
                 OPPORTUNITY_MIN_SCORE
             ):
+
                 continue
 
             result["type"] = (
@@ -2513,19 +3131,23 @@ def en_iyi_firsat_bul(
             )
 
             print(
+
                 f"[FIRSAT ADAY] "
                 f"{symbol} "
                 f"{result['direction']} "
                 f"SKOR="
                 f"{result['score']}",
+
                 flush=True
             )
 
         except Exception as e:
 
             print(
+
                 f"[FIRSAT COIN HATA] "
                 f"{symbol}: {e}",
+
                 flush=True
             )
 
@@ -2533,7 +3155,10 @@ def en_iyi_firsat_bul(
         return None
 
     adaylar.sort(
-        key=lambda x: x["score"],
+
+        key=lambda x:
+            x["score"],
+
         reverse=True
     )
 
@@ -2552,8 +3177,10 @@ def vur_kac_sinyali_bul(
     adaylar = []
 
     print(
+
         f"[SCALP] "
         f"{len(symbols)} coin taranıyor...",
+
         flush=True
     )
 
@@ -2562,12 +3189,15 @@ def vur_kac_sinyali_bul(
         if cooldown_aktif_mi(
             symbol
         ):
+
             continue
 
         try:
 
             result = skorla_coin(
+
                 exchange,
+
                 symbol
             )
 
@@ -2579,9 +3209,11 @@ def vur_kac_sinyali_bul(
                 <
                 SCALP_MIN_SCORE
             ):
+
                 continue
 
             df5 = ohlcv_getir(
+
                 exchange,
                 symbol,
                 "5m",
@@ -2589,6 +3221,7 @@ def vur_kac_sinyali_bul(
             )
 
             df15 = ohlcv_getir(
+
                 exchange,
                 symbol,
                 "15m",
@@ -2600,6 +3233,7 @@ def vur_kac_sinyali_bul(
                 or
                 df15 is None
             ):
+
                 continue
 
             d5 = df5.iloc[-2]
@@ -2612,80 +3246,98 @@ def vur_kac_sinyali_bul(
             if direction == "buy":
 
                 if not (
+
                     d5["ema9"]
                     >
                     d5["ema21"]
+
                     and
+
                     d15["ema9"]
                     >=
                     d15["ema21"]
+
                     and
+
                     d5["macd"]
                     >
                     d5["macd_signal"]
+
                     and
-                    48
-                    <=
+
                     d5["rsi"]
-                    <=
-                    72
+                    >= 48
+
+                    and
+
+                    d5["rsi"]
+                    <= 72
+
                 ):
+
                     continue
 
             else:
 
                 if not (
+
                     d5["ema9"]
                     <
                     d5["ema21"]
+
                     and
+
                     d15["ema9"]
                     <=
                     d15["ema21"]
+
                     and
+
                     d5["macd"]
                     <
                     d5["macd_signal"]
+
                     and
-                    28
-                    <=
+
                     d5["rsi"]
-                    <=
-                    55
+                    >= 28
+
+                    and
+
+                    d5["rsi"]
+                    <= 55
+
                 ):
+
                     continue
 
             result["type"] = "scalp"
 
-            # Scalp teyidine bonus
             result["score"] += 5
 
             adaylar.append(
                 result
             )
 
-            print(
-                f"[SCALP ADAY] "
-                f"{symbol} "
-                f"{direction} "
-                f"SKOR="
-                f"{result['score']}",
-                flush=True
-            )
-
         except Exception as e:
 
             print(
+
                 f"[SCALP ANALİZ HATA] "
                 f"{symbol}: {e}",
+
                 flush=True
             )
 
     if not adaylar:
+
         return None
 
     adaylar.sort(
-        key=lambda x: x["score"],
+
+        key=lambda x:
+            x["score"],
+
         reverse=True
     )
 
@@ -2703,23 +3355,18 @@ def pozisyon_ac(
     position_type
 ):
 
-    symbol = (
-        sembol_temizle(
-            candidate["symbol"]
-        )
+    symbol = candidate[
+        "symbol"
+    ]
+
+    direction = candidate[
+        "direction"
+    ]
+
+    leverage = kaldirac_belirle(
+        candidate["score"]
     )
 
-    direction = (
-        candidate["direction"]
-    )
-
-    leverage = (
-        kaldirac_belirle(
-            candidate["score"]
-        )
-    )
-
-    # Scalp maksimum 5x
     if position_type == "scalp":
 
         leverage = min(
@@ -2728,7 +3375,9 @@ def pozisyon_ac(
         )
 
     leverage = max(
+
         MIN_LEVERAGE,
+
         min(
             MAX_LEVERAGE,
             leverage
@@ -2736,6 +3385,7 @@ def pozisyon_ac(
     )
 
     print(
+
         f"[İŞLEM HAZIR] "
         f"{symbol} "
         f"{direction.upper()} "
@@ -2744,19 +3394,26 @@ def pozisyon_ac(
         f"{candidate['score']} "
         f"KALDIRAÇ="
         f"{leverage}x",
+
         flush=True
     )
 
     if not isolated_ve_kaldirac_ayarla(
+
         exchange,
+
         symbol,
+
         leverage
+
     ):
 
         print(
+
             f"[İŞLEM İPTAL] "
             f"{symbol} "
             f"isolated/leverage ayarlanamadı.",
+
             flush=True
         )
 
@@ -2764,19 +3421,9 @@ def pozisyon_ac(
 
     try:
 
-        real_symbol = (
-            market_symbol_bul(
-                exchange,
-                symbol
-            )
-        )
-
-        if not real_symbol:
-            return False
-
         ticker = (
             exchange.fetch_ticker(
-                real_symbol
+                symbol
             )
         )
 
@@ -2785,10 +3432,15 @@ def pozisyon_ac(
         )
 
         amount = miktar_hesapla(
+
             exchange,
+
             symbol,
+
             margin,
+
             leverage,
+
             price
         )
 
@@ -2796,6 +3448,7 @@ def pozisyon_ac(
             return False
 
         estimated_margin = (
+
             amount
             *
             price
@@ -2810,44 +3463,61 @@ def pozisyon_ac(
         ):
 
             print(
+
                 f"[MARGIN KORUMA] "
                 f"{symbol} "
-                f"hesaplanan margin "
-                f"{estimated_margin:.2f} "
-                f"> "
+                f"{estimated_margin:.2f} > "
                 f"{margin:.2f}",
+
                 flush=True
             )
 
             return False
 
         order = exchange.create_order(
-            real_symbol,
+
+            symbol,
+
             "market",
+
             direction,
+
             amount,
+
             None,
+
             {
+
                 "newClientOrderId":
+
                     (
+
                         "BOT_F_"
-                        if position_type
+
+                        if
+                        position_type
                         ==
                         "opportunity"
+
                         else
+
                         "BOT_S_"
                     )
+
                     +
+
                     str(
                         int(
                             time.time()
-                            * 1000
+                            *
+                            1000
                         )
                     )
             }
         )
 
         print(
+
             f"!!! "
             f"{position_type.upper()} "
             f"AÇILDI !!! "
@@ -2859,15 +3529,17 @@ def pozisyon_ac(
             f"{leverage}x "
             f"Score="
             f"{candidate['score']}",
+
             flush=True
         )
 
-        # Gerçek entry
-        time.sleep(0.5)
+        time.sleep(
+            0.5
+        )
 
         positions = (
             exchange.fetch_positions(
-                [real_symbol]
+                [symbol]
             )
         )
 
@@ -2878,7 +3550,9 @@ def pozisyon_ac(
             try:
 
                 contracts = float(
-                    p.get("contracts")
+                    p.get(
+                        "contracts"
+                    )
                     or 0
                 )
 
@@ -2895,82 +3569,92 @@ def pozisyon_ac(
         if real_position:
 
             real_entry = float(
-                real_position["entryPrice"]
+                real_position[
+                    "entryPrice"
+                ]
             )
 
             real_amount = float(
-                real_position["contracts"]
+                real_position[
+                    "contracts"
+                ]
+            )
+
+            real_leverage = float(
+                real_position.get(
+                    "leverage"
+                )
+                or leverage
             )
 
         else:
 
             real_entry = price
             real_amount = amount
+            real_leverage = leverage
 
-        # ----------------------------------------------------
-        # STOP
-        # ----------------------------------------------------
+        # ====================================================
+        # SCALP STOP
+        #
+        # -1.5 ROI
+        # ====================================================
 
-        if position_type == "opportunity":
+        if position_type == "scalp":
+
+            stop_price = (
+                scalp_stop_fiyati(
+
+                    direction,
+
+                    real_entry,
+
+                    real_leverage
+                )
+            )
+
+            print(
+
+                f"[SCALP AYAR] "
+                f"{symbol} "
+                f"TP=+%3 ROI "
+                f"SL=-%1.5 ROI "
+                f"Leverage="
+                f"{real_leverage}x "
+                f"Stop="
+                f"{stop_price}",
+
+                flush=True
+            )
+
+        # ====================================================
+        # FIRSAT STOP
+        # ====================================================
+
+        else:
 
             stop_price = (
                 baslangic_stop_hesapla(
+
                     direction,
+
                     real_entry,
+
                     candidate["atr"],
+
                     candidate["score"]
                 )
             )
 
-        else:
-
-            # Scalp başlangıç stopu:
-            #
-            # ROI -1%
-            # fiyat hareketi =
-            # 1 / leverage %
-
-            if direction == "buy":
-
-                stop_price = (
-                    real_entry
-                    *
-                    (
-                        1
-                        -
-                        (
-                            1.0
-                            /
-                            leverage
-                            /
-                            100
-                        )
-                    )
-                )
-
-            else:
-
-                stop_price = (
-                    real_entry
-                    *
-                    (
-                        1
-                        +
-                        (
-                            1.0
-                            /
-                            leverage
-                            /
-                            100
-                        )
-                    )
-                )
-
         ilk_stop_yerlestir(
+
             exchange,
+
             symbol,
+
             direction,
+
             real_amount,
+
             stop_price
         )
 
@@ -2979,8 +3663,10 @@ def pozisyon_ac(
     except Exception as e:
 
         print(
+
             f"[POZİSYON AÇMA HATA] "
             f"{symbol}: {e}",
+
             flush=True
         )
 
@@ -2988,51 +3674,7 @@ def pozisyon_ac(
 
 
 # ============================================================
-# TICKER DEĞİŞİMİ
-# ============================================================
-
-def ticker_change_getir(
-    ticker
-):
-
-    try:
-
-        info = ticker.get(
-            "info",
-            {}
-        )
-
-        change = info.get(
-            "priceChangePercent"
-        )
-
-        if change is not None:
-            return float(change)
-
-    except Exception:
-        pass
-
-    try:
-
-        percentage = (
-            ticker.get(
-                "percentage"
-            )
-        )
-
-        if percentage is not None:
-            return float(
-                percentage
-            )
-
-    except Exception:
-        pass
-
-    return None
-
-
-# ============================================================
-# GAINERS / LOSERS
+# MARKET LİSTESİ
 # ============================================================
 
 def top_gainers_losers(
@@ -3049,265 +3691,129 @@ def top_gainers_losers(
     except Exception as e:
 
         print(
+
             f"[TICKER HATA] {e}",
+
             flush=True
         )
 
         return [], []
 
-
     coin_list = []
 
-    for raw_symbol, ticker in (
-        tickers.items()
-    ):
+    for symbol, ticker in tickers.items():
 
         try:
 
-            symbol = (
-                sembol_temizle(
-                    raw_symbol
-                )
+            symbol = sembol_duzelt(
+                symbol
             )
+
+            if symbol not in markets:
+                continue
 
             if not gecerli_kripto_mu(
                 symbol
             ):
+
                 continue
 
-            real_symbol = (
-                market_symbol_bul(
-                    exchange,
-                    symbol
-                )
-            )
+            market = markets[
+                symbol
+            ]
 
-            if not real_symbol:
+            if not market.get(
+                "active",
+                True
+            ):
+
                 continue
 
-            market = markets.get(
-                real_symbol
+            info = ticker.get(
+                "info",
+                {}
             )
 
-            if market is None:
-
-                market = markets.get(
-                    symbol
-                )
-
-            if market is not None:
-
-                if not market.get(
-                    "active",
-                    True
-                ):
-                    continue
-
-                # Sadece perpetual USDT
-                if (
-                    market.get(
-                        "contract"
-                    )
-                    and
-                    market.get(
-                        "linear"
-                    )
-                    and
-                    market.get(
-                        "settle"
-                    )
-                    !=
-                    "USDT"
-                ):
-                    continue
-
-            change = (
-                ticker_change_getir(
-                    ticker
-                )
+            change = info.get(
+                "priceChangePercent"
             )
+
+            if change is None:
+
+                change = ticker.get(
+                    "percentage"
+                )
 
             if change is None:
                 continue
 
-            try:
-
-                quote_volume = float(
-                    ticker.get(
-                        "quoteVolume"
-                    )
-                    or 0
-                )
-
-            except Exception:
-
-                quote_volume = 0
-
-            # Çok düşük hacimli coinleri alma
-            if quote_volume < 500_000:
-                continue
-
-            coin_list.append({
-                "symbol": symbol,
-                "change": change,
-                "quoteVolume":
-                    quote_volume
-            })
-
-        except Exception:
-            continue
-
-
-    # --------------------------------------------------------
-    # GAINERS
-    # --------------------------------------------------------
-
-    coin_list.sort(
-        key=lambda x: x["change"],
-        reverse=True
-    )
-
-    gainers = [
-        x["symbol"]
-        for x in coin_list[:25]
-    ]
-
-
-    # --------------------------------------------------------
-    # LOSERS
-    # --------------------------------------------------------
-
-    coin_list.sort(
-        key=lambda x: x["change"]
-    )
-
-    losers = [
-        x["symbol"]
-        for x in coin_list[:25]
-    ]
-
-    return gainers, losers
-
-
-# ============================================================
-# FALLBACK TARAMA
-#
-# En önemli düzeltmelerden biri.
-#
-# Gainers/losers boş gelirse bot artık:
-#
-# "TARAMA 0"
-#
-# deyip durmayacak.
-#
-# Binance Futures'taki aktif USDT perpetual
-# coinleri hacim sırasına göre alacak.
-# ============================================================
-
-def fallback_hacim_coinleri(
-    exchange,
-    markets,
-    limit=40
-):
-
-    adaylar = []
-
-    try:
-
-        tickers = (
-            exchange.fetch_tickers()
-        )
-
-    except Exception as e:
-
-        print(
-            f"[FALLBACK TICKER HATA] {e}",
-            flush=True
-        )
-
-        return []
-
-
-    for raw_symbol, ticker in (
-        tickers.items()
-    ):
-
-        try:
-
-            symbol = (
-                sembol_temizle(
-                    raw_symbol
-                )
+            change = float(
+                change
             )
 
-            if not gecerli_kripto_mu(
-                symbol
-            ):
-                continue
-
-            real_symbol = (
-                market_symbol_bul(
-                    exchange,
-                    symbol
-                )
-            )
-
-            if not real_symbol:
-                continue
-
-            market = markets.get(
-                real_symbol
-            )
-
-            if not market:
-                continue
-
-            # USDT perpetual
-            if market.get("contract") is not True:
-                continue
-
-            if market.get("linear") is not True:
-                continue
-
-            if market.get("settle") != "USDT":
-                continue
-
-            if market.get(
-                "active",
-                True
-            ) is not True:
-                continue
-
-            quote_volume = float(
+            quote_volume = (
                 ticker.get(
                     "quoteVolume"
                 )
                 or 0
             )
 
-            if quote_volume < 500_000:
+            quote_volume = float(
+                quote_volume
+            )
+
+            if quote_volume < 1_000_000:
+
                 continue
 
-            adaylar.append({
-                "symbol": symbol,
-                "volume": quote_volume
+            coin_list.append({
+
+                "symbol":
+                    symbol,
+
+                "change":
+                    change,
+
+                "quoteVolume":
+                    quote_volume
             })
 
         except Exception:
+
             continue
 
+    coin_list.sort(
 
-    adaylar.sort(
-        key=lambda x: x["volume"],
+        key=lambda x:
+            x["change"],
+
         reverse=True
     )
 
-    result = [
+    gainers = [
+
         x["symbol"]
-        for x in adaylar[:limit]
+
+        for x in coin_list[:25]
     ]
 
-    return result
+    coin_list.sort(
+
+        key=lambda x:
+            x["change"]
+    )
+
+    losers = [
+
+        x["symbol"]
+
+        for x in coin_list[:25]
+    ]
+
+    return (
+        gainers,
+        losers
+    )
 
 
 # ============================================================
@@ -3322,16 +3828,11 @@ def unique_symbols(
     result = []
 
     for symbol in (
+
         gainers
         +
         losers
     ):
-
-        symbol = (
-            sembol_temizle(
-                symbol
-            )
-        )
 
         if symbol not in result:
 
@@ -3343,7 +3844,7 @@ def unique_symbols(
 
 
 # ============================================================
-# ANA BOT
+# ANA ANALİZ
 # ============================================================
 
 def arka_plan_analiz_islem():
@@ -3353,8 +3854,10 @@ def arka_plan_analiz_islem():
     ):
 
         print(
+
             "[CRON] Önceki analiz hâlâ "
             "çalışıyor. Atlandı.",
+
             flush=True
         )
 
@@ -3363,34 +3866,35 @@ def arka_plan_analiz_islem():
     try:
 
         print(
+
             "\n======================================",
+
             flush=True
         )
 
         print(
+
             "BOT ANALİZ BAŞLADI",
+
             datetime.now(
                 timezone.utc
             ).isoformat(),
+
             flush=True
         )
 
         print(
+
             "======================================",
+
             flush=True
         )
 
-        exchange = (
-            get_exchange()
-        )
+        exchange = get_exchange()
 
         markets = (
             exchange.load_markets()
         )
-
-        # ----------------------------------------------------
-        # BAKİYE
-        # ----------------------------------------------------
 
         balance = (
             exchange.fetch_balance()
@@ -3402,6 +3906,7 @@ def arka_plan_analiz_islem():
         )
 
         free_balance = float(
+
             usdt_info.get(
                 "free",
                 0
@@ -3410,6 +3915,7 @@ def arka_plan_analiz_islem():
         )
 
         total_balance = float(
+
             usdt_info.get(
                 "total",
                 free_balance
@@ -3418,15 +3924,19 @@ def arka_plan_analiz_islem():
         )
 
         print(
+
             f"[BAKİYE] "
-            f"Free={free_balance:.2f} "
-            f"Total={total_balance:.2f}",
+            f"Free="
+            f"{free_balance:.2f} "
+            f"Total="
+            f"{total_balance:.2f}",
+
             flush=True
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # POZİSYONLAR
-        # ----------------------------------------------------
+        # ====================================================
 
         positions = (
             exchange.fetch_positions()
@@ -3439,7 +3949,9 @@ def arka_plan_analiz_islem():
             try:
 
                 contracts = float(
-                    p.get("contracts")
+                    p.get(
+                        "contracts"
+                    )
                     or 0
                 )
 
@@ -3454,25 +3966,23 @@ def arka_plan_analiz_islem():
                 )
 
         print(
+
             f"[POZİSYON] "
             f"Toplam aktif="
             f"{len(active_positions)}",
+
             flush=True
         )
 
-        # ----------------------------------------------------
-        # MEVCUT POZİSYONLARI YÖNET
-        # ----------------------------------------------------
-
+        # Mevcut pozisyonları yönet
         pozisyonlari_yonet(
+
             exchange,
+
             active_positions
         )
 
-        # ----------------------------------------------------
-        # YENİ POZİSYONLARI AL
-        # ----------------------------------------------------
-
+        # Yeniden al
         positions = (
             exchange.fetch_positions()
         )
@@ -3484,7 +3994,9 @@ def arka_plan_analiz_islem():
             try:
 
                 contracts = float(
-                    p.get("contracts")
+                    p.get(
+                        "contracts"
+                    )
                     or 0
                 )
 
@@ -3498,27 +4010,30 @@ def arka_plan_analiz_islem():
                     p
                 )
 
-        # ----------------------------------------------------
-        # SAYIM
-        # ----------------------------------------------------
-
         scalp_positions = [
+
             p
+
             for p in active_positions
+
             if pozisyon_tipi(p)
             ==
             "scalp"
         ]
 
         opportunity_positions = [
+
             p
+
             for p in active_positions
+
             if pozisyon_tipi(p)
             ==
             "opportunity"
         ]
 
         print(
+
             f"[SAYIM] "
             f"Fırsat="
             f"{len(opportunity_positions)} "
@@ -3526,131 +4041,105 @@ def arka_plan_analiz_islem():
             f"{len(scalp_positions)} "
             f"Toplam="
             f"{len(active_positions)}",
+
             flush=True
         )
 
-        # ----------------------------------------------------
-        # MAX POZİSYON
-        # ----------------------------------------------------
+        # ====================================================
+        # MAKS POZİSYON
+        # ====================================================
 
         if (
             len(active_positions)
-            >= MAX_TOTAL_POSITIONS
+            >=
+            MAX_TOTAL_POSITIONS
         ):
 
             print(
-                "[KORUMA] "
-                "Maksimum 3 pozisyon aktif.",
+
+                "[KORUMA] Maksimum "
+                "3 pozisyon aktif.",
+
                 flush=True
             )
 
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # GAINERS / LOSERS
-        # ----------------------------------------------------
+        # ====================================================
 
         gainers, losers = (
             top_gainers_losers(
+
                 exchange,
+
                 markets
             )
         )
 
         print(
-            f"[GAINERS] "
-            f"{gainers}",
+
+            f"[GAINERS] {gainers}",
+
             flush=True
         )
 
         print(
-            f"[LOSERS] "
-            f"{losers}",
+
+            f"[LOSERS] {losers}",
+
             flush=True
         )
 
         target_symbols = (
             unique_symbols(
+
                 gainers,
+
                 losers
             )
         )
 
-        # ----------------------------------------------------
-        # GAINERS / LOSERS BOŞSA FALLBACK
-        # ----------------------------------------------------
+        active_symbols = [
 
-        if not target_symbols:
-
-            print(
-                "[FALLBACK] "
-                "Gainers/losers boş. "
-                "Hacim bazlı Futures taraması "
-                "başlatılıyor...",
-                flush=True
+            sembol_duzelt(
+                p["symbol"]
             )
 
-            target_symbols = (
-                fallback_hacim_coinleri(
-                    exchange,
-                    markets,
-                    40
-                )
-            )
-
-            print(
-                f"[FALLBACK] "
-                f"{len(target_symbols)} "
-                f"hacimli coin bulundu.",
-                flush=True
-            )
-
-        # ----------------------------------------------------
-        # AKTİF COINLERİ ÇIKAR
-        # ----------------------------------------------------
-
-        active_symbols = []
-
-        for p in active_positions:
-
-            try:
-
-                symbol = (
-                    sembol_temizle(
-                        p["symbol"]
-                    )
-                )
-
-                active_symbols.append(
-                    symbol
-                )
-
-            except Exception:
-                pass
+            for p in active_positions
+        ]
 
         target_symbols = [
+
             s
+
             for s in target_symbols
+
             if s not in active_symbols
         ]
 
         print(
+
             f"[TARAMA] "
             f"{len(target_symbols)} "
             f"benzersiz coin",
+
             flush=True
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # MAKRO
-        # ----------------------------------------------------
+        # ====================================================
 
         if makro_zaman_engeli_var_mi():
 
             print(
+
                 "[MAKRO ENGEL] "
                 "Yeni işlem açılmayacak. "
                 "Mevcut pozisyonlar yönetildi.",
+
                 flush=True
             )
 
@@ -3658,22 +4147,23 @@ def arka_plan_analiz_islem():
 
         # ====================================================
         # SCALP
-        #
-        # ÖNEMLİ:
-        #
-        # Fırsat pozisyonu açık olsa bile
-        # burası çalışmaya devam eder.
         # ====================================================
 
         if (
+
             len(scalp_positions)
+
             <
+
             MAX_SCALP_POSITIONS
+
         ):
 
             scalp_candidate = (
                 vur_kac_sinyali_bul(
+
                     exchange,
+
                     target_symbols
                 )
             )
@@ -3681,26 +4171,35 @@ def arka_plan_analiz_islem():
             if scalp_candidate:
 
                 print(
+
                     f"[EN İYİ SCALP] "
                     f"{scalp_candidate['symbol']} "
                     f"{scalp_candidate['direction']} "
                     f"SKOR="
                     f"{scalp_candidate['score']}",
+
                     flush=True
                 )
 
                 success = pozisyon_ac(
+
                     exchange,
+
                     scalp_candidate,
+
                     SCALP_MARGIN,
+
                     "scalp"
                 )
 
                 if success:
 
                     target_symbols = [
+
                         s
+
                         for s in target_symbols
+
                         if s
                         !=
                         scalp_candidate[
@@ -3712,59 +4211,29 @@ def arka_plan_analiz_islem():
                         0.5
                     )
 
-            else:
-
-                print(
-                    "[SCALP] "
-                    "Uygun scalp sinyali bulunamadı.",
-                    flush=True
-                )
-
-        else:
-
-            print(
-                "[SCALP] "
-                "2 aktif scalp pozisyonu var.",
-                flush=True
-            )
-
         # ====================================================
         # FIRSAT
         # ====================================================
 
-        if (
-            len(opportunity_positions)
-            >= 1
-        ):
+        # Fırsat zaten varsa scalp çalışmaya devam eder.
+        if len(
+            opportunity_positions
+        ) >= 1:
 
             print(
-                "[FIRSAT] "
-                "Zaten aktif fırsat "
-                "pozisyonu var. "
+
+                "[FIRSAT] Zaten aktif "
+                "fırsat pozisyonu var. "
                 "Scalp işlemleri devam edebilir.",
-                flush=True
-            )
 
-            print(
-                "======================================",
-                flush=True
-            )
-
-            print(
-                "BOT ANALİZ TAMAMLANDI",
-                flush=True
-            )
-
-            print(
-                "======================================",
                 flush=True
             )
 
             return
 
-        # ----------------------------------------------------
-        # POZİSYON SAYISINI YENİDEN KONTROL
-        # ----------------------------------------------------
+        # ====================================================
+        # POZİSYON SAYISINI TEKRAR KONTROL
+        # ====================================================
 
         positions = (
             exchange.fetch_positions()
@@ -3777,7 +4246,9 @@ def arka_plan_analiz_islem():
             try:
 
                 contracts = float(
-                    p.get("contracts")
+                    p.get(
+                        "contracts"
+                    )
                     or 0
                 )
 
@@ -3792,19 +4263,28 @@ def arka_plan_analiz_islem():
                 )
 
         if (
-            len(active_positions_now)
-            >= MAX_TOTAL_POSITIONS
+
+            len(
+                active_positions_now
+            )
+
+            >=
+
+            MAX_TOTAL_POSITIONS
+
         ):
 
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # FIRSAT ARA
-        # ----------------------------------------------------
+        # ====================================================
 
         opportunity_candidate = (
             en_iyi_firsat_bul(
+
                 exchange,
+
                 target_symbols
             )
         )
@@ -3812,29 +4292,17 @@ def arka_plan_analiz_islem():
         if not opportunity_candidate:
 
             print(
+
                 "[FIRSAT] "
                 "Uygun sinyal bulunamadı.",
-                flush=True
-            )
 
-            print(
-                "======================================",
-                flush=True
-            )
-
-            print(
-                "BOT ANALİZ TAMAMLANDI",
-                flush=True
-            )
-
-            print(
-                "======================================",
                 flush=True
             )
 
             return
 
         print(
+
             f"[EN İYİ FIRSAT] "
             f"{opportunity_candidate['symbol']} "
             f"{opportunity_candidate['direction'].upper()} "
@@ -3844,18 +4312,21 @@ def arka_plan_analiz_islem():
             f"{opportunity_candidate['long_score']} "
             f"SHORT="
             f"{opportunity_candidate['short_score']}",
+
             flush=True
         )
 
         print(
+
             f"[NEDENLER] "
             f"{opportunity_candidate.get('reasons', [])}",
+
             flush=True
         )
 
-        # ----------------------------------------------------
-        # BAKİYE KORUMA
-        # ----------------------------------------------------
+        # ====================================================
+        # BAKİYE KORUMASI
+        # ====================================================
 
         used_margin = 0
 
@@ -3864,6 +4335,7 @@ def arka_plan_analiz_islem():
             try:
 
                 used_margin += float(
+
                     p.get(
                         "initialMargin",
                         0
@@ -3872,55 +4344,75 @@ def arka_plan_analiz_islem():
                 )
 
             except Exception:
+
                 pass
 
         if (
+
             used_margin
             +
             OPPORTUNITY_MARGIN
+
             >
-            total_balance * 0.60
+
+            total_balance
+            *
+            0.60
+
         ):
 
             print(
+
                 "[BAKİYE KORUMA] "
                 "Yeni fırsat işlemi açılmadı.",
+
                 flush=True
             )
 
             return
 
-        # ----------------------------------------------------
+        # ====================================================
         # FIRSAT AÇ
-        # ----------------------------------------------------
+        # ====================================================
 
         pozisyon_ac(
+
             exchange,
+
             opportunity_candidate,
+
             OPPORTUNITY_MARGIN,
+
             "opportunity"
         )
 
         print(
+
             "======================================",
+
             flush=True
         )
 
         print(
+
             "BOT ANALİZ TAMAMLANDI",
+
             flush=True
         )
 
         print(
+
             "======================================",
+
             flush=True
         )
 
     except Exception as e:
 
         print(
-            f"[GENEL BOT HATASI] "
-            f"{e}",
+
+            f"[GENEL BOT HATASI] {e}",
+
             flush=True
         )
 
@@ -3931,6 +4423,7 @@ def arka_plan_analiz_islem():
             analiz_lock.release()
 
         except Exception:
+
             pass
 
 
@@ -3942,11 +4435,17 @@ def arka_plan_analiz_islem():
 def health_check():
 
     return (
+
         "Gelişmiş Binance Futures "
         "Fırsat + Scalp Botu Aktif",
+
         200
     )
 
+
+# ============================================================
+# OTOMATİK ANALİZ
+# ============================================================
 
 @app.route("/otomatik-analiz")
 def otomatik_analiz():
@@ -3954,22 +4453,33 @@ def otomatik_analiz():
     if analiz_lock.locked():
 
         return jsonify({
-            "durum": "Atlandi",
+
+            "durum":
+                "Atlandi",
+
             "mesaj":
                 "Önceki analiz hâlâ çalışıyor."
+
         }), 200
 
     thread = threading.Thread(
-        target=arka_plan_analiz_islem,
+
+        target=
+            arka_plan_analiz_islem,
+
         daemon=True
     )
 
     thread.start()
 
     return jsonify({
-        "durum": "Basarili",
+
+        "durum":
+            "Basarili",
+
         "mesaj":
             "Analiz arka planda başlatıldı."
+
     }), 200
 
 
@@ -3981,25 +4491,39 @@ def otomatik_analiz():
 def durum():
 
     return jsonify({
-        "bot": "aktif",
+
+        "bot":
+            "aktif",
+
         "timestamp":
             datetime.now(
                 timezone.utc
             ).isoformat(),
+
         "opportunity_margin":
             OPPORTUNITY_MARGIN,
+
         "scalp_margin":
             SCALP_MARGIN,
+
         "scalp_tp_roi":
             SCALP_TP_ROI,
-        "scalp_entry_lock_roi":
-            SCALP_ENTRY_LOCK_ROI,
+
         "scalp_sl_roi":
             SCALP_SL_ROI,
+
+        "scalp_monitor":
+            "aktif",
+
+        "scalp_monitor_interval":
+            SCALP_MONITOR_INTERVAL,
+
         "max_total_positions":
             MAX_TOTAL_POSITIONS,
+
         "max_scalp_positions":
             MAX_SCALP_POSITIONS
+
     })
 
 
@@ -4009,7 +4533,24 @@ def durum():
 
 if __name__ == "__main__":
 
+    # ========================================================
+    # SCALP MONITOR THREAD
+    #
+    # Flask başladıktan hemen sonra sürekli çalışır.
+    # ========================================================
+
+    scalp_thread = threading.Thread(
+
+        target=
+            scalp_monitor_loop,
+
+        daemon=True
+    )
+
+    scalp_thread.start()
+
     port = int(
+
         os.environ.get(
             "PORT",
             8080
@@ -4017,6 +4558,8 @@ if __name__ == "__main__":
     )
 
     app.run(
+
         host="0.0.0.0",
+
         port=port
     )
