@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 12.0  # Net Anapara (Margin)
+ORDER_SIZE = 12.0  # Net Anapara (Margin) - Ana Fırsat
 MAX_POSITIONS = 3  
 
 # VUR-KAÇ (SCALP) PARAMETRELERI
@@ -30,7 +30,7 @@ def get_exchange():
     })
 
 def gecerli_kripto_mu(symbol):
-    # TradFi / Hisse senedi / Opsiyon / Vadeli özel kontratları ve istenmeyenformatları ele
+    # TradFi / Hisse senedi / Opsiyon / Vadeli özel kontratları ve istenmeyen formatları ele
     yasakli_ifadeler = ['UP/', 'DOWN/', 'BEAR/', 'BULL/', '_', 'BID', 'ASK']
     if not symbol.endswith('USDT'):
         return False
@@ -110,14 +110,14 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "TradFi Filtreli Hibrit Bot Aktif", 200
+    return "Tam Süzülmüş ve Düzeltilmiş Hibrit Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- TradFi Filtreli Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- Tertemiz Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
-        exchange.load_markets()
+        markets = exchange.load_markets()
         
         balance_info = exchange.fetch_balance()['USDT']
         total_balance = balance_info['free'] + balance_info['used']
@@ -238,15 +238,15 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
+        # Temiz ve filtrelenmiş geçerli coin havuzu
+        gecerli_coin_listesi = [s for s in markets.keys() if gecerli_kripto_mu(s)]
+
         # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
         
         if SCALP_ENABLED and not scalp_aktif_var:
             try:
-                tickers = exchange.fetch_tickers()
-                populer_coinler = [s for s, t in tickers.items() if gecerli_kripto_mu(s)]
-                
-                for symbol in populer_coinler[:30]:
+                for symbol in gecerli_coin_listesi[:35]:
                     if symbol in aktif_semboller:
                         continue
                     
@@ -307,8 +307,7 @@ def otomatik_analiz():
                         except:
                             pass
                             
-                        market_data = exchange.load_markets()
-                        market = market_data.get(symbol, {})
+                        market = markets.get(symbol, {})
                         precision = int(market.get('precision', {}).get('amount', 3))
                         min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
                         
@@ -329,22 +328,22 @@ def otomatik_analiz():
             print(f"Maksimum ana pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Scalp çalışıyor, ana pozisyonlar dolu."})
 
-        tickers = exchange.fetch_tickers()
+        # Sadece geçerli kriptoların ticker verilerini çek
         coin_listesi = []
-        for symbol, t in tickers.items():
-            if gecerli_kripto_mu(symbol):
+        for symbol in gecerli_kripto_mu and gecerli_coin_listesi:
+            try:
+                t = exchange.fetch_ticker(symbol)
                 degisim_yuzdesi = 0.0
-                vol = 0.0
                 if 'info' in t and t['info'] is not None:
                     degisim_yuzdesi = float(t['info'].get('priceChangePercent', 0) or 0)
-                    vol = float(t['info'].get('quoteVolume', 0) or 0)
                 else:
                     last_p = t.get('last', 0) or 0
                     open_p = t.get('open', 0) or last_p
                     if open_p > 0 and last_p > 0:
                         degisim_yuzdesi = ((last_p - open_p) / open_p) * 100
-                    vol = t.get('quoteVolume', 0) or 0
-                coin_listesi.append({'symbol': symbol, 'change': degisim_yuzdesi, 'volume': vol})
+                coin_listesi.append({'symbol': symbol, 'change': degisim_yuzdesi})
+            except Exception:
+                continue
 
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         top_gainers = [item['symbol'] for item in coin_listesi[:20]]
@@ -440,8 +439,7 @@ def otomatik_analiz():
             except Exception:
                 pass
 
-            market_data = exchange.load_markets()
-            market = market_data.get(symbol, {})
+            market = markets.get(symbol, {})
             
             notional_target = ORDER_SIZE * hesaplanan_kaldirac
             raw_amount = notional_target / current_price
@@ -476,7 +474,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "TradFi filtreleriyle analiz tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Tertemiz süzülmüş analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
