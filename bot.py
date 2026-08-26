@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 12.0  # Artık NET ANAPARA (Margin) olarak harcanacak miktar!
+ORDER_SIZE = 12.0  # Net Anapara (Margin)
 MAX_POSITIONS = 3  
 
 # VUR-KAÇ (SCALP) PARAMETRELERI
@@ -28,6 +28,16 @@ def get_exchange():
         'enableRateLimit': True,
         'options': {'defaultType': 'future'}
     })
+
+def gecerli_kripto_mu(symbol):
+    # TradFi / Hisse senedi / Opsiyon / Vadeli özel kontratları ve istenmeyenformatları ele
+    yasakli_ifadeler = ['UP/', 'DOWN/', 'BEAR/', 'BULL/', '_', 'BID', 'ASK']
+    if not symbol.endswith('USDT'):
+        return False
+    for yasak in yasakli_ifadeler:
+        if yasak in symbol:
+            return False
+    return True
 
 def hesapla_rsi(series, period=14):
     delta = series.diff()
@@ -100,11 +110,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Doğru Anapara Hesaplamalı Hibrit Bot Aktif", 200
+    return "TradFi Filtreli Hibrit Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Doğru Anapara Maliyetli Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- TradFi Filtreli Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -234,7 +244,7 @@ def otomatik_analiz():
         if SCALP_ENABLED and not scalp_aktif_var:
             try:
                 tickers = exchange.fetch_tickers()
-                populer_coinler = [s for s, t in tickers.items() if 'USDT' in s and not any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])]
+                populer_coinler = [s for s, t in tickers.items() if gecerli_kripto_mu(s)]
                 
                 for symbol in populer_coinler[:30]:
                     if symbol in aktif_semboller:
@@ -302,7 +312,6 @@ def otomatik_analiz():
                         precision = int(market.get('precision', {}).get('amount', 3))
                         min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
                         
-                        # --- DOĞRU ANAPARA HESABI (SCALP) ---
                         notional_target = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
                         raw_amount = notional_target / cur_close
                         amount = max(round(raw_amount, precision), min_amount)
@@ -323,7 +332,7 @@ def otomatik_analiz():
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         for symbol, t in tickers.items():
-            if 'USDT' in symbol and not any(tradfi in symbol for tradfi in ['UP/', 'DOWN/', 'BEAR/', 'BULL/']):
+            if gecerli_kripto_mu(symbol):
                 degisim_yuzdesi = 0.0
                 vol = 0.0
                 if 'info' in t and t['info'] is not None:
@@ -336,11 +345,6 @@ def otomatik_analiz():
                         degisim_yuzdesi = ((last_p - open_p) / open_p) * 100
                     vol = t.get('quoteVolume', 0) or 0
                 coin_listesi.append({'symbol': symbol, 'change': degisim_yuzdesi, 'volume': vol})
-        
-        if len(coin_listesi) == 0:
-            for s in exchange.symbols:
-                if 'USDT' in s:
-                    coin_listesi.append({'symbol': s, 'change': 0.0, 'volume': 1.0})
 
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
         top_gainers = [item['symbol'] for item in coin_listesi[:20]]
@@ -439,15 +443,12 @@ def otomatik_analiz():
             market_data = exchange.load_markets()
             market = market_data.get(symbol, {})
             
-            # --- DOĞRU ANAPARA HESABI (ANA FIRSAT) ---
-            # ORDER_SIZE (12 USDT) * Kaldıraç = Toplam Pozisyon Büyüklüğü (Notional)
             notional_target = ORDER_SIZE * hesaplanan_kaldirac
             raw_amount = notional_target / current_price
             
             precision = int(market.get('precision', {}).get('amount', 3))
             min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
             
-            # Minimum notional kuralı kontrolü (Binance genellikle en az ~5.5 USD notional ister, burada 12*kaldirac zaten çok güvenli)
             amount = max(round(raw_amount, precision), min_amount)
             
             toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
@@ -475,7 +476,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Doğru anapara hesaplamasıyla analiz tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "TradFi filtreleriyle analiz tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
