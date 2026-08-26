@@ -17,7 +17,7 @@ SCALP_ENABLED = True
 SCALP_MARGIN_SIZE = 15.0  # Scalp için net 15 USDT anapara
 SCALP_LEVERAGE = 5
 SCALP_TARGET_PROFIT_PCT = 1.0  
-SCALP_STOP_LOSS_PCT = 0.5      
+SCALP_STOP_LOSS_PCT = 0.5         
 
 pozisyon_en_yuksek_kar = {}
 
@@ -330,7 +330,7 @@ def otomatik_analiz():
 
         # Sadece geçerli kriptoların ticker verilerini çek
         coin_listesi = []
-        for symbol in gecerli_kripto_mu and gecerli_coin_listesi:
+        for symbol in gecerli_coin_listesi:
             try:
                 t = exchange.fetch_ticker(symbol)
                 degisim_yuzdesi = 0.0
