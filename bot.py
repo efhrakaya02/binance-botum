@@ -12,12 +12,12 @@ SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
 ORDER_SIZE = 12.0  
 MAX_POSITIONS = 3  
 
-# GÜNCELLENMİŞ VUR-KAÇ (SCALP) PARAMETRELERI
+# GÜNCELLENMİŞ VE ESNETİLMİŞ VUR-KAÇ (SCALP) PARAMETRELERI
 SCALP_ENABLED = True
-SCALP_MARGIN_SIZE = 15.0  # 15 USD sermaye (Ayrı bütçe)
+SCALP_MARGIN_SIZE = 15.0  
 SCALP_LEVERAGE = 5
-SCALP_TARGET_PROFIT_PCT = 1.0  # Fiyatta %1 kâr (5x ile %5 kazanç)
-SCALP_STOP_LOSS_PCT = 0.5      # Fiyatta %0,5 zararda stop (5x ile %2,5 zarar)
+SCALP_TARGET_PROFIT_PCT = 1.0  
+SCALP_STOP_LOSS_PCT = 0.5      
 
 pozisyon_en_yuksek_kar = {}
 
@@ -100,11 +100,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Bağımsız Scalp + Ana Fırsat Hibrit Botu Aktif", 200
+    return "Esnetilmiş Filtrelerle Hibrit Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Eş Zamanlı Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
+    print("--- Esnetilmiş Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -121,7 +121,7 @@ def otomatik_analiz():
             if s not in aktif_semboller:
                 del pozisyon_en_yuksek_kar[s]
 
-        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi (Tüm Açık Pozisyonlar İçin)
+        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi
         try:
             for p in acik_pozisyonlar:
                 symbol = p['symbol']
@@ -143,19 +143,19 @@ def otomatik_analiz():
                         
                     close_side = 'sell' if side == 'long' else 'buy'
                     
-                    # --- VUR-KAÇ (SCALP) POZİSYON YÖNETİMİ ---
+                    # --- SCALP POZİSYON YÖNETİMİ ---
                     if is_scalp_position:
                         if kar_yuzdesi >= SCALP_TARGET_PROFIT_PCT:
                             exchange.create_order(
                                 symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                             )
-                            print(f"[SCALP] {symbol} hedef kâr oranına (%{SCALP_TARGET_PROFIT_PCT}) ulaştı! Pozisyon kârla kapatıldı. Kâr: %{kar_yuzdesi:.2f}", flush=True)
+                            print(f"[SCALP] {symbol} hedef kâr oranına ulaştı! Kapatıldı. Kâr: %{kar_yuzdesi:.2f}", flush=True)
                             continue
                         elif kar_yuzdesi <= -SCALP_STOP_LOSS_PCT:
                             exchange.create_order(
                                 symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                             )
-                            print(f"[SCALP] {symbol} stop loss sınırına (%-{SCALP_STOP_LOSS_PCT}) ulaştı! Pozisyon kapatıldı. Zarar: %{kar_yuzdesi:.2f}", flush=True)
+                            print(f"[SCALP] {symbol} stop loss sınırına ulaştı! Kapatıldı. Zarar: %{kar_yuzdesi:.2f}", flush=True)
                             continue
                         else:
                             print(f"[SCALP Takipte] {symbol} | Yön: {side.upper()} | Anlık Kâr: %{kar_yuzdesi:.2f}", flush=True)
@@ -228,7 +228,7 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
-        # 2. BAĞIMSIZ 1. MODÜL: VUR-KAÇ (SCALP) FIRSAT TARAMASI (Diğerlerinden Bağımsız Çalışır)
+        # 2. ESNETİLMİŞ VUR-KAÇ (SCALP) FIRSAT TARAMASI
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
         
         if SCALP_ENABLED and not scalp_aktif_var:
@@ -236,7 +236,7 @@ def otomatik_analiz():
                 tickers = exchange.fetch_tickers()
                 populer_coinler = [s for s, t in tickers.items() if 'USDT' in s and not any(x in s for x in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])]
                 
-                for symbol in populer_coinler[:25]:
+                for symbol in populer_coinler[:30]:
                     if symbol in aktif_semboller:
                         continue
                     
@@ -246,7 +246,7 @@ def otomatik_analiz():
                     df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
                     avg_vol_5m = df_5m['volume'].mean()
-                    if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.8):
+                    if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.3):  # 1.8x'ten 1.3x'e esnetildi
                         continue
                         
                     df_5m['rsi'] = hesapla_rsi(df_5m['close'], period=14)
@@ -272,19 +272,18 @@ def otomatik_analiz():
                     df_15m['ema20'] = df_15m['close'].ewm(span=20, adjust=False).mean()
                     
                     rsi_15m = df_15m['rsi'].iloc[-1]
-                    close_15m = df_15m['close'].iloc[-1]
-                    ema20_15m = df_15m['ema20'].iloc[-1]
                     
                     scalp_yon = None
                     
-                    long_sart_5m = ((prev_close <= cur_lower or cur_close <= cur_lower) or cur_rsi < 32) and (cur_close >= ema20_5m)
-                    long_sart_15m = (rsi_15m < 55) and (close_15m >= ema20_15m * 0.995)
+                    # Esnetilmiş Scalp Şartları (15m filtresi genişletildi)
+                    long_sart_5m = ((prev_close <= cur_lower or cur_close <= cur_lower) or cur_rsi < 38) and (cur_close >= ema20_5m * 0.99)
+                    long_sart_15m = (rsi_15m < 60)
                     
                     if long_sart_5m and long_sart_15m:
                         scalp_yon = 'buy'
                     else:
-                        short_sart_5m = ((cur_close >= cur_upper) or cur_rsi > 68) and (cur_close <= ema20_5m)
-                        short_sart_15m = (rsi_15m > 45) and (close_15m <= ema20_15m * 1.005)
+                        short_sart_5m = ((cur_close >= cur_upper) or cur_rsi > 62) and (cur_close <= ema20_5m * 1.01)
+                        short_sart_15m = (rsi_15m > 40)
                         
                         if short_sart_5m and short_sart_15m:
                             scalp_yon = 'sell'
@@ -309,12 +308,12 @@ def otomatik_analiz():
                         amount = max(round(raw_amount, precision), min_amount)
                         
                         exchange.create_order(symbol, 'market', scalp_yon, amount)
-                        print(f"!!! FİLTRELİ VUR-KAÇ (SCALP) AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | 5m RSI: {cur_rsi:.1f} | 15m RSI: {rsi_15m:.1f} !!!", flush=True)
+                        print(f"!!! ESNETİLMİŞ VUR-KAÇ (SCALP) AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | 5m RSI: {cur_rsi:.1f} | 15m RSI: {rsi_15m:.1f} !!!", flush=True)
                         break 
             except Exception as scalp_err:
                 print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
 
-        # 3. BAĞIMSIZ 2. MODÜL: ANA FIRSAT MODÜLÜ (Scalp Açık Olsa Dahi Sürekli Taramaya Devam Eder)
+        # 3. ESNETİLMİŞ ANA FIRSAT MODÜLÜ
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
@@ -344,13 +343,13 @@ def otomatik_analiz():
                     coin_listesi.append({'symbol': s, 'change': 0.0, 'volume': 1.0})
 
         coin_listesi.sort(key=lambda x: x['change'], reverse=True)
-        top_gainers = [item['symbol'] for item in coin_listesi[:15]]
-        top_losers = [item['symbol'] for item in coin_listesi[-15:]]
+        top_gainers = [item['symbol'] for item in coin_listesi[:20]]
+        top_losers = [item['symbol'] for item in coin_listesi[-20:]]
         target_symbols = list(set(top_gainers + top_losers))
         
         en_iyi_fırsat = None
         
-        for symbol in target_symbols[:10]:
+        for symbol in target_symbols[:15]:
             try:
                 time.sleep(0.1)
                 if symbol in [p['symbol'] for p in acik_pozisyonlar]:
@@ -358,7 +357,7 @@ def otomatik_analiz():
                 
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
-                if funding_rate > 0.0015 or funding_rate < -0.0015:
+                if funding_rate > 0.002 or funding_rate < -0.002: # Fonlama filtresi hafif esnetildi
                     continue
                 
                 ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
@@ -366,12 +365,12 @@ def otomatik_analiz():
                 
                 ortalama_hacim = df_1h['volume'].mean()
                 son_hacim = df_1h['volume'].iloc[-1]
-                if son_hacim < (ortalama_hacim * 1.5):
+                if son_hacim < (ortalama_hacim * 1.2):  # 1.5x'ten 1.2x'e esnetildi
                     continue
                 
                 df_1h['candle_size'] = abs(df_1h['close'] - df_1h['open'])
                 avg_candle_size = df_1h['candle_size'].rolling(window=15).mean().iloc[-1]
-                if df_1h['candle_size'].iloc[-1] > (avg_candle_size * 2.5):
+                if df_1h['candle_size'].iloc[-1] > (avg_candle_size * 3.5):  # 2.5x'ten 3.5x'e esnetildi
                     continue 
                 
                 df_1h = formasyon_ve_sikisma_tara(df_1h)
@@ -395,19 +394,20 @@ def otomatik_analiz():
                     continue
                 
                 kalite_puani = 0
-                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and obv_onay and (50 <= current_rsi <= 60):
+                # ESNETİLMİŞ RSI ARALIKLARI: Long için 45-65, Short için 35-55
+                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and (45 <= current_rsi <= 65):
                     kalite_puani += 1
-                    if current_rsi >= 53 and current_rsi <= 57: kalite_puani += 1
-                    if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1
+                    if obv_onay: kalite_puani += 1
+                    if current_rsi >= 50 and current_rsi <= 60: kalite_puani += 1
                     if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
-                    en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': kalite_puani}
+                    en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': max(1, kalite_puani)}
                     break
-                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and not obv_onay and (40 <= current_rsi <= 50):
+                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and (35 <= current_rsi <= 55):
                     kalite_puani += 1
-                    if current_rsi >= 43 and current_rsi <= 47: kalite_puani += 1
-                    if son_hacim > (ortalama_hacim * 2.5): kalite_puani += 1
+                    if not obv_onay: kalite_puani += 1
+                    if current_rsi >= 40 and current_rsi <= 50: kalite_puani += 1
                     if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
-                    en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price, 'score': kalite_puani}
+                    en_iyi_fırsat = {'symbol': symbol, 'side': 'sell', 'price': current_price, 'score': max(1, kalite_puani)}
                     break
             except Exception:
                 continue
@@ -453,7 +453,7 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! ANA FIRSAT İŞLEMİ AÇILDI: {symbol} | Yön: {side.upper()} | Kaldıraç: {hesaplanan_kaldirac}x | Miktar: {amount} !!!", flush=True)
+                print(f"!!! ANA FIRSAT İŞLEMİ AÇILDI: {symbol} | Yön: {side.upper()} | Kaldıraç: {hesaplanan_kaldirac}x | Puan: {score} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -473,7 +473,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Bağımsız Scalp ve Ana Fırsat döngüsü paralel yürütüldü."})
+        return jsonify({"durum": "Basarili", "mesaj": "Esnetilmiş filtrelerle analiz döngüsü tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
