@@ -3,6 +3,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import time
+import threading
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -158,11 +159,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Tertemiz Süzülmüş, Regresyon Filtreli, Cooldown'lu ve BCC/BCH Uyumlu Hibrit Bot Aktif", 200
+    return "Tertemiz Süzülmüş, Regresyon Filtreli, Threading Destekli ve BCC/BCH Uyumlu Hibrit Bot Aktif", 200
 
-@app.route('/otomatik-analiz')
-def otomatik_analiz():
-    print("--- Tertemiz Analiz Döngüsü Başlatıldı ---", flush=True)
+def arka_plan_analiz_islem():
+    """Tüm ağır analiz ve emir döngüsünü zaman aşımından bağımsız arka planda çalıştırır."""
+    print("--- Tertemiz Arka Plan Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         markets = exchange.load_markets()
@@ -387,7 +388,8 @@ def otomatik_analiz():
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
-            return jsonify({"durum": "Beklemede", "mesaj": "Scalp çalışıyor, ana pozisyonlar dolu."})
+            print("Scalp çalışıyor, ana pozisyonlar dolu.", flush=True)
+            return
 
         coin_listesi = []
         for symbol in gecerli_coin_listesi:
@@ -539,11 +541,18 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Regresyon filtreli, Cooldown ve BCH/BCC uyumlu analiz döngüsü tamamlandı."})
+        print("--- Arka Plan Analiz Döngüsü Başarıyla Tamamlandı ---", flush=True)
         
     except Exception as e:
-        print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
-        return jsonify({"durum": "OK_Koru", "mesaj": "Hata yutuldu, sistem çalışmaya devam ediyor."})
+        print(f"Genel arka plan analiz döngüsü hatası: {str(e)}", flush=True)
+
+@app.route('/otomatik-analiz')
+def otomatik_analiz():
+    # Cron-job tetiklediği an saniyesinde 200 OK döner, zaman aşımı (Timeout/502) yaşanmaz.
+    thread = threading.Thread(target=arka_plan_analiz_islem)
+    thread.daemon = True
+    thread.start()
+    return jsonify({"durum": "Basarili", "mesaj": "Analiz arka planda başlatıldı, tetikleyiciye hemen yanıt verildi."}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
