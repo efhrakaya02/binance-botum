@@ -110,7 +110,7 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Tam Süzülmüş ve Düzeltilmiş Hibrit Bot Aktif", 200
+    return "Tertemiz Süzülmüş ve Düzeltilmiş Hibrit Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
@@ -238,7 +238,6 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
-        # Temiz ve filtrelenmiş geçerli coin havuzu
         gecerli_coin_listesi = [s for s in markets.keys() if gecerli_kripto_mu(s)]
 
         # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI
@@ -308,15 +307,22 @@ def otomatik_analiz():
                             pass
                             
                         market = markets.get(symbol, {})
-                        precision = int(market.get('precision', {}).get('amount', 3))
-                        min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
+                        
+                        # --- HASSASİYET VE MİKTAR DÜZELTME KISMI ---
+                        precision = market.get('precision', {})
+                        amount_precision = int(precision.get('amount', 3)) if isinstance(precision.get('amount'), int) else 3
+                        
+                        limits = market.get('limits', {})
+                        min_amount = limits.get('amount', {}).get('min', 0.001)
                         
                         notional_target = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
                         raw_amount = notional_target / cur_close
-                        amount = max(round(raw_amount, precision), min_amount)
+                        
+                        # ccxt built-in amount_to_precision fonksiyonu ile borsa kurallarına tam uyum
+                        amount = float(exchange.amount_to_precision(symbol, max(raw_amount, min_amount)))
                         
                         exchange.create_order(symbol, 'market', scalp_yon, amount)
-                        print(f"!!! SCALP AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Net Anapara: {SCALP_MARGIN_SIZE} USDT | Kaldıraç: {SCALP_LEVERAGE}x !!!", flush=True)
+                        print(f"!!! SCALP AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Miktar: {amount} !!!", flush=True)
                         break 
             except Exception as scalp_err:
                 print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
@@ -325,10 +331,8 @@ def otomatik_analiz():
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
-            print(f"Maksimum ana pozisyon sınırına ({MAX_POSITIONS}) ulaşıldı.", flush=True)
             return jsonify({"durum": "Beklemede", "mesaj": "Scalp çalışıyor, ana pozisyonlar dolu."})
 
-        # Sadece geçerli kriptoların ticker verilerini çek
         coin_listesi = []
         for symbol in gecerli_coin_listesi:
             try:
@@ -427,7 +431,7 @@ def otomatik_analiz():
             elif score == 2:
                 hesaplanan_kaldirac = 5
             else:
-                hesaplanan_kaldirac = 3
+                hesaplanan_kaldirac = 10  # Düşük puanlar için güvenli düşük kaldıraç
                 
             try:
                 exchange.set_margin_mode('isolated', symbol)
@@ -440,21 +444,20 @@ def otomatik_analiz():
                 pass
 
             market = markets.get(symbol, {})
-            
             notional_target = ORDER_SIZE * hesaplanan_kaldirac
             raw_amount = notional_target / current_price
             
-            precision = int(market.get('precision', {}).get('amount', 3))
-            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
-            
-            amount = max(round(raw_amount, precision), min_amount)
+            # Hassasiyet düzeltmesi (CCXT dahili amount_to_precision fonksiyonu ile)
+            limits = market.get('limits', {})
+            min_amount = limits.get('amount', {}).get('min', 0.001)
+            amount = float(exchange.amount_to_precision(symbol, max(raw_amount, min_amount)))
             
             toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
             max_aktif_limit = total_balance * 0.6
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! ANA FIRSAT AÇILDI: {symbol} | Yön: {side.upper()} | Net Anapara: {ORDER_SIZE} USDT | Kaldıraç: {hesaplanan_kaldirac}x | Puan: {score} !!!", flush=True)
+                print(f"!!! ANA FIRSAT AÇILDI: {symbol} | Yön: {side.upper()} | Miktar: {amount} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -470,7 +473,7 @@ def otomatik_analiz():
                         'reduceOnly': True
                     }
                     exchange.create_order(symbol, 'STOP_MARKET', stop_side, amount, params=stop_params)
-                    print(f"[{symbol}] Güvenlik stop emri yerleştirildi. Stop Fiyatı: {stop_price:.4f}", flush=True)
+                    print(f"[{symbol}] Güvenlik stop emri yerleştirildi.", flush=True)
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
