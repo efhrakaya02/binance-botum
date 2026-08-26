@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 12.0  # Net Anapara (Margin) - Ana Fırsat
+ORDER_SIZE = 12.0  # Net Anapara (Margin) - Ana Fırsat (KESİNLİKLE AŞILMAZ)
 MAX_POSITIONS = 3  
 
 # VUR-KAÇ (SCALP) PARAMETRELERI
@@ -22,8 +22,7 @@ SCALP_STOP_LOSS_PCT = 0.5
 
 pozisyon_en_yuksek_kar = {}
 
-# SOĞUMA SÜRESİ (COOLDOWN) MEKANİZMASI İÇİN SÖZLÜK
-# {symbol: son_kapanis_zaman_milisaniye}
+# SOĞUMA SÜRESİ (COOLDOWN) MEKANİZMASI
 cooldown_suresi_ms = 4 * 3600 * 1000  # 4 Saatlik soğuma süresi
 son_kapanis_zamanlari = {}
 
@@ -36,7 +35,6 @@ def get_exchange():
     })
 
 def sembol_duzelt(symbol):
-    """BCC/USDT gibi eski/alternatif sembol kodlarını Binance standardı olan BCH/USDT'ye çevirir."""
     if symbol == 'BCC/USDT':
         return 'BCH/USDT'
     return symbol
@@ -61,10 +59,37 @@ def hesapla_obv(close, volume):
     obv = (np.sign(close.diff()) * volume).fillna(0).cumsum()
     return obv
 
+def hesapla_adx(df, period=14):
+    """Trendin gücünü ölçmek için ADX ve DMI hesaplar"""
+    df = df.copy()
+    df['tr1'] = df['high'] - df['low']
+    df['tr2'] = abs(df['high'] - df['close'].shift())
+    df['tr3'] = abs(df['low'] - df['close'].shift())
+    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    
+    df['up_move'] = df['high'] - df['high'].shift()
+    df['down_move'] = df['low'].shift() - df['low']
+    
+    df['plus_dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
+    df['minus_dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
+    
+    df['atr'] = df['tr'].rolling(window=period).mean()
+    df['plus_di'] = 100 * (df['plus_dm'].rolling(window=period).mean() / df['atr'])
+    df['minus_di'] = 100 * (df['minus_dm'].rolling(window=period).mean() / df['atr'])
+    
+    df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+    df['adx'] = df['dx'].rolling(window=period).mean()
+    return df
+
+def hesapla_macd(df, fast=12, slow=26, signal=9):
+    df = df.copy()
+    df['ema_fast'] = df['close'].ewm(span=fast, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=slow, adjust=False).mean()
+    df['macd'] = df['ema_fast'] - df['ema_slow']
+    df['macd_signal'] = df['macd'].ewm(span=signal, adjust=False).mean()
+    return df
+
 def hesapla_regresyon_bantlari(df, period=50, std_multiplier=2.0):
-    """
-        Doğrusal Regresyon ve Üst/Alt Bant Filtresi Hesaplar
-    """
     df = df.copy()
     y = df['close'].values
     x = np.arange(len(y))
@@ -111,59 +136,12 @@ def formasyon_ve_sikisma_tara(df):
     df = hesapla_regresyon_bantlari(df, period=50, std_multiplier=2.0)
     return df
 
-def hesapla_supertrend(df, period=10, multiplier=3):
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    
-    tr1 = high - low
-    tr2 = abs(high - close.shift())
-    tr3 = abs(low - close.shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    
-    hl2 = (high + low) / 2
-    final_upperband = hl2 + (multiplier * atr)
-    final_lowerband = hl2 - (multiplier * atr)
-    
-    supertrend = [True] * len(df)
-    
-    for i in range(period, len(df)):
-        curr_close = close.iloc[i]
-        prev_close = close.iloc[i-1]
-        
-        if final_upperband.iloc[i] < final_upperband.iloc[i-1] or prev_close > final_upperband.iloc[i-1]:
-            pass
-        else:
-            final_upperband.iloc[i] = final_upperband.iloc[i-1]
-            
-        if final_lowerband.iloc[i] > final_lowerband.iloc[i-1] or prev_close < final_lowerband.iloc[i-1]:
-            pass
-        else:
-            final_lowerband.iloc[i] = final_lowerband.iloc[i-1]
-            
-        if i == period:
-            supertrend[i] = True if curr_close > final_upperband.iloc[i] else False
-        else:
-            prev_st = supertrend[i-1]
-            if prev_st == True and curr_close <= final_lowerband.iloc[i]:
-                supertrend[i] = False
-            elif prev_st == False and curr_close >= final_upperband.iloc[i]:
-                supertrend[i] = True
-            else:
-                supertrend[i] = prev_st
-                
-    df['supertrend'] = supertrend
-    df['atr'] = atr
-    return df
-
 @app.route('/')
 def health_check():
-    return "Tertemiz Süzülmüş, Regresyon Filtreli, Threading Destekli ve BCC/BCH Uyumlu Hibrit Bot Aktif", 200
+    return "Gelişmiş ADX & EMA Trend Analizli, Sıkı Risk Yönetimli ve Threading Destekli Bot Aktif", 200
 
 def arka_plan_analiz_islem():
-    """Tüm ağır analiz ve emir döngüsünü zaman aşımından bağımsız arka planda çalıştırır."""
-    print("--- Tertemiz Arka Plan Analiz Döngüsü Başlatıldı ---", flush=True)
+    print("--- Gelişmiş Trend Analizli Arka Plan Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         markets = exchange.load_markets()
@@ -183,7 +161,7 @@ def arka_plan_analiz_islem():
                 if s in pozisyon_en_yuksek_kar:
                     del pozisyon_en_yuksek_kar[s]
 
-        # 1. Kademeli Stop, Trend ve Zirveden Geri Çekilme Yönetimi
+        # 1. Pozisyon Yönetimi ve Erken Risk Koruması
         try:
             for p in acik_pozisyonlar:
                 symbol = sembol_duzelt(p['symbol'])
@@ -205,13 +183,22 @@ def arka_plan_analiz_islem():
                         
                     close_side = 'sell' if side == 'long' else 'buy'
                     
+                    # --- KATI MAKSİMUM ZARAR KORUMASI (%5) ---
+                    if kar_yuzdesi <= -5.0:
+                        exchange.create_order(
+                            symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
+                        )
+                        print(f"[ACİL STOP - %5 SINIRI] {symbol} %5 zarar sınırına ulaştı! Kapatıldı. Zarar: %{kar_yuzdesi:.2f}", flush=True)
+                        son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
+                        continue
+
                     # --- SCALP POZİSYON YÖNETİMİ ---
                     if is_scalp_position:
                         if kar_yuzdesi >= SCALP_TARGET_PROFIT_PCT:
                             exchange.create_order(
                                 symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                             )
-                            print(f"[SCALP] {symbol} hedef kâr oranına ulaştı! Kapatıldı. Kâr: %{kar_yuzdesi:.2f}", flush=True)
+                            print(f"[SCALP] {symbol} hedef kör oranına ulaştı! Kapatıldı. Kâr: %{kar_yuzdesi:.2f}", flush=True)
                             son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                             continue
                         elif kar_yuzdesi <= -SCALP_STOP_LOSS_PCT:
@@ -225,7 +212,7 @@ def arka_plan_analiz_islem():
                             print(f"[SCALP Takipte] {symbol} | Yön: {side.upper()} | Anlık Kâr: %{kar_yuzdesi:.2f}", flush=True)
                             continue 
 
-                    # --- ANA TREND POZİSYON YÖNETİMİ ---
+                    # --- ANA TREND POZİSYON YÖNETİMİ & ERKEN HASSAS STOP ---
                     if symbol not in pozisyon_en_yuksek_kar:
                         pozisyon_en_yuksek_kar[symbol] = kar_yuzdesi
                     else:
@@ -234,33 +221,36 @@ def arka_plan_analiz_islem():
                             
                     en_yuksek_kar = pozisyon_en_yuksek_kar[symbol]
                     
-                    if en_yuksek_kar >= 5.0 and (en_yuksek_kar - kar_yuzdesi >= 5.0):
+                    if en_yuksek_kar >= 5.0 and (en_yuksek_kar - kar_yuzdesi >= 3.5): 
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Zirveden geri çekilme algılandı! En yüksek kâr: %{en_yuksek_kar:.2f}, Kapatıldı.", flush=True)
+                        print(f"[{symbol}] Zirveden erken kar koruması! En yüksek: %{en_yuksek_kar:.2f}, Kapatıldı.", flush=True)
                         son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                         continue
                     
                     ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                     df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
-                    df_1h = hesapla_supertrend(df_1h, period=10, multiplier=3)
+                    df_1h['ema9'] = df_1h['close'].ewm(span=9, adjust=False).mean()
+                    df_1h['ema21'] = df_1h['close'].ewm(span=21, adjust=False).mean()
+                    df_1h = hesapla_macd(df_1h)
                     
-                    st_bullish = df_1h['supertrend'].iloc[-1]
-                    ema50_val = df_1h['ema50'].iloc[-1]
+                    ema9_val = df_1h['ema9'].iloc[-1]
+                    ema21_val = df_1h['ema21'].iloc[-1]
+                    macd_val = df_1h['macd'].iloc[-1]
+                    macd_sig = df_1h['macd_signal'].iloc[-1]
                     
-                    trend_tersine_dondu = False
-                    if side == 'long' and (not st_bullish or current_price < ema50_val):
-                        trend_tersine_dondu = True
-                    elif side == 'short' and (st_bullish or current_price > ema50_val):
-                        trend_tersine_dondu = True
+                    erken_kesin_stop = False
+                    if side == 'long' and (ema9_val < ema21_val or macd_val < macd_sig):
+                        erken_kesin_stop = True
+                    elif side == 'short' and (ema9_val > ema21_val or macd_val > macd_sig):
+                        erken_kesin_stop = True
                         
-                    if trend_tersine_dondu:
+                    if erken_kesin_stop:
                         exchange.create_order(
                             symbol=symbol, type='market', side=close_side, amount=contracts, params={'reduceOnly': True}
                         )
-                        print(f"[{symbol}] Trend tersine döndü! Pozisyon kapatıldı. Kâr/Zarar: %{kar_yuzdesi:.2f}", flush=True)
+                        print(f"[{symbol}] Hassas EMA/MACD erken risk koruması ile kapatıldı! Kâr/Zarar: %{kar_yuzdesi:.2f}", flush=True)
                         son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
                         continue
                         
@@ -286,7 +276,7 @@ def arka_plan_analiz_islem():
                                 'reduceOnly': True
                             }
                             exchange.create_order(symbol, 'STOP_MARKET', close_side, contracts, params=stop_params)
-                            print(f"[{symbol}] Kademeli Stop Güncellendi! Yeni Stop: {hedef_stop_fiyat:.4f}", flush=True)
+                            print(f"[{symbol}] Kademeli Stop Güncellendi: {hedef_stop_fiyat:.4f}", flush=True)
                     except Exception as stop_up_err:
                         print(f"Kademeli stop güncelleme hatası: {stop_up_err}", flush=True)
                         
@@ -296,14 +286,14 @@ def arka_plan_analiz_islem():
 
         gecerli_coin_listesi = [sembol_duzelt(s) for s in markets.keys() if gecerli_kripto_mu(s)]
 
-        # --- SOĞUMA SÜRESİ (COOLDOWN) KONTROLÜ ---
+        # SOĞUMA SÜRESİ KONTROLÜ
         simdiki_zaman = int(time.time() * 1000)
         gecerli_coin_listesi = [
             s for s in gecerli_coin_listesi 
             if s not in son_kapanis_zamanlari or (simdiki_zaman - son_kapanis_zamanlari[s]) > cooldown_suresi_ms
         ]
 
-        # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI
+        # 2. VUR-KAÇ (SCALP) MODÜLÜ
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
         
         if SCALP_ENABLED and not scalp_aktif_var:
@@ -313,11 +303,23 @@ def arka_plan_analiz_islem():
                     if symbol in aktif_semboller:
                         continue
                     
+                    market = markets.get(symbol, {})
+                    limits = market.get('limits', {})
+                    min_amount = limits.get('amount', {}).get('min', 0.001)
+                    
                     ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=40)
                     if len(ohlcv_5m) < 40:
                         continue
                     df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    cur_close = df_5m['close'].iloc[-1]
                     
+                    notional_target_scalp = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
+                    raw_amount_scalp = notional_target_scalp / cur_close
+                    amount_scalp = float(exchange.amount_to_precision(symbol, max(raw_amount_scalp, min_amount)))
+                    gerceklesen_marj = (amount_scalp * cur_close) / SCALP_LEVERAGE
+                    if gerceklesen_marj > (SCALP_MARGIN_SIZE * 1.35): 
+                        continue
+
                     avg_vol_5m = df_5m['volume'].mean()
                     if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.3):
                         continue
@@ -330,7 +332,6 @@ def arka_plan_analiz_islem():
                     df_5m['upper'] = df_5m['middle'] + (2 * std_5m)
                     df_5m['lower'] = df_5m['middle'] - (2 * std_5m)
                     
-                    cur_close = df_5m['close'].iloc[-1]
                     prev_close = df_5m['close'].iloc[-2]
                     cur_lower = df_5m['lower'].iloc[-1]
                     cur_upper = df_5m['upper'].iloc[-1]
@@ -342,8 +343,6 @@ def arka_plan_analiz_islem():
                         continue
                     df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df_15m['rsi'] = hesapla_rsi(df_15m['close'], period=14)
-                    df_15m['ema20'] = df_15m['close'].ewm(span=20, adjust=False).mean()
-                    
                     rsi_15m = df_15m['rsi'].iloc[-1]
                     
                     scalp_yon = None
@@ -355,7 +354,6 @@ def arka_plan_analiz_islem():
                     else:
                         short_sart_5m = ((cur_close >= cur_upper) or cur_rsi > 62) and (cur_close <= ema20_5m * 1.01)
                         short_sart_15m = (rsi_15m > 40)
-                        
                         if short_sart_5m and short_sart_15m:
                             scalp_yon = 'sell'
                         
@@ -369,22 +367,13 @@ def arka_plan_analiz_islem():
                         except:
                             pass
                             
-                        market = markets.get(symbol, {})
-                        precision = market.get('precision', {})
-                        limits = market.get('limits', {})
-                        min_amount = limits.get('amount', {}).get('min', 0.001)
-                        
-                        notional_target = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
-                        raw_amount = notional_target / cur_close
-                        amount = float(exchange.amount_to_precision(symbol, max(raw_amount, min_amount)))
-                        
-                        exchange.create_order(symbol, 'market', scalp_yon, amount)
-                        print(f"!!! SCALP AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Miktar: {amount} !!!", flush=True)
+                        exchange.create_order(symbol, 'market', scalp_yon, amount_scalp)
+                        print(f"!!! SCALP AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Miktar: {amount_scalp} !!!", flush=True)
                         break 
             except Exception as scalp_err:
                 print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
 
-        # 3. ANA FIRSAT MODÜLÜ
+        # 3. ANA FIRSAT MODÜLÜ (Gelişmiş ADX ve EMA Trend Filtreli)
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
@@ -422,6 +411,20 @@ def arka_plan_analiz_islem():
                 if symbol in [sembol_duzelt(p['symbol']) for p in acik_pozisyonlar]:
                     continue
                 
+                market = markets.get(symbol, {})
+                limits = market.get('limits', {})
+                min_amount = limits.get('amount', {}).get('min', 0.001)
+                
+                t_check = exchange.fetch_ticker(symbol)
+                current_price_check = t_check['last']
+                
+                notional_target_check = ORDER_SIZE * 10 
+                raw_amount_check = notional_target_check / current_price_check
+                amount_check = float(exchange.amount_to_precision(symbol, max(raw_amount_check, min_amount)))
+                gerceklesen_marj_check = (amount_check * current_price_check) / 10
+                if gerceklesen_marj_check > (ORDER_SIZE * 1.35): 
+                    continue
+
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
                 if funding_rate > 0.002 or funding_rate < -0.002:
@@ -441,30 +444,41 @@ def arka_plan_analiz_islem():
                     continue 
                 
                 df_1h = formasyon_ve_sikisma_tara(df_1h)
+                df_1h = hesapla_adx(df_1h)
+                df_1h = hesapla_macd(df_1h)
+                
                 obv_onay = df_1h['obv_trend'].iloc[-1]
                 df_1h['rsi'] = hesapla_rsi(df_1h['close'], period=14)
                 current_rsi = df_1h['rsi'].iloc[-1]
+                
+                # ADX Güçlü Trend Kontrolü (ADX > 20 olmalı ki testere piyasaya girmesin)
+                current_adx = df_1h['adx'].iloc[-1]
+                if pd.isna(current_adx) or current_adx < 20:
+                    continue
                 
                 ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=60)
                 df_4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
                 trend_4h_up = df_4h['close'].iloc[-1] > df_4h['ema50'].iloc[-1]
                 
-                df_1h['ema50'] = df_1h['close'].ewm(span=50, adjust=False).mean()
-                df_1h = hesapla_supertrend(df_1h, period=10, multiplier=3)
+                df_1h['ema9'] = df_1h['close'].ewm(span=9, adjust=False).mean()
+                df_1h['ema21'] = df_1h['close'].ewm(span=21, adjust=False).mean()
                 
                 current_price = df_1h['close'].iloc[-1]
-                ema50_1h = df_1h['ema50'].iloc[-1]
-                st_bullish_1h = df_1h['supertrend'].iloc[-1]
+                ema9_1h = df_1h['ema9'].iloc[-1]
+                ema21_1h = df_1h['ema21'].iloc[-1]
+                macd_val = df_1h['macd'].iloc[-1]
+                macd_sig = df_1h['macd_signal'].iloc[-1]
                 
                 reg_upper_val = df_1h['reg_upper'].iloc[-1]
                 reg_lower_val = df_1h['reg_lower'].iloc[-1]
                 
-                if pd.isna(ema50_1h) or pd.isna(current_rsi) or pd.isna(reg_upper_val):
+                if pd.isna(ema9_1h) or pd.isna(current_rsi) or pd.isna(reg_upper_val):
                     continue
                 
                 kalite_puani = 0
-                if trend_4h_up and current_price > ema50_1h and st_bullish_1h and (45 <= current_rsi <= 65):
+                # Gelişmiş Long Şartı (ADX > 20, EMA9 > EMA21, MACD pozitif, RSI 45-65)
+                if trend_4h_up and (ema9_1h > ema21_1h) and (macd_val > macd_sig) and (45 <= current_rsi <= 65):
                     if current_price < reg_upper_val:
                         kalite_puani += 1
                         if obv_onay: kalite_puani += 1
@@ -472,7 +486,8 @@ def arka_plan_analiz_islem():
                         if df_1h['squeeze'].iloc[-1]: kalite_puani += 1
                         en_iyi_fırsat = {'symbol': symbol, 'side': 'buy', 'price': current_price, 'score': max(1, kalite_puani)}
                         break
-                elif not trend_4h_up and current_price < ema50_1h and not st_bullish_1h and (35 <= current_rsi <= 55):
+                # Gelişmiş Short Şartı (ADX > 20, EMA9 < EMA21, MACD negatif, RSI 35-55)
+                elif not trend_4h_up and (ema9_1h < ema21_1h) and (macd_val < macd_sig) and (35 <= current_rsi <= 55):
                     if current_price > reg_lower_val:
                         kalite_puani += 1
                         if not obv_onay: kalite_puani += 1
@@ -541,18 +556,17 @@ def arka_plan_analiz_islem():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        print("--- Arka Plan Analiz Döngüsü Başarıyla Tamamlandı ---", flush=True)
+        print("--- Gelişmiş Trend Analiz Döngüsü Tamamlandı ---", flush=True)
         
     except Exception as e:
         print(f"Genel arka plan analiz döngüsü hatası: {str(e)}", flush=True)
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    # Cron-job tetiklediği an saniyesinde 200 OK döner, zaman aşımı (Timeout/502) yaşanmaz.
     thread = threading.Thread(target=arka_plan_analiz_islem)
     thread.daemon = True
     thread.start()
-    return jsonify({"durum": "Basarili", "mesaj": "Analiz arka planda başlatıldı, tetikleyiciye hemen yanıt verildi."}), 200
+    return jsonify({"durum": "Basarili", "mesaj": "Gelişmiş trend analizli tarama arka planda başlatıldı."}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
