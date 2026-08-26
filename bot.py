@@ -9,12 +9,12 @@ app = Flask(__name__)
 
 API_KEY = os.getenv('BINANCE_API_KEY')
 SECRET_KEY = os.getenv('BINANCE_SECRET_KEY')
-ORDER_SIZE = 12.0  
+ORDER_SIZE = 12.0  # Artık NET ANAPARA (Margin) olarak harcanacak miktar!
 MAX_POSITIONS = 3  
 
-# GÜNCELLENMİŞ VE ESNETİLMİŞ VUR-KAÇ (SCALP) PARAMETRELERI
+# VUR-KAÇ (SCALP) PARAMETRELERI
 SCALP_ENABLED = True
-SCALP_MARGIN_SIZE = 15.0  
+SCALP_MARGIN_SIZE = 15.0  # Scalp için net 15 USDT anapara
 SCALP_LEVERAGE = 5
 SCALP_TARGET_PROFIT_PCT = 1.0  
 SCALP_STOP_LOSS_PCT = 0.5      
@@ -100,11 +100,11 @@ def hesapla_supertrend(df, period=10, multiplier=3):
 
 @app.route('/')
 def health_check():
-    return "Esnetilmiş Filtrelerle Hibrit Bot Aktif", 200
+    return "Doğru Anapara Hesaplamalı Hibrit Bot Aktif", 200
 
 @app.route('/otomatik-analiz')
 def otomatik_analiz():
-    print("--- Esnetilmiş Analiz ve Vur-Kaç Döngüsü Başlatıldı ---", flush=True)
+    print("--- Doğru Anapara Maliyetli Analiz Döngüsü Başlatıldı ---", flush=True)
     try:
         exchange = get_exchange()
         exchange.load_markets()
@@ -228,7 +228,7 @@ def otomatik_analiz():
         except Exception as pos_err:
             print(f"Pozisyon yönetimi hatası: {pos_err}", flush=True)
 
-        # 2. ESNETİLMİŞ VUR-KAÇ (SCALP) FIRSAT TARAMASI
+        # 2. VUR-KAÇ (SCALP) FIRSAT TARAMASI
         scalp_aktif_var = any(abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0 for p in acik_pozisyonlar)
         
         if SCALP_ENABLED and not scalp_aktif_var:
@@ -246,7 +246,7 @@ def otomatik_analiz():
                     df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     
                     avg_vol_5m = df_5m['volume'].mean()
-                    if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.3):  # 1.8x'ten 1.3x'e esnetildi
+                    if df_5m['volume'].iloc[-1] < (avg_vol_5m * 1.3):
                         continue
                         
                     df_5m['rsi'] = hesapla_rsi(df_5m['close'], period=14)
@@ -275,7 +275,6 @@ def otomatik_analiz():
                     
                     scalp_yon = None
                     
-                    # Esnetilmiş Scalp Şartları (15m filtresi genişletildi)
                     long_sart_5m = ((prev_close <= cur_lower or cur_close <= cur_lower) or cur_rsi < 38) and (cur_close >= ema20_5m * 0.99)
                     long_sart_15m = (rsi_15m < 60)
                     
@@ -303,17 +302,18 @@ def otomatik_analiz():
                         precision = int(market.get('precision', {}).get('amount', 3))
                         min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
                         
+                        # --- DOĞRU ANAPARA HESABI (SCALP) ---
                         notional_target = SCALP_MARGIN_SIZE * SCALP_LEVERAGE
                         raw_amount = notional_target / cur_close
                         amount = max(round(raw_amount, precision), min_amount)
                         
                         exchange.create_order(symbol, 'market', scalp_yon, amount)
-                        print(f"!!! ESNETİLMİŞ VUR-KAÇ (SCALP) AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | 5m RSI: {cur_rsi:.1f} | 15m RSI: {rsi_15m:.1f} !!!", flush=True)
+                        print(f"!!! SCALP AÇILDI: {symbol} | Yön: {scalp_yon.upper()} | Net Anapara: {SCALP_MARGIN_SIZE} USDT | Kaldıraç: {SCALP_LEVERAGE}x !!!", flush=True)
                         break 
             except Exception as scalp_err:
                 print(f"Vur-Kaç tarama hatası: {scalp_err}", flush=True)
 
-        # 3. ESNETİLMİŞ ANA FIRSAT MODÜLÜ
+        # 3. ANA FIRSAT MODÜLÜ
         normal_acik_sayisi = len([p for p in acik_pozisyonlar if not abs(float(p['initialMargin']) - SCALP_MARGIN_SIZE) < 3.0])
         
         if normal_acik_sayisi >= MAX_POSITIONS:
@@ -357,7 +357,7 @@ def otomatik_analiz():
                 
                 funding_info = exchange.fetch_funding_rate(symbol)
                 funding_rate = funding_info.get('fundingRate', 0) or 0
-                if funding_rate > 0.002 or funding_rate < -0.002: # Fonlama filtresi hafif esnetildi
+                if funding_rate > 0.002 or funding_rate < -0.002:
                     continue
                 
                 ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=60)
@@ -365,12 +365,12 @@ def otomatik_analiz():
                 
                 ortalama_hacim = df_1h['volume'].mean()
                 son_hacim = df_1h['volume'].iloc[-1]
-                if son_hacim < (ortalama_hacim * 1.2):  # 1.5x'ten 1.2x'e esnetildi
+                if son_hacim < (ortalama_hacim * 1.2):
                     continue
                 
                 df_1h['candle_size'] = abs(df_1h['close'] - df_1h['open'])
                 avg_candle_size = df_1h['candle_size'].rolling(window=15).mean().iloc[-1]
-                if df_1h['candle_size'].iloc[-1] > (avg_candle_size * 3.5):  # 2.5x'ten 3.5x'e esnetildi
+                if df_1h['candle_size'].iloc[-1] > (avg_candle_size * 3.5):
                     continue 
                 
                 df_1h = formasyon_ve_sikisma_tara(df_1h)
@@ -394,7 +394,6 @@ def otomatik_analiz():
                     continue
                 
                 kalite_puani = 0
-                # ESNETİLMİŞ RSI ARALIKLARI: Long için 45-65, Short için 35-55
                 if trend_4h_up and current_price > ema50_1h and st_bullish_1h and (45 <= current_rsi <= 65):
                     kalite_puani += 1
                     if obv_onay: kalite_puani += 1
@@ -440,12 +439,15 @@ def otomatik_analiz():
             market_data = exchange.load_markets()
             market = market_data.get(symbol, {})
             
-            raw_amount = ORDER_SIZE / current_price
+            # --- DOĞRU ANAPARA HESABI (ANA FIRSAT) ---
+            # ORDER_SIZE (12 USDT) * Kaldıraç = Toplam Pozisyon Büyüklüğü (Notional)
+            notional_target = ORDER_SIZE * hesaplanan_kaldirac
+            raw_amount = notional_target / current_price
+            
             precision = int(market.get('precision', {}).get('amount', 3))
             min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.001)
-            min_notional = 5.5
-            if (raw_amount * current_price) < min_notional:
-                raw_amount = min_notional / current_price
+            
+            # Minimum notional kuralı kontrolü (Binance genellikle en az ~5.5 USD notional ister, burada 12*kaldirac zaten çok güvenli)
             amount = max(round(raw_amount, precision), min_amount)
             
             toplam_kullanilan = sum([float(p['initialMargin']) for p in acik_pozisyonlar])
@@ -453,7 +455,7 @@ def otomatik_analiz():
             
             if toplam_kullanilan + ORDER_SIZE <= max_aktif_limit:
                 exchange.create_order(symbol, 'market', side, amount)
-                print(f"!!! ANA FIRSAT İŞLEMİ AÇILDI: {symbol} | Yön: {side.upper()} | Kaldıraç: {hesaplanan_kaldirac}x | Puan: {score} !!!", flush=True)
+                print(f"!!! ANA FIRSAT AÇILDI: {symbol} | Yön: {side.upper()} | Net Anapara: {ORDER_SIZE} USDT | Kaldıraç: {hesaplanan_kaldirac}x | Puan: {score} !!!", flush=True)
                 
                 try:
                     ohlcv_stop = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
@@ -473,7 +475,7 @@ def otomatik_analiz():
                 except Exception as borsa_stop_err:
                     print(f"Borsa stop emri hatası: {borsa_stop_err}", flush=True)
 
-        return jsonify({"durum": "Basarili", "mesaj": "Esnetilmiş filtrelerle analiz döngüsü tamamlandı."})
+        return jsonify({"durum": "Basarili", "mesaj": "Doğru anapara hesaplamasıyla analiz tamamlandı."})
         
     except Exception as e:
         print(f"Genel analiz döngüsü hatası: {str(e)}", flush=True)
