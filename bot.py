@@ -28,10 +28,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TRADING_ENABLED = True
 POSITION_MONITOR_ENABLED = True
 
-# Finansal Kısıtlar
+# Finansal ve Risk Kısıtları (Kesin Kurallar)
 SCALP_MARGIN = 10.0          # Kesin kural: Scalp için tam 10 USDT
 OPPORTUNITY_MARGIN = 15.0    # Kesin kural: Fırsat için tam 15 USDT
+MAX_SCALP_POSITIONS = 1      # Maksimum 1 Scalp pozisyonu
+MAX_OPPORTUNITY_POSITIONS = 1# Maksimum 1 Fırsat pozisyonu
 MAX_TOTAL_POSITIONS = 2      # Toplamda maksimum 2 pozisyon (1 Scalp + 1 Fırsat)
+LEVERAGE = 5                 # Maksimum kaldıraç kesin olarak 5x
 
 MIN_SCORE_THRESHOLD = 85     # %80+ isabet için minimum skor sınırı
 SCALP_TARGET_USDT = 0.30     # Scalp modunda minimum net kar hedefi
@@ -168,10 +171,15 @@ def scan_scalp_market(exchange):
                 score += 12
                 
             if direction and score >= MIN_SCORE_THRESHOLD:
-                if check_pullback_and_confirmation(df, direction):
-                    candidates.append({"symbol": symbol, "score": score, "direction": direction, "mode": "scalp"})
-            
-            del df
+                candidates.append({
+                    "symbol": symbol, 
+                    "score": score, 
+                    "direction": direction, 
+                    "mode": "scalp",
+                    "df": df
+                })
+            else:
+                del df
         
         candidates.sort(key=lambda x: x["score"], reverse=True)
         return candidates[:5]
@@ -225,7 +233,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM YÖNETİMİ VE EMİR GÖNDERİMİ
+# İŞLEM YÖNETİMİ VE LİMİT KONTROLLÜ EMİR GÖNDERİMİ
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not TRADING_ENABLED: return False
@@ -235,11 +243,30 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             positions = exchange.fetch_positions()
             active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
-            if len(active_positions) >= MAX_TOTAL_POSITIONS: return False
+            # 1. Toplam Pozisyon Limiti Kontrolü (Max 2)
+            if len(active_positions) >= MAX_TOTAL_POSITIONS: 
+                logging.warning(f"[SINIR AŞILDI] Toplam maksimum pozisyon sınırına ({MAX_TOTAL_POSITIONS}) ulaşıldı.")
+                return False
+                
+            # Aynı sembolde zaten pozisyon var mı kontrolü
             for p in active_positions:
-                if sembol_duzelt(p.get("symbol")) == symbol: return False
+                if sembol_duzelt(p.get("symbol")) == symbol: 
+                    return False
 
-            leverage = 4
+            # Tür bazlı sıkı limit kontrolleri (1 Scalp ve 1 Fırsat)
+            aktif_scalp_sayisi = sum(1 for sym, p_t in pozisyon_tipleri.items() if p_t == "scalp")
+            aktif_firsat_sayisi = sum(1 for sym, p_t in pozisyon_tipleri.items() if p_t == "opportunity")
+
+            if p_type == "scalp" and aktif_scalp_sayisi >= MAX_SCALP_POSITIONS:
+                logging.info(f"[LİMİT KORUMA] Zaten açık 1 Scalp pozisyonu var. Yeni Scalp açılmadı.")
+                return False
+                
+            if p_type == "opportunity" and aktif_firsat_sayisi >= MAX_OPPORTUNITY_POSITIONS:
+                logging.info(f"[LİMİT KORUMA] Zaten açık 1 Fırsat pozisyonu var. Yeni Fırsat açılmadı.")
+                return False
+
+            # Kaldıraç ve Marj Uygulaması
+            leverage = LEVERAGE
             try:
                 exchange.set_margin_mode("isolated", symbol)
                 exchange.set_leverage(leverage, symbol)
@@ -249,6 +276,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
+            # Kesin Marj Kuralları: Scalp = 10 USDT, Fırsat = 15 USDT
             margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             notional = margin * leverage
             amount = notional / price
@@ -262,7 +290,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_yonleri[symbol] = direction
                 pozisyon_giris_fiyatlari[symbol] = price
                 pozisyon_en_yuksek_kar[symbol] = 0.0
-                logging.info(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Giriş: {price} | Puan: {score} | Marj: {margin} USDT")
+                logging.info(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Giriş: {price} | Puan: {score} | Marj: {margin} USDT | Kaldıraç: {leverage}x")
                 
                 time.sleep(1)
                 try:
@@ -384,30 +412,25 @@ def ana_tarama_dongusu():
             
             logging.info("Hibrit Piyasa Taraması Başlatılıyor...")
             
+            # 1. Ayrı Listeler Halinde Taramalar
             scalp_listesi = scan_scalp_market(exchange)
             firsat_listesi = scan_opportunity_market(exchange)
             
-            # Puanlama Listelerini Loglara Detaylı Yazdır
-            logging.info("--- SCALP MODU ADAY PUANLAMA LİSTESİ ---")
+            logging.info("========================================")
+            logging.info("--- 1. SCALP MODU ADAY LİSTESİ ---")
             if scalp_listesi:
                 for idx, c in enumerate(scalp_listesi, 1):
                     logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']}")
             else:
                 logging.info("Scalp kriterlerine uyan aday bulunamadı.")
 
-            logging.info("--- FIRSAT MODU TAKİP/PUANLAMA LİSTESİ ---")
+            logging.info("--- 2. FIRSAT MODU TAKİP LİSTESİ (Teyit Bekleniyor) ---")
             if firsat_listesi:
                 for idx, c in enumerate(firsat_listesi, 1):
-                    logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']} (Teyit bekleniyor)")
+                    logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']}")
             else:
                 logging.info("Fırsat kriterlerine uyan aday bulunamadı.")
-            
-            for item in scalp_listesi:
-                if item['score'] >= 92:
-                    item['mode'] = 'opportunity'
-                    if not any(f['symbol'] == item['symbol'] for f in firsat_listesi):
-                        firsat_listesi.append(item)
-                        logging.info(f"ÇAPRAZ KÖPRÜ: {item['symbol']} Scalp modundan Fırsat takip listesine aktarıldı!")
+            logging.info("========================================")
 
             positions = exchange.fetch_positions()
             active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
@@ -415,28 +438,38 @@ def ana_tarama_dongusu():
             firsat_var = any(pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) == "opportunity" for p in active_pos)
             scalp_var = any(pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) == "scalp" for p in active_pos)
             
-            # Fırsat Modu: Takip listesindekiler teyit ve pullback şartını geçerse işleme girilir
+            # A) FIRSAT MODU: Hemen girmek yok, liste takip edilir, teyit/pullback beklenir
             if not firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
                     dir_val = candidate['direction']
                     df_check = candidate.get('df')
-                    if df_check is None:
-                        df_check = ohlcv_getir(exchange, sym, '1h', 70)
                     
                     if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
-                        logging.info(f"[FIRSAT TEYİT GEÇTİ] {sym} için pullback onayı alındı, işleme giriliyor...")
+                        logging.info(f"[FIRSAT TEYİT ALINDI] {sym} için pullback onayı sağlandı, en doğru zamanda işleme giriliyor...")
                         pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
-                        if df_check is not None: del df_check
                         break
                     else:
-                        logging.info(f"[FIRSAT BEKLİYOR] {sym} takipte, henüz pullback teyidi alınmadı.")
-                        if df_check is not None: del df_check
+                        logging.info(f"[FIRSAT TAKİpte] {sym} izleniyor, henüz teyit/pullback oluşmadı.")
 
-            # Scalp Modu: En iyi scalp adayı ile işlem açılır
+            # B) SCALP MODU: En yüksek skorlu aday teyit alarak işleme girer
             if not scalp_var and scalp_listesi:
                 best_s = scalp_listesi[0]
-                pozisyon_ac(exchange, best_s['symbol'], best_s['direction'], best_s['score'], "scalp")
+                df_check = best_s.get('df')
+                sym = best_s['symbol']
+                dir_val = best_s['direction']
+                
+                if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
+                    logging.info(f"[SCALP TEYİT ALINDI] En yüksek skorlu {sym} işleme alınıyor...")
+                    pozisyon_ac(exchange, sym, dir_val, best_s['score'], "scalp")
+                else:
+                    logging.info(f"[SCALP BEKLİYOR] En yüksek skorlu {sym} için teyit bekleniyor.")
+
+            # Temizlik
+            for item in scalp_listesi:
+                if 'df' in item and item['df'] is not None: del item['df']
+            for item in firsat_listesi:
+                if 'df' in item and item['df'] is not None: del item['df']
 
         except Exception as e:
             logging.error(f"Ana döngü hatası: {e}")
