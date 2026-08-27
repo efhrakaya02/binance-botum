@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - KATI LİMİT VE YETİM EMİR TEMİZLİKLİ SÜRÜM
+# BINANCE FUTURES BOT - KATI 80+ PUAN SINIRLI SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -39,8 +39,10 @@ MAX_OPPORTUNITY_POSITIONS = 1
 
 MAX_TOTAL_POSITIONS = 2 
 
-OPPORTUNITY_MIN_SCORE = 68
-SCALP_MIN_SCORE = 75
+# --- KATI PUAN SINIRLARI (80 ALTI İŞLEM YASAK) ---
+MINIMUM_PROCESS_SCORE = 80
+OPPORTUNITY_MIN_SCORE = 80
+SCALP_MIN_SCORE = 80
 
 COOLDOWN_HOURS = 4
 cooldown_ms = COOLDOWN_HOURS * 60 * 60 * 1000
@@ -373,7 +375,6 @@ def market_pozisyon_kapat(exchange, symbol, side, amount, sebep):
         return False
     with pozisyon_kapatma_lock:
         try:
-            # İşlem kapatılırken veya kapanmadan önce o coine ait tüm bekleyen ek emirleri (TP/SL) temizle
             try:
                 exchange.cancel_all_orders(symbol)
             except Exception:
@@ -393,10 +394,8 @@ def market_pozisyon_kapat(exchange, symbol, side, amount, sebep):
             return False
 
 def pozisyonlari_yonet(exchange, positions):
-    # Aktif pozisyon sembollerini takip etmek için küme oluşturuyoruz
     aktif_semboller = {sembol_duzelt(p.get("symbol")) for p in positions if float(p.get("contracts") or 0) > 0}
 
-    # Eğer daha önceden botun hafızasında olan ancak borsada artık kontratı kalmamış (TP/SL ile kapanmış) coin varsa, ek emirlerini temizle
     for sym in list(pozisyon_tipleri.keys()):
         if sym not in aktif_semboller:
             try:
@@ -461,7 +460,6 @@ def pozisyon_monitor_loop():
             if pozisyon_monitor_lock.acquire(blocking=False):
                 try:
                     positions = exchange.fetch_positions()
-                    # Tüm pozisyonları göndererek hem kar yönetimi hem de kapanan pozisyonların emir temizliğini yap
                     pozisyonlari_yonet(exchange, positions)
                 finally:
                     pozisyon_monitor_lock.release()
@@ -537,31 +535,32 @@ def piyasa_tara_ve_islem_yap():
         if cooldown_aktif_mi(symbol):
             continue
         res = skorla_coin(exchange, symbol)
-        if res and res["score"] >= OPPORTUNITY_MIN_SCORE:
+        # --- KATI FİLTRE: SADECE 80 VE ÜZERİ PUAN ALANLAR LİSTEYE EKLENİR ---
+        if res and res["score"] >= MINIMUM_PROCESS_SCORE:
             adaylar.append(res)
 
     if adaylar:
         adaylar.sort(key=lambda x: x["score"], reverse=True)
 
         print("\n" + "="*50, flush=True)
-        print("📊 TEYİT EDİLMİŞ PİYASA ANALİZ SONUÇLARI VE PUAN TABLOSU", flush=True)
+        print("📊 TEYİT EDİLMİŞ PİYASA ANALİZ SONUÇLARI (80+ PUAN LİSTESİ)", flush=True)
         print("="*50, flush=True)
         
         firsat_adaylari = adaylar[:5]
-        print("🏆 ANA FIRSAT İÇİN EN İYİ İLK 5 ADAY (12 USDT Margin):", flush=True)
+        print("🏆 80+ PUANLI FIRSAT ADAYLARI (12 USDT Margin):", flush=True)
         for i, c in enumerate(firsat_adaylari, 1):
             print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
 
         scalp_adaylari = [c for c in adaylar if c['score'] >= SCALP_MIN_SCORE][:5]
         if scalp_adaylari:
-            print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY (10 USDT Margin):", flush=True)
+            print("\n⚡ 80+ PUANLI SCALP ADAYLARI (10 USDT Margin):", flush=True)
             for i, c in enumerate(scalp_adaylari, 1):
                 print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
         else:
-            print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY: (75+ Teyitli scalp adayı bulunamadı)", flush=True)
+            print("\n⚡ SCALP ADAYI: (80+ puan sağlayan scalp adayı bulunamadı)", flush=True)
         print("="*50 + "\n", flush=True)
     else:
-        print("[ANALİZ] Kriterleri ve süzgeçleri sağlayan uygun coin bulunamadı.", flush=True)
+        print(f"[ANALİZ] Minimum {MINIMUM_PROCESS_SCORE} puan barajını sağlayan hiçbir coin bulunamadı. İşlem açılmadan sonraki döngü bekleniyor.", flush=True)
 
     print("="*50, flush=True)
     print(f"📌 ANLIK AÇIK İŞLEM DURUMU (Aktif İşlem Sayısı: {aktif_sayisi}/{MAX_TOTAL_POSITIONS})", flush=True)
@@ -603,6 +602,10 @@ def piyasa_tara_ve_islem_yap():
         s = aday["symbol"]
         score = aday["score"]
         
+        # Ekstra güvenlik katmanı: Puan kesinlikle 80 ve üzeri olmalı
+        if score < MINIMUM_PROCESS_SCORE:
+            continue
+        
         if score >= SCALP_MIN_SCORE and not scalp_var and not (s in pozisyon_tipleri):
             if pozisyon_ac(exchange, s, aday["direction"], score, "scalp"):
                 scalp_var = True
@@ -620,7 +623,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Kesintisiz Çalışıyor (Yetim Emir Temizliği Aktif)", 
+        "status": "Bot Kesintisiz Çalışıyor (Katı 80+ Puan Sınırı Aktif)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -629,7 +632,7 @@ def index():
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Emir temizlikli tarama tetiklendi."}), 200
+        return jsonify({"success": True, "message": "80+ puan sınırlı tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
