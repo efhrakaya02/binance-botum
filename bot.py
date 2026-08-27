@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - 5M & 15M TEYİT, TOP 3 VE KORELASYON KORUMASI
+# BINANCE FUTURES BOT - 5M & 15M TEYİT, TOP 3 VE MANUEL KAPANIŞ KORUMASI
 # ============================================================
 
 app = Flask(__name__)
@@ -46,6 +46,7 @@ SCALP_MIN_SCORE = 85
 
 # --- COOLDOWN / 4 SAATLİK MUM KISITLAMASI ---
 cooldown_4h_tracker = {}       # { "symbol_direction": son_giris_4h_timestamp }
+onceki_aktif_pozisyonlar = set() # Manuel veya normal kapanışları anlık yakalamak için
 
 son_kapanis_zamanlari = {}
 POSITION_MONITOR_INTERVAL = 2.0
@@ -55,6 +56,7 @@ POSITION_MONITOR_INTERVAL = 2.0
 # ============================================================
 pozisyon_en_yuksek_kar = {}
 pozisyon_tipleri = {}
+pozisyon_yonleri = {}          # Hangi sembolün hangi yönde (buy/sell) olduğunu takip etmek için
 pozisyon_kapatma_lock = threading.Lock()
 pozisyon_monitor_lock = threading.Lock()
 islem_acma_lock = threading.Lock()
@@ -437,7 +439,6 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
 # ============================================================
 def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
     try:
-        # 5m ve 15m verilerini çek
         df_5m = ohlcv_getir(exchange, symbol, "5m", 15)
         df_15m = ohlcv_getir(exchange, symbol, "15m", 15)
 
@@ -446,7 +447,6 @@ def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
             body_5m = last_5m['close'] - last_5m['open']
             atr_5m = last_5m.get('atr', 0)
             
-            # 5m ters yönde büyük mum kontrolü
             if direction == "buy" and body_5m < 0 and abs(body_5m) > (atr_5m * 0.4):
                 print(f"[5M TEYİDİ REDDİ] {symbol} (BUY) | 5m mum ters yönde güçlü.", flush=True)
                 return False
@@ -459,7 +459,6 @@ def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
             body_15m = last_15m['close'] - last_15m['open']
             atr_15m = last_15m.get('atr', 0)
             
-            # 15m ters yönde büyük mum ve trend uyum kontrolü
             if direction == "buy" and body_15m < 0 and abs(body_15m) > (atr_15m * 0.4):
                 print(f"[15M TEYİDİ REDDİ] {symbol} (BUY) | 15m mum ters yönde güçlü.", flush=True)
                 return False
@@ -509,7 +508,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not can_open_position_4h_cooldown(exchange, symbol, direction):
         return False
 
-    # Organik Bağ / Korelasyon Kontrolü (Örn: BTC ve BCH aynı yönde olamaz)
+    # Organik Bağ / Korelasyon Kontrolü
     if not organik_bag_kontrolu(exchange, symbol, direction):
         return False
 
@@ -553,6 +552,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             
             if order:
                 pozisyon_tipleri[symbol] = p_type
+                pozisyon_yonleri[symbol] = direction  # Yönü kayıt altına al
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
                 record_trade_4h_cooldown(exchange, symbol, direction)
@@ -602,15 +602,29 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 def pozisyonlari_yonet(exchange, positions):
+    global onceki_aktif_pozisyonlar
+    
     aktif_semboller = {sembol_duzelt(p.get("symbol")) for p in positions if float(p.get("contracts") or 0) > 0}
-    for sym in list(pozisyon_tipleri.keys()):
-        if sym not in aktif_semboller:
-            try:
-                exchange.cancel_all_orders(sym)
-            except Exception:
-                pass
-            if sym in pozisyon_tipleri: del pozisyon_tipleri[sym]
-            if sym in pozisyon_en_yuksek_kar: del pozisyon_en_yuksek_kar[sym]
+    
+    # Kapanan pozisyonları tespit et (Manuel veya otomatik kapandığında cooldown uygula)
+    kapananlar = onceki_aktif_pozisyonlar - aktif_semboller
+    for sym in kapananlar:
+        eski_yon = pozisyon_yonleri.get(sym)
+        if eski_yon:
+            # Manuel veya erken kapanışta o 4h mum periyodu boyunca tekrar girmemesi için zorunlu cooldown işaretle
+            record_trade_4h_cooldown(exchange, sym, eski_yon)
+            print(f"[MANUEL / POZİSYON KAPANIŞI TESPİT EDİLDİ] {sym} ({eski_yon.upper}) kapatıldı. 4H Cooldown devreye sokuldu.", flush=True)
+        
+        if sym in pozisyon_tipleri: del pozisyon_tipleri[sym]
+        if sym in pozisyon_en_yuksek_kar: del pozisyon_en_yuksek_kar[sym]
+        if sym in pozisyon_yonleri: del pozisyon_yonleri[sym]
+        
+        try:
+            exchange.cancel_all_orders(sym)
+        except Exception:
+            pass
+
+    onceki_aktif_pozisyonlar = aktif_semboller.copy()
 
     for p in positions:
         symbol = sembol_duzelt(p.get("symbol"))
@@ -627,6 +641,7 @@ def pozisyonlari_yonet(exchange, positions):
             if symbol not in pozisyon_tipleri:
                 if approx_margin >= 11.0: pozisyon_tipleri[symbol] = "opportunity"
                 else: pozisyon_tipleri[symbol] = "scalp"
+                pozisyon_yonleri[symbol] = "buy" if side == "long" else "sell"
 
             if pozisyon_tipleri.get(symbol) == "opportunity":
                 roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
@@ -799,14 +814,14 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Top 3 Aday, 5m & 15m Zamanlama Teyidi Aktif)"})
+    return jsonify({"status": "Bot Çalışıyor (Top 3 Aday, 5m & 15m Zamanlama Teyidi ve Manuel Kapanış Koruması Aktif)"})
 
 @app.route("/tetikle")
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Tarama, Top 3 analizi ve 5m/15m teyit tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Tarama, Top 3 analizi, 5m/15m teyit ve manuel kapanış koruması tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
