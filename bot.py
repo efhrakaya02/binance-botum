@@ -253,7 +253,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 if sembol_duzelt(p.get("symbol")) == symbol: 
                     return False
 
-            # Tür bazlı sıkı limit kontrolleri (1 Scalp ve 1 Fırsat)
+            # Kesin Mod Kotası Sınırları (1 Scalp ve 1 Fırsat Bağımsız Kontrolü)
             aktif_scalp_sayisi = sum(1 for sym, p_t in pozisyon_tipleri.items() if p_t == "scalp")
             aktif_firsat_sayisi = sum(1 for sym, p_t in pozisyon_tipleri.items() if p_t == "opportunity")
 
@@ -432,14 +432,12 @@ def ana_tarama_dongusu():
                 logging.info("Fırsat kriterlerine uyan aday bulunamadı.")
             logging.info("========================================")
 
-            positions = exchange.fetch_positions()
-            active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
+            # Mevcut açık pozisyonların mod bazlı durumları kontrol ediliyor
+            aktif_scalp_var = any(p_t == "scalp" for p_t in pozisyon_tipleri.values())
+            aktif_firsat_var = any(p_t == "opportunity" for p_t in pozisyon_tipleri.values())
             
-            firsat_var = any(pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) == "opportunity" for p in active_pos)
-            scalp_var = any(pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) == "scalp" for p in active_pos)
-            
-            # A) FIRSAT MODU: Hemen girmek yok, liste takip edilir, teyit/pullback beklenir
-            if not firsat_var and firsat_listesi:
+            # A) FIRSAT MODU: Hemen girmek yok, liste takip edilir, teyit/pullback beklenir (Kotası: 1 Fırsat)
+            if not aktif_firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
                     dir_val = candidate['direction']
@@ -450,10 +448,10 @@ def ana_tarama_dongusu():
                         pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
                         break
                     else:
-                        logging.info(f"[FIRSAT TAKİpte] {sym} izleniyor, henüz teyit/pullback oluşmadı.")
+                        logging.info(f"[FIRSAT TAKİPTE] {sym} izleniyor, henüz teyit/pullback oluşmadı.")
 
-            # B) SCALP MODU: En yüksek skorlu aday teyit alarak işleme girer
-            if not scalp_var and scalp_listesi:
+            # B) SCALP MODU: En yüksek skorlu aday teyit alarak işleme girer (Kotası: 1 Scalp)
+            if not aktif_scalp_var and scalp_listesi:
                 best_s = scalp_listesi[0]
                 df_check = best_s.get('df')
                 sym = best_s['symbol']
