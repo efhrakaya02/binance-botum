@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - 30M, ATR STOP, %4 ROI & FORMASYON AVCISI
+# BINANCE FUTURES BOT - SABİT LİMİTLİ FIRSAT & SCALP AVCISI
 # ============================================================
 
 app = Flask(__name__)
@@ -26,23 +26,23 @@ TRADING_ENABLED = True
 POSITION_MONITOR_ENABLED = True
 
 # ============================================================
-# AYARLAR VE STRATEJİ PARAMETRELERİ
+# AYARLAR VE KESİN İŞLEM LİMİTLERİ
 # ============================================================
 SCALP_ENABLED = True
-SCALP_MARGIN = 15.0      
-MAX_SCALP_POSITIONS = 1
-SCALP_TP_ROI = 4.0       
+SCALP_MARGIN = 10.0      # Kesin kural: Scalp için tam 10 USDT
+MAX_SCALP_POSITIONS = 1  # En fazla 1 adet Scalp
+SCALP_TP_ROI = 4.0       # Hedef net %4 ROI
 
 OPPORTUNITY_ENABLED = True
-OPPORTUNITY_MARGIN = 20.0  
-MAX_OPPORTUNITY_POSITIONS = 1
+OPPORTUNITY_MARGIN = 12.0  # Kesin kural: Fırsat için tam 12 USDT
+MAX_OPPORTUNITY_POSITIONS = 1  # En fazla 1 adet Fırsat
 
-MAX_TOTAL_POSITIONS = 2 
+MAX_TOTAL_POSITIONS = 2  # Toplamda kesinlikle aynı anda maksimum 2 işlem
 
-MINIMUM_PROCESS_SCORE = 75  # Formasyon avcılığı için taban puan esnetildi
+MINIMUM_PROCESS_SCORE = 75  
 SCALP_MIN_SCORE = 80
 
-COOLDOWN_HOURS = 4
+COOLDOWN_HOURS = 2       
 cooldown_ms = COOLDOWN_HOURS * 60 * 60 * 1000
 son_kapanis_zamanlari = {}
 
@@ -99,7 +99,7 @@ def cooldown_aktif_mi(symbol):
     return False
 
 # ============================================================
-# İNDİKATÖRLER VE FORMASYON TESPİT MOTORU
+# İNDİKATÖRLER VE FORMASYON / PUMP-DUMP TESPİT MOTORU
 # ============================================================
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -152,62 +152,50 @@ def hesapla_obv(df):
     direction = np.sign(df["close"].diff()).fillna(0)
     return (direction * df["volume"]).cumsum()
 
-# --- FORMASYON TESPİT FONKSİYONLARI ---
-def formasyonlari_tespit_et(df):
-    """
-    OBO, TOBO, Bayrak (Bull Flag) ve Ters Bayrak (Bear Flag) tespiti yapar.
-    Dönüş değerleri: 'tobo', 'obo', 'bull_flag', 'bear_flag', None
-    """
+def formasyon_ve_volatilite_avcisi(df):
     if len(df) < 40:
         return None, None
 
     closes = df["close"].values
     highs = df["high"].values
     lows = df["low"].values
-    volumes = df["volume"].values
 
-    # Son 30 mumluk dar alan
     recent_lows = lows[-30:]
     recent_highs = highs[-30:]
     recent_closes = closes[-30:]
 
-    # 1. TOBO Tespiti (Ters Omuz Baş Omuz - Dip Dönüşü)
-    # Ortadaki dip (baş) en düşük nokta olmalı, sol ve sağ omuzlar ona yakın yükseklikte olmalı
+    pump_check = (closes[-5] - closes[-20]) / closes[-20]
+    if pump_check > 0.12 and recent_highs[-1] > recent_closes[-1] * 1.03: 
+        return "sert_dump_reversal", "sell"
+
+    dump_check = (closes[-20] - closes[-5]) / closes[-20]
+    if dump_check > 0.12 and recent_lows[-1] < recent_closes[-1] * 0.97: 
+        return "sert_pump_reversal", "buy"
+
     min_idx = np.argmin(recent_lows)
-    if 8 <= min_idx <= 22: # Baş ortada yer almalı
+    if 8 <= min_idx <= 22:
         head = recent_lows[min_idx]
         left_shoulder = np.min(recent_lows[:min_idx])
         right_shoulder = np.min(recent_lows[min_idx+1:])
-        
-        # Baş, omuzlardan belirgin şekilde aşağıda olmalı ve omuzlar birbirine yakın olmalı
-        if head < left_shoulder and head < right_shoulder and abs(left_shoulder - right_shoulder) / left_shoulder < 0.03:
-            if recent_closes[-1] > np.mean([left_shoulder, right_shoulder]): # Boyun çizgisi yukarı kırılmışsa
+        if head < left_shoulder and head < right_shoulder and abs(left_shoulder - right_shoulder) / left_shoulder < 0.04:
+            if recent_closes[-1] > np.mean([left_shoulder, right_shoulder]):
                 return "tobo", "buy"
 
-    # 2. OBO Tespiti (Omuz Baş Omuz - Tepe Dönüşü)
     max_idx = np.argmax(recent_highs)
     if 8 <= max_idx <= 22:
         head_h = recent_highs[max_idx]
         left_h = np.max(recent_highs[:max_idx])
         right_h = np.max(recent_highs[max_idx+1:])
-        
-        if head_h > left_h and head_h > right_h and abs(left_h - right_h) / left_h < 0.03:
-            if recent_closes[-1] < np.mean([left_h, right_h]): # Boyun çizgisi aşağı kırılmışsa
+        if head_h > left_h and head_h > right_h and abs(left_h - right_h) / left_h < 0.04:
+            if recent_closes[-1] < np.mean([left_h, right_h]):
                 return "obo", "sell"
 
-    # 3. Boğa Bayrağı (Bull Flag - Sert Yükseliş Sonrası Yatay Sıkışma & Devam)
-    # Önceki 15 mum sert yükselmiş, son 15 mum hafif aşağı dar bir kanalda dinleniyor
-    price_change_prev = (closes[-20] - closes[-40]) / closes[-40]
-    if price_change_prev > 0.05: # Son 20 mumda %5+ ralli
-        flag_volatility = np.std(recent_closes[-10:]) / np.mean(recent_closes[-10:])
-        if flag_volatility < 0.015 and recent_closes[-1] > recent_closes[-5]: # Sıkışma bitip tekrar yukarı kırıyor
+    if (closes[-20] - closes[-40]) / closes[-40] > 0.05:
+        if np.std(recent_closes[-10:]) / np.mean(recent_closes[-10:]) < 0.015 and recent_closes[-1] > recent_closes[-5]:
             return "bull_flag", "buy"
 
-    # 4. Ters Bayrak (Bear Flag - Sert Düşüş Sonrası Yatay Tepki & Düşüşün Devamı)
-    price_drop_prev = (closes[-40] - closes[-20]) / closes[-40]
-    if price_drop_prev > 0.05: # Son 20 mumda %5+ sert düşüş
-        flag_volatility_bear = np.std(recent_closes[-10:]) / np.mean(recent_closes[-10:])
-        if flag_volatility_bear < 0.015 and recent_closes[-1] < recent_closes[-5]: # Tepki bitti ve aşağı kırıyor
+    if (closes[-40] - closes[-20]) / closes[-40] > 0.05:
+        if np.std(recent_closes[-10:]) / np.mean(recent_closes[-10:]) < 0.015 and recent_closes[-1] < recent_closes[-5]:
             return "bear_flag", "sell"
 
     return None, None
@@ -238,9 +226,6 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
     except Exception as e:
         return None
 
-# ============================================================
-# BTC KORELASYON KONTROLÜ
-# ============================================================
 def btc_egilimini_getir(exchange):
     try:
         df_btc = ohlcv_getir(exchange, "BTC/USDT", "1h", 50)
@@ -256,18 +241,18 @@ def btc_egilimini_getir(exchange):
         return "neutral"
 
 # ============================================================
-# FORMASYON DESTEKLİ 30M PULLBACK VE SKORLAMA
+# SKORLAMA VE FIRSAT / SCALP AYRIMI
 # ============================================================
 def skorla_coin(exchange, symbol, btc_trend):
     result = {
         "symbol": symbol, "long_score": 0, "short_score": 0,
-        "direction": None, "score": 0, "atr": None, "price": None, "formasyon": None
+        "direction": None, "score": 0, "atr": None, "price": None, "formasyon": None, "is_firsat": False
     }
     try:
         try:
             funding_data = exchange.fetch_funding_rate(symbol)
             funding = float(funding_data.get("fundingRate", 0) or 0)
-            if abs(funding) >= 0.0012:
+            if abs(funding) >= 0.0015:
                 return None
         except Exception:
             funding = 0
@@ -286,55 +271,39 @@ def skorla_coin(exchange, symbol, btc_trend):
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
             return None
 
-        # Formasyon Tespiti Çağrısı
-        formasyon_adi, formasyon_yonu = formasyonlari_tespit_et(df30)
+        formasyon_adi, formasyon_yonu = formasyon_ve_volatilite_avcisi(df30)
         result["formasyon"] = formasyon_adi
 
         vol_ratio = float(d30["volume_ratio"])
-        if vol_ratio < 1.3 and not formasyon_adi: # Formasyon varsa hacim esnetilir
-            return None
-
-        trend4_long = (d4["close"] > d4["ema50"]) and (d4["ema50"] > d4["ema200"])
-        trend4_short = (d4["close"] < d4["ema50"]) and (d4["ema50"] < d4["ema200"])
-        trend1_long = (d1["close"] > d1["ema50"]) and (d1["ema9"] > d1["ema21"])
-        trend1_short = (d1["close"] < d1["ema50"]) and (d1["ema9"] < d1["ema21"])
-        
-        adx = float(d1["adx"])
-        if adx < 16 and not formasyon_adi:
+        if vol_ratio < 1.3 and not formasyon_adi:
             return None
 
         rsi30 = float(d30["rsi"])
         long_score, short_score = 0, 0
 
-        can_long = rsi30 < 72
-        can_short = rsi30 > 28
+        if formasyon_adi:
+            result["is_firsat"] = True
+            if formasyon_yonu == "buy":
+                long_score += 35
+            else:
+                short_score += 35
 
-        is_pullback_long = (price <= d30["ema9"]) and (price >= d30["ema21"])
-        is_pullback_short = (price >= d30["ema9"]) and (price <= d30["ema21"])
+        trend4_long = (d4["close"] > d4["ema50"])
+        trend4_short = (d4["close"] < d4["ema50"])
+        trend1_long = (d1["close"] > d1["ema50"]) and (d1["ema9"] > d1["ema21"])
+        trend1_short = (d1["close"] < d1["ema50"]) and (d1["ema9"] < d1["ema21"])
 
-        if can_long:
-            if btc_trend == "bullish": long_score += 10
+        if rsi30 < 72:
             if trend4_long: long_score += 15
             if trend1_long: long_score += 15
             if d30["macd"] > d30["macd_signal"]: long_score += 10
-            if is_pullback_long: long_score += 15
-            
-            # Formasyon Avcısı Puanı (TOBO veya Boğa Bayrağı yakalandıysa +25 Puan)
-            if formasyon_adi in ["tobo", "bull_flag"] and formasyon_yonu == "buy":
-                long_score += 28
-                print(f"[AVLANAN FORMASYON] {symbol} -> {formasyon_adi.upper()} Yakalandı! (+28 Puan)", flush=True)
+            if (price <= d30["ema9"]) and (price >= d30["ema21"]): long_score += 15
 
-        if can_short:
-            if btc_trend == "bearish": short_score += 10
+        if rsi30 > 28:
             if trend4_short: short_score += 15
             if trend1_short: short_score += 15
             if d30["macd"] < d30["macd_signal"]: short_score += 10
-            if is_pullback_short: short_score += 15
-            
-            # Formasyon Avcısı Puanı (OBO veya Ters Bayrak yakalandıysa +25 Puan)
-            if formasyon_adi in ["obo", "bear_flag"] and formasyon_yonu == "sell":
-                short_score += 28
-                print(f"[AVLANAN FORMASYON] {symbol} -> {formasyon_adi.upper()} Yakalandı! (+28 Puan)", flush=True)
+            if (price >= d30["ema9"]) and (price <= d30["ema21"]): short_score += 15
 
         if long_score >= short_score:
             result["direction"], result["score"] = "buy", long_score
@@ -353,7 +322,7 @@ def skorla_coin(exchange, symbol, btc_trend):
 # ============================================================
 def kaldirac_belirle(score):
     if score >= 90: return 5
-    elif score >= 80: return 3
+    elif score >= 80: return 4
     return 3
 
 def miktar_hesapla(exchange, symbol, margin, leverage, price):
@@ -376,7 +345,7 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
     try:
         exchange.set_leverage(leverage, symbol)
         return True
-    except Exception:
+    except Exception as e:
         return False
 
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
@@ -387,11 +356,22 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             positions = exchange.fetch_positions()
             active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
+            # KESİN LİMİT KONTROLÜ
             if len(active_positions) >= MAX_TOTAL_POSITIONS:
                 return False
 
             for p in active_positions:
                 if sembol_duzelt(p.get("symbol")) == symbol:
+                    return False
+
+            # Tür bazlı tekil limit kontrolü
+            if p_type == "opportunity":
+                mevcut_firsat = sum(1 for p in active_positions if sembol_duzelt(p.get("symbol")) in pozisyon_tipleri and pozisyon_tipleri[sembol_duzelt(p.get("symbol"))] == "opportunity")
+                if mevcut_firsat >= MAX_OPPORTUNITY_POSITIONS:
+                    return False
+            elif p_type == "scalp":
+                mevcut_scalp = sum(1 for p in active_positions if sembol_duzelt(p.get("symbol")) in pozisyon_tipleri and pozisyon_tipleri[sembol_duzelt(p.get("symbol"))] == "scalp")
+                if mevcut_scalp >= MAX_SCALP_POSITIONS:
                     return False
 
             leverage = kaldirac_belirle(score)
@@ -401,7 +381,8 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            margin = SCALP_MARGIN if p_type == "scalp" else OPPORTUNITY_MARGIN
+            # KESİN BÜTÇE KONTROLÜ: Fırsat için 12 USDT, Scalp için 10 USDT
+            margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             amount = miktar_hesapla(exchange, symbol, margin, leverage, price)
 
             side = "buy" if direction == "buy" else "sell"
@@ -436,7 +417,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                     exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
                         'stopPrice': sl_price, 'reduceOnly': True
                     })
-                    print(f"[TP/SL AYARLANDI (%{SCALP_TP_ROI} ROI)] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
+                    print(f"[TP/SL AYARLANDI] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
                 except Exception as tp_err:
                     print(f"[TP/SL HATA] {symbol}: {tp_err}", flush=True)
 
@@ -486,8 +467,15 @@ def pozisyonlari_yonet(exchange, positions):
             leverage = float(p.get("leverage") or 1)
             if entry_price == 0 or mark_price == 0: continue
 
+            # Otomatik tip atama (Eğer hafızada yoksa teminata göre etiketle)
+            approx_margin = (contracts * entry_price) / leverage if leverage > 0 else 0
+            if symbol not in pozisyon_tipleri:
+                if approx_margin >= 11.0:
+                    pozisyon_tipleri[symbol] = "opportunity"
+                else:
+                    pozisyon_tipleri[symbol] = "scalp"
+
             roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
-            p_type = pozisyon_tipleri.get(symbol, "opportunity")
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max: pozisyon_en_yuksek_kar[symbol] = roi
         except Exception:
@@ -536,8 +524,7 @@ def piyasa_tara_ve_islem_yap():
                 coin_listesi.append({"symbol": symbol, "change": float(ticker.get("percentage", 0) or 0)})
                 
         coin_listesi.sort(key=lambda x: x["change"], reverse=True)
-        hedef_coini_listesi = list(set([i["symbol"] for i in coin_listesi[:25]] + [i["symbol"] for i in coin_listesi[-25:]]))
-        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} coin Formasyon Avcısı motoruyla taranıyor...", flush=True)
+        hedef_coini_listesi = list(set([i["symbol"] for i in coin_listesi[:30]] + [i["symbol"] for i in coin_listesi[-30:]]))
     except Exception as e:
         return
 
@@ -545,11 +532,25 @@ def piyasa_tara_ve_islem_yap():
         positions = exchange.fetch_positions()
         active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
         aktif_sayisi = len(active_positions)
-        scalp_var = any(float(p.get("contracts") or 0) * float(p.get("entryPrice") or 0) / float(p.get("leverage") or 1) < 18.0 for p in active_positions)
+        
+        scalp_var = False
+        firsat_var = False
+        for p in active_positions:
+            p_sym = sembol_duzelt(p.get("symbol"))
+            p_contracts = float(p.get("contracts") or 0)
+            p_entry = float(p.get("entryPrice") or 0)
+            p_lev = float(p.get("leverage") or 1)
+            approx_margin = (p_contracts * p_entry) / p_lev if p_lev > 0 else 0
+            if approx_margin >= 11.0:
+                firsat_var = True
+                pozisyon_tipleri[p_sym] = "opportunity"
+            else:
+                scalp_var = True
+                pozisyon_tipleri[p_sym] = "scalp"
     except Exception:
         active_positions = []
         aktif_sayisi = 0
-        scalp_var = False
+        scalp_var, firsat_var = False, False
 
     adaylar = []
     for symbol in hedef_coini_listesi:
@@ -560,21 +561,24 @@ def piyasa_tara_ve_islem_yap():
 
     if adaylar:
         adaylar.sort(key=lambda x: x["score"], reverse=True)
-        print("\n" + "="*50, flush=True)
-        print("🎯 FORMASYON AVCISI TARAMA SONUÇLARI", flush=True)
-        print("="*50, flush=True)
-        for i, c in enumerate(adaylar[:5], 1):
-            form_str = f" [Formasyon: {c['formasyon'].upper()}]" if c['formasyon'] else ""
-            print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']}{form_str}", flush=True)
-        print("="*50 + "\n", flush=True)
 
     if aktif_sayisi >= MAX_TOTAL_POSITIONS or not adaylar: return
 
     for aday in adaylar:
         s = aday["symbol"]
         score = aday["score"]
-        if score >= SCALP_MIN_SCORE and not scalp_var and not (s in pozisyon_tipleri):
+        is_firsat = aday["is_firsat"]
+        
+        # 1. Fırsat İşlemi (12 USDT, Max 1 adet)
+        if is_firsat and not firsat_var and not (s in pozisyon_tipleri):
+            if pozisyon_ac(exchange, s, aday["direction"], score, "opportunity"):
+                firsat_var = True
+                break
+        
+        # 2. Scalp İşlemi (10 USDT, Max 1 adet)
+        elif score >= SCALP_MIN_SCORE and not scalp_var and not (s in pozisyon_tipleri):
             if pozisyon_ac(exchange, s, aday["direction"], score, "scalp"):
+                scalp_var = True
                 break
 
 # ============================================================
@@ -582,13 +586,13 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Formasyon Avcısı & 30M Sürüm)"})
+    return jsonify({"status": "Bot Çalışıyor (12 USDT Fırsat & 10 USDT Scalp Sürümü)"})
 
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Formasyon taraması tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Piyasa analizi tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
