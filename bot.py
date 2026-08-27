@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - SCALP (0.30 USDT TP) & FIRSAT (DİNAMİK STOP) SÜRÜMÜ
+# BINANCE FUTURES BOT - SCALP & FIRSAT (COOLDOWN KORUMALI) SÜRÜMÜ
 # ============================================================
 
 app = Flask(__name__)
@@ -44,7 +44,7 @@ MAX_TOTAL_POSITIONS = 2        # Toplamda kesinlikle aynı anda maksimum 2 işle
 MINIMUM_PROCESS_SCORE = 85  
 SCALP_MIN_SCORE = 85
 
-# --- COOLDOWN / SÜRE KISITLAMASI AYARLARI ---
+# --- COOLDOWN / SÜRE KISITLAMASI AYARLARI (AYNI COİNE TEKRAR GİRİŞ ENGELİ) ---
 COOLDOWN_HOURS = 4 
 cooldown_tracker = {}          # { "BTC/USDT_buy": datetime_objesi, ... }
 
@@ -448,6 +448,7 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not islem_izni_var_mi(): return False
     
+    # 4 Saatlik Cooldown (Aynı yönde tekrar giriş) Koruması
     if not can_open_position_cooldown(symbol, direction):
         return False
 
@@ -492,6 +493,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_tipleri[symbol] = p_type
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
+                # İşlem açıldığı anda cooldown süresini kaydet
                 record_trade_cooldown(symbol, direction)
                 
                 print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT", flush=True)
@@ -724,9 +726,10 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Scalp: 0.30 USDT TP / Fırsat: Dinamik Trailing Stop)"})
+    return jsonify({"status": "Bot Çalışıyor (Scalp: 0.30 USDT TP / Fırsat: Dinamik Trailing Stop / Cooldown Aktif)"})
 
 @app.route("/tetikle")
+@app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
