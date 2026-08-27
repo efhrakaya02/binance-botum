@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - ÖZEL MARGIN VE PUANLAMA SÜRÜMÜ
+# BINANCE FUTURES BOT - DETAYLI LOG VE ANLIK İŞLEM TAKİBİ SÜRÜMÜ
 # ============================================================
 
 app = Flask(__name__)
@@ -34,7 +34,7 @@ MAX_SCALP_POSITIONS = 1
 SCALP_TP_ROI = 3.0       # %3 ROI hedeflenir
 
 OPPORTUNITY_ENABLED = True
-OPPORTUNITY_MARGIN = 12.0  # Fırsat işlemleri için 12 USDT teminat (Ayırt etmek için özel)
+OPPORTUNITY_MARGIN = 12.0  # Fırsat işlemleri için 12 USDT teminat
 MAX_OPPORTUNITY_POSITIONS = 1
 
 MAX_TOTAL_POSITIONS = 2 
@@ -309,7 +309,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         ticker = exchange.fetch_ticker(symbol)
         price = float(ticker["last"])
         
-        # Scalp için 10 USDT, Fırsat için 12 USDT margin kullanılır
         margin = SCALP_MARGIN if p_type == "scalp" else OPPORTUNITY_MARGIN
         amount = miktar_hesapla(exchange, symbol, margin, leverage, price)
 
@@ -321,7 +320,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             pozisyon_en_yuksek_kar[symbol] = 0.0
             print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT | Kaldıraç: {leverage}x", flush=True)
             
-            # --- BORSA TABANLI TP VE SL EMİRLERİNİN GÖNDERİLMESİ ---
             time.sleep(1)
             try:
                 close_side = "sell" if side == "buy" else "buy"
@@ -445,7 +443,7 @@ def monitor_baslat():
         thread.start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ VE EN İYİLERİ LİSTELEME
+# ANA TARAMA DÖNGÜSÜ, PUANLAMA VE ANLIK İŞLEM RAPORU
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
@@ -474,6 +472,7 @@ def piyasa_tara_ve_islem_yap():
         print(f"[PİYASA LİSTE HATA]: {e}", flush=True)
         return
 
+    # --- 1. AÇIK POZİSYONLARIN DURUMUNU ÖNCEDEN AL VE RAPORLA ---
     try:
         positions = exchange.fetch_positions()
         active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
@@ -483,11 +482,9 @@ def piyasa_tara_ve_islem_yap():
         scalp_var = "scalp" in acik_tipler
         firsat_var = "opportunity" in acik_tipler
     except Exception:
+        active_positions = []
         aktif_sayisi = 0
         scalp_var, firsat_var = False, False
-
-    if aktif_sayisi >= MAX_TOTAL_POSITIONS:
-        return
 
     adaylar = []
     for symbol in hedef_coini_listesi:
@@ -497,29 +494,59 @@ def piyasa_tara_ve_islem_yap():
         if res and res["score"] >= OPPORTUNITY_MIN_SCORE:
             adaylar.append(res)
 
-    if not adaylar:
+    if adaylar:
+        adaylar.sort(key=lambda x: x["score"], reverse=True)
+
+        # --- 2. PUANLAMA TABLOSUNu HER DURUMDA YAZDIR ---
+        print("\n" + "="*50, flush=True)
+        print("📊 PİYASA ANALİZ SONUÇLARI VE PUAN TABLOSU", flush=True)
+        print("="*50, flush=True)
+        
+        firsat_adaylari = adaylar[:5]
+        print("🏆 ANA FIRSAT İÇİN EN İYİ İLK 5 ADAY (12 USDT Margin):", flush=True)
+        for i, c in enumerate(firsat_adaylari, 1):
+            print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
+
+        scalp_adaylari = [c for c in adaylar if c['score'] >= SCALP_MIN_SCORE][:5]
+        if scalp_adaylari:
+            print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY (10 USDT Margin):", flush=True)
+            for i, c in enumerate(scalp_adaylari, 1):
+                print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
+        else:
+            print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY: (75+ Puan sağlayan scalp adayı bulunamadı)", flush=True)
+        print("="*50 + "\n", flush=True)
+    else:
         print("[ANALİZ] Kriterleri sağlayan uygun coin bulunamadı.", flush=True)
+
+    # --- 3. ANLIK AÇIK İŞLEM BİLGİLERİNİ LOGLARDA GÖSTER ---
+    print("="*50, flush=True)
+    print(f"📌 ANLIK AÇIK İŞLEM DURUMU (Aktif İşlem Sayısı: {aktif_sayisi}/{MAX_TOTAL_POSITIONS})", flush=True)
+    print("="*50, flush=True)
+    if active_positions:
+        for p in active_positions:
+            p_sym = sembol_duzelt(p.get("symbol"))
+            p_side = str(p.get("side")).upper()
+            p_entry = float(p.get("entryPrice") or 0)
+            p_mark = float(p.get("markPrice") or 0)
+            p_lev = float(p.get("leverage") or 1)
+            p_type_val = pozisyon_tipleri.get(p_sym, "bilinmiyor").upper()
+            
+            if p_side == "LONG":
+                p_roi = ((p_mark - p_entry) / p_entry) * 100 * p_lev
+            else:
+                p_roi = ((p_entry - p_mark) / p_entry) * 100 * p_lev
+                
+            print(f"  • Tip: {p_type_val} | Coin: {p_sym} | Yön: {p_side} | Giriş: {p_entry} | Mark: {p_mark} | Kaldıraç: {p_lev}x | Anlık Kar (ROI): %{p_roi:.2f}", flush=True)
+    else:
+        print("  • Şu an borsada açık aktif bir işlem bulunmuyor.", flush=True)
+    print("="*50 + "\n", flush=True)
+
+    # --- 4. MAKSİMUM İŞLEM SAYISINA ULAŞILDIYSA YENİ İŞLEM AÇMA ---
+    if aktif_sayisi >= MAX_TOTAL_POSITIONS:
         return
 
-    adaylar.sort(key=lambda x: x["score"], reverse=True)
-
-    print("\n" + "="*50, flush=True)
-    print("📊 PİYASA ANALİZ SONUÇLARI VE PUAN TABLOSU", flush=True)
-    print("="*50, flush=True)
-    
-    firsat_adaylari = adaylar[:5]
-    print("🏆 ANA FIRSAT İÇİN EN İYİ İLK 5 ADAY (12 USDT Margin):", flush=True)
-    for i, c in enumerate(firsat_adaylari, 1):
-        print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
-
-    scalp_adaylari = [c for c in adaylar if c['score'] >= SCALP_MIN_SCORE][:5]
-    if scalp_adaylari:
-        print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY (10 USDT Margin):", flush=True)
-        for i, c in enumerate(scalp_adaylari, 1):
-            print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
-    else:
-        print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY: (75+ Puan sağlayan scalp adayı bulunamadı)", flush=True)
-    print("="*50 + "\n", flush=True)
+    if not adaylar:
+        return
 
     for aday in adaylar:
         if aktif_sayisi >= MAX_TOTAL_POSITIONS:
@@ -545,7 +572,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Kesintisiz Çalışıyor (12 USDT Fırsat Margin Aktif)", 
+        "status": "Bot Kesintisiz Çalışıyor (Detaylı Log & Anlık İşlem Raporu Aktif)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -554,7 +581,7 @@ def index():
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Tarama ve puanlama arka planda tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Tarama, puanlama ve anlık durum raporu tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
