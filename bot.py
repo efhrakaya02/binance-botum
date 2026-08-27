@@ -282,18 +282,22 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            # Kesin Marj Kuralları: Scalp = 10 USDT, Fırsat = 15 USDT (Yuvarlama sapmalarını önlemek için kesin oran)
+            # Marj Kuralları: Scalp = 10 USDT, Fırsat = 15 USDT
             margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             notional = margin * leverage
             raw_amount = notional / price
-            amount = float(exchange.amount_to_precision(symbol, raw_amount))
+
+            # --- Borsa Minimum Miktar ve Bakiye / Limit Kontrolü ---
+            market = exchange.market(symbol)
+            min_amount = market['limits']['amount']['min']
             
-            # Borsa adım boyutuna yuvarlandıktan sonra marjın aşırı sapmasını engellemek için kontrol
+            if raw_amount < min_amount:
+                logging.warning(f"[BAKİYE/LİMİT YETERSİZ] {symbol} için hesaplanan miktar ({raw_amount}), borsanın minimum sınırından ({min_amount}) küçük. İşlem pas geçiliyor, sonraki adaya geçilecek.")
+                return False  # False döndürerek üst döngünün diğer adaylara geçmesini sağlıyoruz
+
+            amount = float(exchange.amount_to_precision(symbol, raw_amount))
             gercek_notional = amount * price
             gercek_margin = gercek_notional / leverage
-            if gercek_margin > (margin * 1.25):  # Eğer borsa kısıtları nedeniyle çok yukarı yuvarlandıysa miktarı bir kademe aşağı çek
-                # Alternatif olarak hassas ayarlama
-                pass
 
             side = "buy" if direction == "buy" else "sell"
             order = exchange.create_order(symbol, "market", side, amount, None, {"leverage": leverage})
@@ -458,7 +462,7 @@ def ana_tarama_dongusu():
             aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
             aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
             
-            # A) FIRSAT MODU: Hemen girmek yok, liste takip edilir, teyit/pullback beklenir (Kotası: 1 Fırsat)
+            # A) FIRSAT MODU: Listeyi sırayla tarar, limiti/bakiyesi yetmeyeni atlar, uygun olanla işleme girer (Kotası: 1 Fırsat)
             if not aktif_firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
@@ -466,24 +470,33 @@ def ana_tarama_dongusu():
                     df_check = candidate.get('df')
                     
                     if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
-                        logging.info(f"[FIRSAT TEYİT ALINDI] {sym} için pullback onayı sağlandı, en doğru zamanda işleme giriliyor...")
-                        pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
-                        break
+                        logging.info(f"[FIRSAT TEYİT ALINDI] {sym} için pullback onayı sağlandı, işleme giriliyor...")
+                        basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
+                        if basarili:
+                            break  # İşlem başarıyla açıldıysa döngüden çık
+                        else:
+                            logging.info(f"[FIRSAT ATLANDI] {sym} bakiye/limit kuralına takıldı, listedeki sonraki adaya geçiliyor...")
+                            continue
                     else:
                         logging.info(f"[FIRSAT TAKİPTE] {sym} izleniyor, henüz teyit/pullback oluşmadı.")
 
-            # B) SCALP MODU: En yüksek skorlu aday teyit alarak işleme girer (Kotası: 1 Scalp)
+            # B) SCALP MODU: Adayları sırayla dener, limiti yetmeyeni atlayıp sonrakine geçer (Kotası: 1 Scalp)
             if not aktif_scalp_var and scalp_listesi:
-                best_s = scalp_listesi[0]
-                df_check = best_s.get('df')
-                sym = best_s['symbol']
-                dir_val = best_s['direction']
-                
-                if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
-                    logging.info(f"[SCALP TEYİT ALINDI] En yüksek skorlu {sym} işleme alınıyor...")
-                    pozisyon_ac(exchange, sym, dir_val, best_s['score'], "scalp")
-                else:
-                    logging.info(f"[SCALP BEKLİYOR] En yüksek skorlu {sym} için teyit bekleniyor.")
+                for candidate in scalp_listesi:
+                    sym = candidate['symbol']
+                    dir_val = candidate['direction']
+                    df_check = candidate.get('df')
+                    
+                    if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
+                        logging.info(f"[SCALP TEYİT ALINDI] {sym} işleme alınıyor...")
+                        basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
+                        if basarili:
+                            break  # İşlem başarıyla açıldıysa döngüden çık
+                        else:
+                            logging.info(f"[SCALP ATLANDI] {sym} bakiye/limit kuralına takıldı, listedeki sonraki adaya geçiliyor...")
+                            continue
+                    else:
+                        logging.info(f"[SCALP BEKLİYOR] {sym} için teyit bekleniyor.")
 
             # Temizlik
             for item in scalp_listesi:
