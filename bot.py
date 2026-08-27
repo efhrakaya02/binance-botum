@@ -4,11 +4,12 @@ import pandas as pd
 import numpy as np
 import time
 import threading
+import gc
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - 5M & 15M TEYİT, TOP 3 VE MANUEL KAPANIŞ KORUMASI
+# BINANCE FUTURES BOT - GAINERS/LOSERS 25 & RAM OPTİMİZE SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -46,9 +47,8 @@ SCALP_MIN_SCORE = 85
 
 # --- COOLDOWN / 4 SAATLİK MUM KISITLAMASI ---
 cooldown_4h_tracker = {}       # { "symbol_direction": son_giris_4h_timestamp }
-onceki_aktif_pozisyonlar = set() # Manuel veya normal kapanışları anlık yakalamak için
+onceki_aktif_pozisyonlar = set() 
 
-son_kapanis_zamanlari = {}
 POSITION_MONITOR_INTERVAL = 2.0
 
 # ============================================================
@@ -56,14 +56,14 @@ POSITION_MONITOR_INTERVAL = 2.0
 # ============================================================
 pozisyon_en_yuksek_kar = {}
 pozisyon_tipleri = {}
-pozisyon_yonleri = {}          # Hangi sembolün hangi yönde (buy/sell) olduğunu takip etmek için
+pozisyon_yonleri = {}          
 pozisyon_kapatma_lock = threading.Lock()
 pozisyon_monitor_lock = threading.Lock()
 islem_acma_lock = threading.Lock()
 monitor_basladi = False
 
 # ============================================================
-# BINANCE BAĞLANTI
+# BINANCE BAĞLANTI (Bellek ve Hız Optimizasyonlu)
 # ============================================================
 def get_exchange():
     return ccxt.binance({
@@ -72,7 +72,8 @@ def get_exchange():
         "enableRateLimit": True,
         "options": {
             "defaultType": "future",
-            "adjustForTimeDifference": True
+            "adjustForTimeDifference": True,
+            "warnOnFetchOpenOrdersWithoutSymbol": False
         }
     })
 
@@ -96,7 +97,7 @@ def gecerli_kripto_mu(symbol):
     return True
 
 # ============================================================
-# ORGANİK BAĞLI / KORELE COİN KONTROLÜ (Örn: BTC & BCH)
+# ORGANİK BAĞLI / KORELE COİN KONTROLÜ
 # ============================================================
 def organik_bag_kontrolu(exchange, symbol, direction):
     try:
@@ -141,7 +142,7 @@ def can_open_position_4h_cooldown(exchange, symbol, direction):
         if df_4h is not None and not df_4h.empty:
             current_last_4h_ts = int(df_4h.iloc[-1]["timestamp"])
             if current_last_4h_ts <= last_trade_4h_ts:
-                print(f"[4H COOLDOWN AKTİF] {symbol} ({direction.upper()}) | Henüz yeni bir 4H mum kapanmadı. İşlem engellendi.", flush=True)
+                print(f"[4H COOLDOWN AKTİF] {symbol} ({direction.upper()}) | Henüz yeni bir 4H mum kapanmadı.", flush=True)
                 return False
     except Exception:
         pass
@@ -276,10 +277,10 @@ def teknik_indikatorleri_hesapla(df):
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
     return df
 
-def ohlcv_getir(exchange, symbol, timeframe, limit=250):
+def ohlcv_getir(exchange, symbol, timeframe, limit=100):
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not data or len(data) < 50:
+        if not data or len(data) < 30:
             return None
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
         return teknik_indikatorleri_hesapla(df)
@@ -288,7 +289,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
 
 def btc_egilimini_getir(exchange):
     try:
-        df_btc = ohlcv_getir(exchange, "BTC/USDT", "1h", 50)
+        df_btc = ohlcv_getir(exchange, "BTC/USDT", "1h", 40)
         if df_btc is None or len(df_btc) < 10:
             return "neutral", None
         b_last = df_btc.iloc[-2]
@@ -302,7 +303,7 @@ def btc_egilimini_getir(exchange):
         return "neutral", None
 
 # ============================================================
-# GELİŞMİŞ TEYİT VE DOĞRULAMA MODÜLÜ
+# KORELASYON VE DESTEK / DİRENÇ
 # ============================================================
 def btc_korelasyon_kontrolu(df_alt, df_btc, yon):
     if df_alt is None or df_btc is None or len(df_alt) < 10 or len(df_btc) < 10:
@@ -310,42 +311,32 @@ def btc_korelasyon_kontrolu(df_alt, df_btc, yon):
     
     alt_returns = df_alt["close"].pct_change().tail(10)
     btc_returns = df_btc["close"].pct_change().tail(10)
-    
     corr = alt_returns.corr(btc_returns)
     
     if yon == "buy":
-        if corr < -0.65: 
-            return False, -15
-        elif corr > 0.3:
-            return True, 10
+        if corr < -0.65: return False, -15
+        elif corr > 0.3: return True, 10
     else: 
-        if corr > 0.7 and btc_returns.iloc[-1] > 0: 
-            return False, -20
-        elif corr < 0 or btc_returns.iloc[-1] < 0:
-            return True, 10
-            
+        if corr > 0.7 and btc_returns.iloc[-1] > 0: return False, -20
+        elif corr < 0 or btc_returns.iloc[-1] < 0: return True, 10
     return True, 0
 
 def destek_direnc_konum_teyidi(df, price, atr, yon):
-    recent_high = df["high"].iloc[-50:].max()
-    recent_low = df["low"].iloc[-50:].min()
-    
+    recent_high = df["high"].iloc[-30:].max()
+    recent_low = df["low"].iloc[-30:].min()
     puan_katkisi = 0
     if yon == "buy":
         ema50 = df["ema50"].iloc[-2]
-        dist_to_support = abs(price - recent_low)
-        if dist_to_support < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
+        if abs(price - recent_low) < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
             puan_katkisi += 15
     else:
         ema50 = df["ema50"].iloc[-2]
-        dist_to_resistance = abs(recent_high - price)
-        if dist_to_resistance < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
+        if abs(recent_high - price) < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
             puan_katkisi += 15
-            
     return puan_katkisi, ""
 
 # ============================================================
-# SKORLAMA VE DETAYLI LOGLAMA MOTORU
+# SKORLAMA MOTORU
 # ============================================================
 def skorla_coin(exchange, symbol, btc_trend, df_btc):
     result = {
@@ -361,9 +352,9 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
         except Exception:
             funding = 0
 
-        df30 = ohlcv_getir(exchange, symbol, "30m", 150)
-        df1 = ohlcv_getir(exchange, symbol, "1h", 250)
-        df4 = ohlcv_getir(exchange, symbol, "4h", 250)
+        df30 = ohlcv_getir(exchange, symbol, "30m", 80)
+        df1 = ohlcv_getir(exchange, symbol, "1h", 80)
+        df4 = ohlcv_getir(exchange, symbol, "4h", 60)
 
         if df30 is None or df1 is None or df4 is None:
             return None
@@ -435,7 +426,7 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
         return None
 
 # ============================================================
-# ANLIK 5M VE 15M MUM GÖVDE VE TREND UYUM TEYİDİ
+# ANLIK 5M VE 15M TEYİT
 # ============================================================
 def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
     try:
@@ -446,25 +437,15 @@ def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
             last_5m = df_5m.iloc[-1]
             body_5m = last_5m['close'] - last_5m['open']
             atr_5m = last_5m.get('atr', 0)
-            
-            if direction == "buy" and body_5m < 0 and abs(body_5m) > (atr_5m * 0.4):
-                print(f"[5M TEYİDİ REDDİ] {symbol} (BUY) | 5m mum ters yönde güçlü.", flush=True)
-                return False
-            elif direction == "sell" and body_5m > 0 and body_5m > (atr_5m * 0.4):
-                print(f"[5M TEYİDİ REDDİ] {symbol} (SELL) | 5m mum ters yönde güçlü.", flush=True)
-                return False
+            if direction == "buy" and body_5m < 0 and abs(body_5m) > (atr_5m * 0.4): return False
+            elif direction == "sell" and body_5m > 0 and body_5m > (atr_5m * 0.4): return False
 
         if df_15m is not None and len(df_15m) >= 3:
             last_15m = df_15m.iloc[-1]
             body_15m = last_15m['close'] - last_15m['open']
             atr_15m = last_15m.get('atr', 0)
-            
-            if direction == "buy" and body_15m < 0 and abs(body_15m) > (atr_15m * 0.4):
-                print(f"[15M TEYİDİ REDDİ] {symbol} (BUY) | 15m mum ters yönde güçlü.", flush=True)
-                return False
-            elif direction == "sell" and body_15m > 0 and body_15m > (atr_15m * 0.4):
-                print(f"[15M TEYİDİ REDDİ] {symbol} (SELL) | 15m mum ters yönde güçlü.", flush=True)
-                return False
+            if direction == "buy" and body_15m < 0 and abs(body_15m) > (atr_15m * 0.4): return False
+            elif direction == "sell" and body_15m > 0 and body_15m > (atr_15m * 0.4): return False
 
         return True
     except Exception:
@@ -503,43 +484,29 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
 
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not islem_izni_var_mi(): return False
-    
-    # 4 Saatlik Mum Tabanlı Cooldown Koruması
-    if not can_open_position_4h_cooldown(exchange, symbol, direction):
-        return False
-
-    # Organik Bağ / Korelasyon Kontrolü
-    if not organik_bag_kontrolu(exchange, symbol, direction):
-        return False
-
-    # 5m ve 15m Doğru Yer / Zaman Teyidi
-    if not anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
-        return False
+    if not can_open_position_4h_cooldown(exchange, symbol, direction): return False
+    if not organik_bag_kontrolu(exchange, symbol, direction): return False
+    if not anlik_giris_zamanlama_teyidi(exchange, symbol, direction): return False
 
     with islem_acma_lock:
         try:
             positions = exchange.fetch_positions()
             active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
-            if len(active_positions) >= MAX_TOTAL_POSITIONS:
-                return False
+            if len(active_positions) >= MAX_TOTAL_POSITIONS: return False
 
             for p in active_positions:
-                if sembol_duzelt(p.get("symbol")) == symbol:
-                    return False
+                if sembol_duzelt(p.get("symbol")) == symbol: return False
 
             if p_type == "opportunity":
                 mevcut_firsat = sum(1 for p in active_positions if sembol_duzelt(p.get("symbol")) in pozisyon_tipleri and pozisyon_tipleri[sembol_duzelt(p.get("symbol"))] == "opportunity")
-                if mevcut_firsat >= MAX_OPPORTUNITY_POSITIONS:
-                    return False
+                if mevcut_firsat >= MAX_OPPORTUNITY_POSITIONS: return False
             elif p_type == "scalp":
                 mevcut_scalp = sum(1 for p in active_positions if sembol_duzelt(p.get("symbol")) in pozisyon_tipleri and pozisyon_tipleri[sembol_duzelt(p.get("symbol"))] == "scalp")
-                if mevcut_scalp >= MAX_SCALP_POSITIONS:
-                    return False
+                if mevcut_scalp >= MAX_SCALP_POSITIONS: return False
 
             leverage = kaldirac_belirle(score)
-            if not isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
-                return False
+            if not isolated_ve_kaldirac_ayarla(exchange, symbol, leverage): return False
 
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
@@ -552,50 +519,33 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             
             if order:
                 pozisyon_tipleri[symbol] = p_type
-                pozisyon_yonleri[symbol] = direction  # Yönü kayıt altına al
+                pozisyon_yonleri[symbol] = direction  
                 pozisyon_en_yuksek_kar[symbol] = 0.0
-                
                 record_trade_4h_cooldown(exchange, symbol, direction)
                 print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT", flush=True)
                 
                 time.sleep(1)
                 try:
                     close_side = "sell" if side == "buy" else "buy"
-                    df_temp = ohlcv_getir(exchange, symbol, "30m", 30)
+                    df_temp = ohlcv_getir(exchange, symbol, "30m", 20)
                     current_atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
                     
                     if p_type == "scalp":
                         fiyat_farki = SCALP_TARGET_PROFIT_USDT / amount
-                        if side == "buy":
-                            tp_price = price + fiyat_farki
-                            sl_price = price - (current_atr * 2.0)
-                        else:
-                            tp_price = price - fiyat_farki
-                            sl_price = price + (current_atr * 2.0)
+                        tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
+                        sl_price = (price - (current_atr * 2.0)) if side == "buy" else (price + (current_atr * 2.0))
                         
                         tp_price = float(exchange.price_to_precision(symbol, tp_price))
                         sl_price = float(exchange.price_to_precision(symbol, sl_price))
 
-                        exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {
-                            'stopPrice': tp_price, 'reduceOnly': True
-                        })
-                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
-                            'stopPrice': sl_price, 'reduceOnly': True
-                        })
+                        exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': tp_price, 'reduceOnly': True})
+                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
                     else:
-                        if side == "buy":
-                            sl_price = price - (current_atr * 2.0)
-                        else:
-                            sl_price = price + (current_atr * 2.0)
-                        
+                        sl_price = (price - (current_atr * 2.0)) if side == "buy" else (price + (current_atr * 2.0))
                         sl_price = float(exchange.price_to_precision(symbol, sl_price))
-                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
-                            'stopPrice': sl_price, 'reduceOnly': True
-                        })
-
-                except Exception as tp_err:
+                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
+                except Exception:
                     pass
-
                 return True
         except Exception as e:
             print(f"[İŞLEM AÇMA HATA] {symbol}: {e}", flush=True)
@@ -603,22 +553,18 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
 
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
-    
     aktif_semboller = {sembol_duzelt(p.get("symbol")) for p in positions if float(p.get("contracts") or 0) > 0}
     
-    # Kapanan pozisyonları tespit et (Manuel veya otomatik kapandığında cooldown uygula)
     kapananlar = onceki_aktif_pozisyonlar - aktif_semboller
     for sym in kapananlar:
         eski_yon = pozisyon_yonleri.get(sym)
         if eski_yon:
-            # Manuel veya erken kapanışta o 4h mum periyodu boyunca tekrar girmemesi için zorunlu cooldown işaretle
             record_trade_4h_cooldown(exchange, sym, eski_yon)
-            print(f"[MANUEL / POZİSYON KAPANIŞI TESPİT EDİLDİ] {sym} ({eski_yon.upper}) kapatıldı. 4H Cooldown devreye sokuldu.", flush=True)
+            print(f"[POZİSYON KAPANDI] {sym} ({eski_yon.upper()}) kapatıldı. 4H Cooldown devreye sokuldu.", flush=True)
         
         if sym in pozisyon_tipleri: del pozisyon_tipleri[sym]
         if sym in pozisyon_en_yuksek_kar: del pozisyon_en_yuksek_kar[sym]
         if sym in pozisyon_yonleri: del pozisyon_yonleri[sym]
-        
         try:
             exchange.cancel_all_orders(sym)
         except Exception:
@@ -646,7 +592,6 @@ def pozisyonlari_yonet(exchange, positions):
             if pozisyon_tipleri.get(symbol) == "opportunity":
                 roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
                 current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
-                
                 if roi > current_max:
                     pozisyon_en_yuksek_kar[symbol] = roi
                     current_max = roi
@@ -662,16 +607,14 @@ def pozisyonlari_yonet(exchange, positions):
                         exchange.cancel_all_orders(symbol)
                         close_side = "sell" if side == "long" else "buy"
                         yeni_sl = float(exchange.price_to_precision(symbol, yeni_sl))
-                        exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {
-                            'stopPrice': yeni_sl, 'reduceOnly': True
-                        })
+                        exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {'stopPrice': yeni_sl, 'reduceOnly': True})
                     except Exception:
                         pass
         except Exception:
             pass
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE TAKİP PANELİ
+# POZİSYON MONİTÖRÜ
 # ============================================================
 def pozisyon_monitor_loop():
     global monitor_basladi
@@ -714,7 +657,7 @@ def monitor_baslat():
         threading.Thread(target=pozisyon_monitor_loop, daemon=True, name="PositionMonitor").start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ (TOP 3 VE 5M/15M TEYİTLİ SEÇİM)
+# ANA TARAMA DÖNGÜSÜ (GAINERS 25 & LOSERS 25 + GC ENTEGRELİ)
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
@@ -728,11 +671,15 @@ def piyasa_tara_ve_islem_yap():
             if gecerli_kripto_mu(symbol):
                 coin_listesi.append({"symbol": symbol, "change": float(ticker.get("percentage", 0) or 0)})
                 
+        # Yüzdesel değişime göre sırala
         coin_listesi.sort(key=lambda x: x["change"], reverse=True)
+        
+        # İstediğin Kriter: Gainers ilk 25 ve Losers ilk 25 (Toplam 50 coin)
         gainers_25 = [i["symbol"] for i in coin_listesi[:25]]
         losers_25 = [i["symbol"] for i in coin_listesi[-25:]]
         hedef_coini_listesi = list(set(gainers_25 + losers_25))
     except Exception as e:
+        print(f"[PİYASA TARAMA HATA] {e}", flush=True)
         return
 
     try:
@@ -788,6 +735,9 @@ def piyasa_tara_ve_islem_yap():
         print(" (Uygun Fırsat adayı bulunamadı)", flush=True)
     print("---------------------------------------\n", flush=True)
 
+    # Belleği anında serbest bırakmak için Garbage Collection tetikle
+    gc.collect()
+
     if aktif_sayisi >= MAX_TOTAL_POSITIONS: 
         return
 
@@ -814,14 +764,14 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Top 3 Aday, 5m & 15m Zamanlama Teyidi ve Manuel Kapanış Koruması Aktif)"})
+    return jsonify({"status": "Bot Çalışıyor (Gainers/Losers 25 & GC Aktif)"})
 
 @app.route("/tetikle")
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Tarama, Top 3 analizi, 5m/15m teyit ve manuel kapanış koruması tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Tarama ve analiz tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
