@@ -326,10 +326,8 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
 
-            # Anlık Takip Logu
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Max Kar: %{current_max:.2f}")
 
-            # Fırsat modunda dinamik stop yükseltme
             if p_type == "opportunity":
                 yeni_sl = None
                 if current_max >= 10.0:
@@ -389,8 +387,20 @@ def ana_tarama_dongusu():
             scalp_listesi = scan_scalp_market(exchange)
             firsat_listesi = scan_opportunity_market(exchange)
             
-            logging.info(f"Scalp Adayları (Top 5): {[c['symbol'] for c in scalp_listesi]}")
-            logging.info(f"Fırsat Takip Listesi (Top 5): {[c['symbol'] for c in firsat_listesi]}")
+            # Puanlama Listelerini Loglara Detaylı Yazdır
+            logging.info("--- SCALP MODU ADAY PUANLAMA LİSTESİ ---")
+            if scalp_listesi:
+                for idx, c in enumerate(scalp_listesi, 1):
+                    logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']}")
+            else:
+                logging.info("Scalp kriterlerine uyan aday bulunamadı.")
+
+            logging.info("--- FIRSAT MODU TAKİP/PUANLAMA LİSTESİ ---")
+            if firsat_listesi:
+                for idx, c in enumerate(firsat_listesi, 1):
+                    logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']} (Teyit bekleniyor)")
+            else:
+                logging.info("Fırsat kriterlerine uyan aday bulunamadı.")
             
             for item in scalp_listesi:
                 if item['score'] >= 92:
@@ -405,6 +415,7 @@ def ana_tarama_dongusu():
             firsat_var = any(pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) == "opportunity" for p in active_pos)
             scalp_var = any(pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) == "scalp" for p in active_pos)
             
+            # Fırsat Modu: Takip listesindekiler teyit ve pullback şartını geçerse işleme girilir
             if not firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
@@ -419,8 +430,10 @@ def ana_tarama_dongusu():
                         if df_check is not None: del df_check
                         break
                     else:
+                        logging.info(f"[FIRSAT BEKLİYOR] {sym} takipte, henüz pullback teyidi alınmadı.")
                         if df_check is not None: del df_check
 
+            # Scalp Modu: En iyi scalp adayı ile işlem açılır
             if not scalp_var and scalp_listesi:
                 best_s = scalp_listesi[0]
                 pozisyon_ac(exchange, best_s['symbol'], best_s['direction'], best_s['score'], "scalp")
