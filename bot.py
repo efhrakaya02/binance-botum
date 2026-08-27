@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - DETAYLI LOG VE ANLIK İŞLEM TAKİBİ SÜRÜMÜ
+# BINANCE FUTURES BOT - GELİŞMİŞ SİNYAL TEYİT VE KONTROL SÜRÜMÜ
 # ============================================================
 
 app = Flask(__name__)
@@ -184,7 +184,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
         return None
 
 # ============================================================
-# SKORLAMA VE ANALİZ
+# SIKI SKORLAMA VE ÇOK KATMANLI TEYİT MEKANİZMASI
 # ============================================================
 def skorla_coin(exchange, symbol):
     result = {
@@ -192,15 +192,17 @@ def skorla_coin(exchange, symbol):
         "direction": None, "score": 0, "atr": None, "price": None, "funding": 0
     }
     try:
+        # 1. Teyit: Fonlama Oranı (Funding Rate) Güvenlik Kontrolü
         try:
             funding_data = exchange.fetch_funding_rate(symbol)
             funding = float(funding_data.get("fundingRate", 0) or 0)
             result["funding"] = funding
             if abs(funding) >= 0.0015:
-                return None
+                return None  # Aşırı fonlama riski olan coinleri eledik
         except Exception:
             funding = 0
 
+        # Çoklu Zaman Dilimi Verilerinin Çekilmesi
         df15 = ohlcv_getir(exchange, symbol, "15m", 150)
         df1 = ohlcv_getir(exchange, symbol, "1h", 250)
         df4 = ohlcv_getir(exchange, symbol, "4h", 250)
@@ -212,19 +214,24 @@ def skorla_coin(exchange, symbol):
         price, atr = float(d15["close"]), float(d15["atr"])
         result["price"], result["atr"] = price, atr
 
+        # 2. Teyit: Volatilite ve ATR Sınırı (%10 üstü çok risklidir)
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
             return None
 
+        # 3. Teyit: Hacim Onayı (Ortalamanın altında hacimle işlem açılmaz)
         if float(d15["volume_ratio"]) < 0.70:
             return None
 
+        # 4. Teyit: Çoklu Zaman Dilimi Trend Uyumu (4h, 1h ve 15m uyumu)
         trend4_long = (d4["close"] > d4["ema50"]) and (d4["ema50"] > d4["ema200"])
         trend4_short = (d4["close"] < d4["ema50"]) and (d4["ema50"] < d4["ema200"])
+        
         trend1_long = (d1["close"] > d1["ema50"]) and (d1["ema9"] > d1["ema21"])
         trend1_short = (d1["close"] < d1["ema50"]) and (d1["ema9"] < d1["ema21"])
+        
         adx = float(d1["adx"])
         if adx < 18:
-            return None
+            return None  # Yetersiz trend gücü
 
         rsi15 = float(d15["rsi"])
         long_score, short_score = 0, 0
@@ -232,6 +239,7 @@ def skorla_coin(exchange, symbol):
         can_long = rsi15 < 72
         can_short = rsi15 > 28
 
+        # Sinyal Puanlama ve Teyit Matrisi
         if can_long:
             if trend4_long: long_score += 18
             if trend1_long: long_score += 16
@@ -257,6 +265,7 @@ def skorla_coin(exchange, symbol):
         else:
             result["direction"], result["score"] = "sell", short_score
 
+        # 5. Teyit: Yön Belirsizliği Filtresi (Long ve Short puanları birbirine çok yakınsa net değildir, iptal et)
         if abs(long_score - short_score) < 8:
             return None
 
@@ -466,13 +475,12 @@ def piyasa_tara_ve_islem_yap():
         losers = [item["symbol"] for item in coin_listesi[-25:]]
         hedef_coini_listesi = list(set(gainers + losers))
         
-        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} adet hareketli coin inceleniyor...", flush=True)
+        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} adet hareketli coin katı süzgeçten geçiriliyor...", flush=True)
         
     except Exception as e:
         print(f"[PİYASA LİSTE HATA]: {e}", flush=True)
         return
 
-    # --- 1. AÇIK POZİSYONLARIN DURUMUNU ÖNCEDEN AL VE RAPORLA ---
     try:
         positions = exchange.fetch_positions()
         active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
@@ -497,9 +505,8 @@ def piyasa_tara_ve_islem_yap():
     if adaylar:
         adaylar.sort(key=lambda x: x["score"], reverse=True)
 
-        # --- 2. PUANLAMA TABLOSUNu HER DURUMDA YAZDIR ---
         print("\n" + "="*50, flush=True)
-        print("📊 PİYASA ANALİZ SONUÇLARI VE PUAN TABLOSU", flush=True)
+        print("📊 TEYİT EDİLMİŞ PİYASA ANALİZ SONUÇLARI VE PUAN TABLOSU", flush=True)
         print("="*50, flush=True)
         
         firsat_adaylari = adaylar[:5]
@@ -513,12 +520,11 @@ def piyasa_tara_ve_islem_yap():
             for i, c in enumerate(scalp_adaylari, 1):
                 print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
         else:
-            print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY: (75+ Puan sağlayan scalp adayı bulunamadı)", flush=True)
+            print("\n⚡ SCALP İÇİN EN İYİ İLK 5 ADAY: (75+ Teyitli scalp adayı bulunamadı)", flush=True)
         print("="*50 + "\n", flush=True)
     else:
-        print("[ANALİZ] Kriterleri sağlayan uygun coin bulunamadı.", flush=True)
+        print("[ANALİZ] Kriterleri ve süzgeçleri sağlayan uygun coin bulunamadı.", flush=True)
 
-    # --- 3. ANLIK AÇIK İŞLEM BİLGİLERİNİ LOGLARDA GÖSTER ---
     print("="*50, flush=True)
     print(f"📌 ANLIK AÇIK İŞLEM DURUMU (Aktif İşlem Sayısı: {aktif_sayisi}/{MAX_TOTAL_POSITIONS})", flush=True)
     print("="*50, flush=True)
@@ -541,7 +547,6 @@ def piyasa_tara_ve_islem_yap():
         print("  • Şu an borsada açık aktif bir işlem bulunmuyor.", flush=True)
     print("="*50 + "\n", flush=True)
 
-    # --- 4. MAKSİMUM İŞLEM SAYISINA ULAŞILDIYSA YENİ İŞLEM AÇMA ---
     if aktif_sayisi >= MAX_TOTAL_POSITIONS:
         return
 
@@ -572,7 +577,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Kesintisiz Çalışıyor (Detaylı Log & Anlık İşlem Raporu Aktif)", 
+        "status": "Bot Kesintisiz Çalışıyor (Teyitli Sinyal Motoru Aktif)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -581,7 +586,7 @@ def index():
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Tarama, puanlama ve anlık durum raporu tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Çoklu teyitli tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
