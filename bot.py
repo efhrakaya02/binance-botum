@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - GAINERS/LOSERS (İLK 25'ER) 15M SÜRÜMÜ
+# BINANCE FUTURES BOT - RAILWAY 502 ÇÖZÜMLÜ SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -41,7 +41,7 @@ MAX_OPPORTUNITY_POSITIONS = 1
 MAX_TOTAL_POSITIONS = 2 
 
 OPPORTUNITY_MIN_SCORE = 68
-SCALP_MIN_SCORE = 75  # Scalp için seçicilik artırıldı
+SCALP_MIN_SCORE = 75
 
 MIN_LEVERAGE = 3
 MAX_LEVERAGE = 5
@@ -79,7 +79,6 @@ def get_exchange():
 
 def islem_izni_var_mi():
     if not TRADING_ENABLED:
-        print("[GÜVENLİK] TRADING_ENABLED=False -> Emir gönderimi engellendi.", flush=True)
         return False
     return True
 
@@ -191,7 +190,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
         return None
 
 # ============================================================
-# SKORLAMA VE ANALİZ (15M BAZLI)
+# SKORLAMA VE ANALİZ
 # ============================================================
 def skorla_coin(exchange, symbol):
     result = {
@@ -222,8 +221,7 @@ def skorla_coin(exchange, symbol):
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
             return None
 
-        volume_ratio_15 = float(d15["volume_ratio"])
-        if volume_ratio_15 < 0.70:
+        if float(d15["volume_ratio"]) < 0.70:
             return None
 
         trend4_long = (d4["close"] > d4["ema50"]) and (d4["ema50"] > d4["ema200"])
@@ -273,7 +271,7 @@ def skorla_coin(exchange, symbol):
         return None
 
 # ============================================================
-# KALDIRAÇ VE MİKTAR
+# KALDIRAÇ VE İŞLEM YÖNETİMİ
 # ============================================================
 def kaldirac_belirle(score):
     if score >= 85:
@@ -306,9 +304,6 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
     except Exception as e:
         return False
 
-# ============================================================
-# İŞLEM AÇMA VE YÖNETİMİ
-# ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not islem_izni_var_mi():
         return False
@@ -399,7 +394,7 @@ def pozisyonlari_yonet(exchange, positions):
             pass
 
 # ============================================================
-# POZİSYON MONİTÖR LOOP
+# POZİSYON MONİTÖRÜ
 # ============================================================
 def pozisyon_monitor_loop():
     global monitor_basladi
@@ -433,13 +428,12 @@ def monitor_baslat():
         thread.start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ (GAINERS / LOSERS İLK 25'ER COİN)
+# ANA TARAMA DÖNGÜSÜ (GAINERS / LOSERS İLK 25'ER)
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
     try:
         exchange.load_markets()
-        
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
@@ -451,13 +445,13 @@ def piyasa_tara_ve_islem_yap():
                     "change": float(yuzde_degisim)
                 })
                 
-        # Yüzde değişimine göre sırala (En çok artandan en çok düşene)
         coin_listesi.sort(key=lambda x: x["change"], reverse=True)
         
-        # En çok yükselen ilk 25 ve en çok düşen ilk 25 coin (Toplam 50 coinlik hedef havuz)
         gainers = [item["symbol"] for item in coin_listesi[:25]]
         losers = [item["symbol"] for item in coin_listesi[-25:]]
         hedef_coini_listesi = list(set(gainers + losers))
+        
+        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} adet hareketli coin inceleniyor...", flush=True)
         
     except Exception as e:
         print(f"[PİYASA LİSTE HATA]: {e}", flush=True)
@@ -510,7 +504,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Çalışıyor (Gainers/Losers İlk 25'er Havuz)", 
+        "status": "Bot Kesintisiz Çalışıyor (Gainers/Losers 25'er)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -525,6 +519,10 @@ def bot_ana_dongu():
         time.sleep(60)
 
 if __name__ == "__main__":
+    # Arka plan tarama döngüsünü başlat
     t = threading.Thread(target=bot_ana_dongu, daemon=True)
     t.start()
-    app.run(host="0.0.0.0", port=5000)
+    
+    # Railway'in dinamik PORT değerini al (502 hatasını çözen kritik kısım)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
