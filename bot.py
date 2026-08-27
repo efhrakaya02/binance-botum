@@ -418,7 +418,7 @@ def ana_tarama_dongusu():
         time.sleep(120) # 2 dakikalık tarama aralığı
 
 # ============================================================
-# FLASK WEB ENDPOINTLERİ
+# FLASK WEB ENDPOINTLERİ (CRON & TETİKLEME)
 # ============================================================
 @app.route("/")
 def index():
@@ -428,6 +428,11 @@ def index():
 def tetikle():
     threading.Thread(target=ana_tarama_dongusu, daemon=True).start()
     return jsonify({"success": True, "message": "Manuel tetikleme başarılı."})
+
+@app.route("/otomatik-analiz")
+def otomatik_analiz():
+    threading.Thread(target=ana_tarama_dongusu, daemon=True).start()
+    return jsonify({"success": True, "message": "Otomatik analiz cron tetiklemesi başarılı."})
 
 if __name__ == "__main__":
     t = threading.Thread(target=ana_tarama_dongusu, daemon=True)
