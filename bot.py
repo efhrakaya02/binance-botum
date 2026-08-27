@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - 50 COİN HAVUZU & 85 PUAN KİLİTLİ SİSTEM
+# BINANCE FUTURES BOT - TEYİTLİ (KORELASYON, FUNDING, S/R) & 85 PUAN
 # ============================================================
 
 app = Flask(__name__)
@@ -39,7 +39,6 @@ MAX_OPPORTUNITY_POSITIONS = 1  # En fazla 1 adet Fırsat
 
 MAX_TOTAL_POSITIONS = 2        # Toplamda kesinlikle aynı anda maksimum 2 işlem
 
-# İstediğin gibi işlem puan alt sınırları 85 olarak güncellendi
 MINIMUM_PROCESS_SCORE = 85  
 SCALP_MIN_SCORE = 85
 
@@ -231,20 +230,77 @@ def btc_egilimini_getir(exchange):
     try:
         df_btc = ohlcv_getir(exchange, "BTC/USDT", "1h", 50)
         if df_btc is None or len(df_btc) < 10:
-            return "neutral"
+            return "neutral", None
         b_last = df_btc.iloc[-2]
+        trend = "neutral"
         if b_last["close"] > b_last["ema50"] and b_last["ema9"] > b_last["ema21"]:
-            return "bullish"
+            trend = "bullish"
         elif b_last["close"] < b_last["ema50"] and b_last["ema9"] < b_last["ema21"]:
-            return "bearish"
-        return "neutral"
+            trend = "bearish"
+        return trend, df_btc
     except Exception:
-        return "neutral"
+        return "neutral", None
 
 # ============================================================
-# SKORLAMA VE FIRSAT / SCALP AYRIMI
+# GELİŞMİŞ TEYİT VE DOĞRULAMA MODÜLÜ (Korelasyon, Funding, S/R)
 # ============================================================
-def skorla_coin(exchange, symbol, btc_trend):
+def btc_korelasyon_kontrolu(df_alt, df_btc, yon):
+    if df_alt is None or df_btc is None or len(df_alt) < 10 or len(df_btc) < 10:
+        return True, 0  # Veri yetersizse engelleme
+    
+    alt_returns = df_alt["close"].pct_change().tail(10)
+    btc_returns = df_btc["close"].pct_change().tail(10)
+    
+    # Pearson Korelasyonu
+    corr = alt_returns.corr(btc_returns)
+    
+    # Long yönlü teyit: Genel olarak BTC yükseliyorken altcoin de ayak uydurmalı veya korelasyon pozitif olmalı
+    if yon == "buy":
+        if corr < -0.65: # BTC ile ters yönde agresif ayrışıyorsa tehlikeli olabilir
+            return False, -15
+        elif corr > 0.3:
+            return True, 10
+    else: # Short yönlü teyit
+        if corr > 0.7 and btc_returns.iloc[-1] > 0: # BTC coşmuşken short açmak riskli
+            return False, -20
+        elif corr < 0 or btc_returns.iloc[-1] < 0:
+            return True, 10
+            
+    return True, 0
+
+def destek_direnc_konum_teyidi(df, price, atr, yon):
+    # Son 50 mumun en yüksek ve en düşük yerel seviyeleri (S/R noktaları)
+    recent_high = df["high"].iloc[-50:].max()
+    recent_low = df["low"].iloc[-50:].min()
+    
+    puan_katkisi = 0
+    not_aciklama = ""
+    
+    if yon == "buy":
+        # Fiyat güçlü bir desteğe mi yakın? (Yerel dibe veya EMA50 desteğine)
+        ema50 = df["ema50"].iloc[-2]
+        dist_to_support = abs(price - recent_low)
+        if dist_to_support < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
+            puan_katkisi += 15
+            not_aciklama = "Güçlü Destek / EMA50 Temas Teyidi (+15 Puan)"
+        else:
+            not_aciklama = "Destek Bölgesinden Uzakta"
+    else:
+        # Fiyat güçlü bir dirence mi yakın?
+        ema50 = df["ema50"].iloc[-2]
+        dist_to_resistance = abs(recent_high - price)
+        if dist_to_resistance < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
+            puan_katkisi += 15
+            not_aciklama = "Güçlü Direnç / EMA50 Red Teyidi (+15 Puan)"
+        else:
+            not_aciklama = "Direnç Bölgesinden Uzakta"
+            
+    return puan_katkisi, not_aciklama
+
+# ============================================================
+# SKORLAMA VE DETAYLI LOGLAMA MOTORU
+# ============================================================
+def skorla_coin(exchange, symbol, btc_trend, df_btc):
     result = {
         "symbol": symbol, "long_score": 0, "short_score": 0,
         "direction": None, "score": 0, "atr": None, "price": None, "formasyon": None, "is_firsat": False
@@ -254,6 +310,7 @@ def skorla_coin(exchange, symbol, btc_trend):
             funding_data = exchange.fetch_funding_rate(symbol)
             funding = float(funding_data.get("fundingRate", 0) or 0)
             if abs(funding) >= 0.0015:
+                print(f"[FİLTRE - ELEMSİ] {symbol} | Yüksek Fonlama Oranı: {funding:.5f}", flush=True)
                 return None
         except Exception:
             funding = 0
@@ -270,6 +327,7 @@ def skorla_coin(exchange, symbol, btc_trend):
         result["price"], result["atr"] = price, atr
 
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
+            print(f"[FİLTRE - ELEMSİ] {symbol} | Volatilite aşırı yüksek (ATR/Fiyat > %10)", flush=True)
             return None
 
         formasyon_adi, formasyon_yonu = formasyon_ve_volatilite_avcisi(df30)
@@ -277,17 +335,21 @@ def skorla_coin(exchange, symbol, btc_trend):
 
         vol_ratio = float(d30["volume_ratio"])
         if vol_ratio < 1.3 and not formasyon_adi:
+            print(f"[FİLTRE - ELEMSİ] {symbol} | Hacim Yetersiz (Hacim Oranı: {vol_ratio:.2f} < 1.3)", flush=True)
             return None
 
         rsi30 = float(d30["rsi"])
         long_score, short_score = 0, 0
+        log_detay = []
 
         if formasyon_adi:
             result["is_firsat"] = True
             if formasyon_yonu == "buy":
                 long_score += 35
+                log_detay.append(f"Formasyon [{formasyon_adi.upper()}]: Long +35")
             else:
                 short_score += 35
+                log_detay.append(f"Formasyon [{formasyon_adi.upper()}]: Short +35")
 
         trend4_long = (d4["close"] > d4["ema50"])
         trend4_short = (d4["close"] < d4["ema50"])
@@ -295,27 +357,86 @@ def skorla_coin(exchange, symbol, btc_trend):
         trend1_short = (d1["close"] < d1["ema50"]) and (d1["ema9"] < d1["ema21"])
 
         if rsi30 < 72:
-            if trend4_long: long_score += 15
-            if trend1_long: long_score += 15
-            if d30["macd"] > d30["macd_signal"]: long_score += 10
-            if (price <= d30["ema9"]) and (price >= d30["ema21"]): long_score += 15
+            if trend4_long: 
+                long_score += 15
+                log_detay.append("4h Trend Long (+15)")
+            if trend1_long: 
+                long_score += 15
+                log_detay.append("1h Trend Long (+15)")
+            if d30["macd"] > d30["macd_signal"]: 
+                long_score += 10
+                log_detay.append("30m MACD Pozitif (+10)")
+            if (price <= d30["ema9"]) and (price >= d30["ema21"]): 
+                long_score += 15
+                log_detay.append("EMA Pullback (+15)")
 
         if rsi30 > 28:
-            if trend4_short: short_score += 15
-            if trend1_short: short_score += 15
-            if d30["macd"] < d30["macd_signal"]: short_score += 10
-            if (price >= d30["ema9"]) and (price <= d30["ema21"]): short_score += 15
+            if trend4_short: 
+                short_score += 15
+                log_detay.append("4h Trend Short (+15)")
+            if trend1_short: 
+                short_score += 15
+                log_detay.append("1h Trend Short (+15)")
+            if d30["macd"] < d30["macd_signal"]: 
+                short_score += 10
+                log_detay.append("30m MACD Negatif (+10)")
+            if (price >= d30["ema9"]) and (price <= d30["ema21"]): 
+                short_score += 15
+                log_detay.append("EMA Pullback (+15)")
 
+        # Geçici Yön Belirleme
+        temp_dir = "buy" if long_score >= short_score else "sell"
+
+        # ========================================================
+        # EK TEYİT FİLTRELERİ UYGULANIYOR
+        # ========================================================
+        # 1. Funding Rate Teyidi (Long için negatif/nötr avantaj, Short için pozitif avantaj)
+        if temp_dir == "buy" and funding < 0:
+            long_score += 10
+            log_detay.append(f"Funding Rate Long Teyidi [Negatif: {funding:.5f}] (+10)")
+        elif temp_dir == "sell" and funding > 0.0005:
+            short_score += 10
+            log_detay.append(f"Funding Rate Short Teyidi [Pozitif: {funding:.5f}] (+10)")
+
+        # 2. Destek / Direnç Konum Teyidi
+        sr_puan, sr_aciklama = destek_direnc_konum_teyidi(df30, price, atr, temp_dir)
+        if temp_dir == "buy":
+            long_score += sr_puan
+            log_detay.append(sr_aciklama)
+        else:
+            short_score += sr_puan
+            log_detay.append(sr_aciklama)
+
+        # 3. BTC Korelasyon Teyidi
+        kor_gecerli, kor_puan = btc_korelasyon_kontrolu(df30, df_btc, temp_dir)
+        if not kor_gecerli:
+            print(f"[FİLTRE - TEYİT REDDİ] {symbol} | BTC Korelasyonu Sinyalle Uyuşmuyor (Korelasyon Kriteri Takıldı)", flush=True)
+            return None
+        
+        if temp_dir == "buy":
+            long_score += kor_puan
+        else:
+            short_score += kor_puan
+        log_detay.append(f"BTC Korelasyon Teyidi ({kor_puan:+d} Puan)")
+
+        # Final Yön ve Skor
         if long_score >= short_score:
             result["direction"], result["score"] = "buy", long_score
         else:
             result["direction"], result["score"] = "sell", short_score
 
         if abs(long_score - short_score) < 8 and not formasyon_adi:
+            print(f"[ANALİZ] {symbol} | Yön Kararsızlığı (Long: {long_score}, Short: {short_score}) -> Elerndi", flush=True)
             return None
+
+        # DETAYLI ANALİZ VE PUANLAMA LOGU
+        print(f"[TEYİTLİ ANALİZ RAPORU] {symbol} | Fiyat: {price} | RSI(30m): {rsi30:.1f} | Funding: {funding:.5f} | "
+              f"Seçilen Yön: {result['direction'].upper()} | Toplam Puan: {result['score']} (Long: {long_score}, Short: {short_score}) | "
+              f"Teyit Detayları: {', '.join(log_detay)}", flush=True)
 
         return result
     except Exception as e:
+        print(f"[ANALİZ HATA] {symbol}: {e}", flush=True)
         return None
 
 # ============================================================
@@ -357,7 +478,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             positions = exchange.fetch_positions()
             active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
-            # KESİN LİMİT KONTROLÜ
             if len(active_positions) >= MAX_TOTAL_POSITIONS:
                 return False
 
@@ -507,13 +627,15 @@ def monitor_baslat():
         threading.Thread(target=pozisyon_monitor_loop, daemon=True, name="PositionMonitor").start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ (GAINERS / LOSERS İLK 25'ER COİN - TOPLAM 50)
+# ANA TARAMA DÖNGÜSÜ
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
     try:
         exchange.load_markets()
-        btc_trend = btc_egilimini_getir(exchange)
+        btc_trend, df_btc = btc_egilimini_getir(exchange)
+        print(f"\n--- TEYİTLİ PİYASA TARAMASI BAŞLADI | BTC Trend: {btc_trend.upper()} ---", flush=True)
+        
         tickers = exchange.fetch_tickers()
         coin_listesi = []
         
@@ -521,14 +643,14 @@ def piyasa_tara_ve_islem_yap():
             if gecerli_kripto_mu(symbol):
                 coin_listesi.append({"symbol": symbol, "change": float(ticker.get("percentage", 0) or 0)})
                 
-        # Yüzdesel değişime göre sırala
         coin_listesi.sort(key=lambda x: x["change"], reverse=True)
         
-        # İstediğin gibi: En çok kazananlar ilk 25 ve en çok kaybedenler ilk 25 (Toplam 50 coin)
         gainers_25 = [i["symbol"] for i in coin_listesi[:25]]
         losers_25 = [i["symbol"] for i in coin_listesi[-25:]]
         hedef_coini_listesi = list(set(gainers_25 + losers_25))
+        print(f"Toplam 50 Coin analize alınıyor...", flush=True)
     except Exception as e:
+        print(f"[TARAMA HATA] {e}", flush=True)
         return
 
     try:
@@ -558,45 +680,47 @@ def piyasa_tara_ve_islem_yap():
     adaylar = []
     for symbol in hedef_coini_listesi:
         if cooldown_aktif_mi(symbol): continue
-        res = skorla_coin(exchange, symbol, btc_trend)
-        # Güncellenen kural: Minimum 85 puan alt sınırı
+        res = skorla_coin(exchange, symbol, btc_trend, df_btc)
         if res and res["score"] >= MINIMUM_PROCESS_SCORE:
             adaylar.append(res)
 
     if adaylar:
         adaylar.sort(key=lambda x: x["score"], reverse=True)
+        print(f"-> 85 Puan Barajını ve Teyitlerden Geçen Aday Sayısı: {len(adaylar)}", flush=True)
 
-    if aktif_sayisi >= MAX_TOTAL_POSITIONS or not adaylar: return
+    if aktif_sayisi >= MAX_TOTAL_POSITIONS or not adaylar: 
+        print(f"--- TARAMA TAMAMLANDI (Aktif İşlem Sayısı: {aktif_sayisi}/{MAX_TOTAL_POSITIONS}) ---\n", flush=True)
+        return
 
     for aday in adaylar:
         s = aday["symbol"]
         score = aday["score"]
         is_firsat = aday["is_firsat"]
         
-        # 1. Fırsat İşlemi (12 USDT, Max 1 adet, Formasyon/Pump-Dump tetiklemeli)
         if is_firsat and not firsat_var and not (s in pozisyon_tipleri) and score >= SCALP_MIN_SCORE:
             if pozisyon_ac(exchange, s, aday["direction"], score, "opportunity"):
                 firsat_var = True
                 break
         
-        # 2. Scalp İşlemi (10 USDT, Max 1 adet, 85+ puan trend/pullback teyitli)
         elif not scalp_var and not (s in pozisyon_tipleri) and score >= SCALP_MIN_SCORE:
             if pozisyon_ac(exchange, s, aday["direction"], score, "scalp"):
                 scalp_var = True
                 break
+                
+    print(f"--- TARAMA TAMAMLANDI ---\n", flush=True)
 
 # ============================================================
 # FLASK ENDPOINTLERİ
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (50 Coin Havuzu & 85 Puan Limitli Sürüm)"})
+    return jsonify({"status": "Bot Çalışıyor (Teyitli & Loglu Sürüm)"})
 
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Piyasa analizi tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Teyitli piyasa analizi tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
