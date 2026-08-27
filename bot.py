@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - GELİŞMİŞ FİLTRELEME VE 80+ PUAN SÜRÜMÜ
+# BINANCE FUTURES BOT - PULLBACK & ATR STOP OPTİMİZE SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -196,7 +196,6 @@ def btc_egilimini_getir(exchange):
             return "neutral"
         
         b_last = df_btc.iloc[-2]
-        # Eğer BTC kısa vadeli EMA9, EMA21'in üzerindeyse ve EMA50 üstündeyse yükselişte kabul edilir
         if b_last["close"] > b_last["ema50"] and b_last["ema9"] > b_last["ema21"]:
             return "bullish"
         elif b_last["close"] < b_last["ema50"] and b_last["ema9"] < b_last["ema21"]:
@@ -206,7 +205,7 @@ def btc_egilimini_getir(exchange):
         return "neutral"
 
 # ============================================================
-# GELİŞTİRİLMİŞ ÇOK KATMANLI SKORLAMA VE TEYİT SİSTEMİ
+# PULLBACK VE ATR TABANLI HASSAS SKORLAMA SİSTEMİ
 # ============================================================
 def skorla_coin(exchange, symbol, btc_trend):
     result = {
@@ -214,12 +213,10 @@ def skorla_coin(exchange, symbol, btc_trend):
         "direction": None, "score": 0, "atr": None, "price": None, "funding": 0
     }
     try:
-        # 1. Funding Rate Kontrolü ve Dinamik Sıkılaştırma
         try:
             funding_data = exchange.fetch_funding_rate(symbol)
             funding = float(funding_data.get("fundingRate", 0) or 0)
             result["funding"] = funding
-            # Aşırı yüksek fonlama oranlarını tamamen ele
             if abs(funding) >= 0.0012:
                 return None
         except Exception:
@@ -239,9 +236,8 @@ def skorla_coin(exchange, symbol, btc_trend):
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
             return None
 
-        # 2. Hacim Patlaması (Volume Spike) Filtresi: En az ortalamanın 2 katı hacim aranır
         vol_ratio = float(d15["volume_ratio"])
-        if vol_ratio < 2.0:
+        if vol_ratio < 1.5:  # Hacim şartı korunuyor ancak esnetildi
             return None
 
         trend4_long = (d4["close"] > d4["ema50"]) and (d4["ema50"] > d4["ema200"])
@@ -256,15 +252,15 @@ def skorla_coin(exchange, symbol, btc_trend):
         rsi15 = float(d15["rsi"])
         long_score, short_score = 0, 0
 
-        can_long = rsi15 < 72
-        can_short = rsi15 > 28
+        can_long = rsi15 < 70
+        can_short = rsi15 > 30
 
-        # 3. Destek / Direnç Kırılım (Order Block / Breakout) Doğrulaması
-        is_breaking_resistance = price >= float(d15["recent_high"])
-        is_breaking_support = price <= float(d15["recent_low"])
+        # --- PULLBACK (GERİ ÇEKİLME) KONTROLÜ ---
+        # Tepeden hemen atlamak yerine EMA9 ile EMA21 arasına veya desteğe yakınsalı tasarlandık
+        is_pullback_long = (price <= d15["ema9"]) and (price >= d15["ema21"])
+        is_pullback_short = (price >= d15["ema9"]) and (price <= d15["ema21"])
 
         if can_long:
-            # BTC Trend Filtresi: BTC düşüşteyken altcoin long açmayı zorlaştır veya puan kır
             if btc_trend == "bearish":
                 long_score -= 15
             elif btc_trend == "bullish":
@@ -275,21 +271,16 @@ def skorla_coin(exchange, symbol, btc_trend):
             if d15["macd"] > d15["macd_signal"]: long_score += 10
             if d15["plus_di"] > d15["minus_di"]: long_score += 8
             if adx >= 25: long_score += 8
-            if 48 <= rsi15 <= 65: long_score += 10
+            if 45 <= rsi15 <= 60: long_score += 12  # Sağlıklı RSI bölgesi
             if d15["obv"] > d15["obv_ma"]: long_score += 8
             
-            # Destek/Direnç ve Hacim Puanı Eklenmesi
-            if is_breaking_resistance:
-                long_score += 12
-            if vol_ratio >= 3.0:
-                long_score += 10
-
-            # Funding rate long'u destekliyor mu? (Negatif funding long için avantajdır)
+            # Doğrudan tepe yerine Pullback (Sağlam Taban) Puanlaması
+            if is_pullback_long:
+                long_score += 15
             if funding < 0:
                 long_score += 8
 
         if can_short:
-            # BTC Trend Filtresi: BTC yükselişteyken short açmayı zorlaştır
             if btc_trend == "bullish":
                 short_score -= 15
             elif btc_trend == "bearish":
@@ -300,16 +291,11 @@ def skorla_coin(exchange, symbol, btc_trend):
             if d15["macd"] < d15["macd_signal"]: short_score += 10
             if d15["minus_di"] > d15["plus_di"]: short_score += 8
             if adx >= 25: short_score += 8
-            if 35 <= rsi15 <= 52: short_score += 10
-            if d15["obv"] < d15["obv_ma"]: short_score += 8
+            if 40 <= rsi15 <= 55: short_score += 12  # Sağlıklı RSI bölgesi
+            if d15["obv"] < d15["obv_ma"]: long_score += 8
             
-            # Destek/Direnç ve Hacim Puanı Eklenmesi
-            if is_breaking_support:
-                short_score += 12
-            if vol_ratio >= 3.0:
-                short_score += 10
-
-            # Funding rate short'u destekliyor mu? (Pozitif funding short için avantajdır)
+            if is_pullback_short:
+                short_score += 15
             if funding > 0:
                 short_score += 8
 
@@ -399,12 +385,17 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 try:
                     close_side = "sell" if side == "buy" else "buy"
                     
+                    # Güncel ATR bilgisini çekip esnek stop mesafesi veriyoruz
+                    df_temp = ohlcv_getir(exchange, symbol, "15m", 30)
+                    current_atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
+                    
                     if side == "buy":
                         tp_price = price * (1 + (SCALP_TP_ROI / 100) / leverage)
-                        sl_price = price * (1 - 2.5 / 100 / leverage)
+                        # ATR tabanlı stop (fiyatın 1.5 katı ATR kadar nefes almasına izin verilir)
+                        sl_price = price - (current_atr * 1.5)
                     else:
                         tp_price = price * (1 - (SCALP_TP_ROI / 100) / leverage)
-                        sl_price = price * (1 + 2.5 / 100 / leverage)
+                        sl_price = price + (current_atr * 1.5)
                     
                     tp_price = float(exchange.price_to_precision(symbol, tp_price))
                     sl_price = float(exchange.price_to_precision(symbol, sl_price))
@@ -418,7 +409,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                         'stopPrice': sl_price,
                         'reduceOnly': True
                     })
-                    print(f"[TP/SL AYARLANDI] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
+                    print(f"[TP/SL AYARLANDI (ATR Nefes Paylı)] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
                 except Exception as tp_err:
                     print(f"[TP/SL HATA] {symbol}: {tp_err}", flush=True)
 
@@ -537,7 +528,6 @@ def piyasa_tara_ve_islem_yap():
     try:
         exchange.load_markets()
         
-        # BTC Trend Analizini Yap
         btc_trend = btc_egilimini_getir(exchange)
         print(f"[PİYASA KORELASYON] BTC Genel Eğilim: {btc_trend.upper()}", flush=True)
 
@@ -558,7 +548,7 @@ def piyasa_tara_ve_islem_yap():
         losers = [item["symbol"] for item in coin_listesi[-25:]]
         hedef_coini_listesi = list(set(gainers + losers))
         
-        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} adet hareketli coin gelişmiş süzgeçlerden geçiriliyor...", flush=True)
+        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} adet hareketli coin Pullback ve ATR süzgecinden geçiriliyor...", flush=True)
         
     except Exception as e:
         print(f"[PİYASA LİSTE HATA]: {e}", flush=True)
@@ -597,7 +587,6 @@ def piyasa_tara_ve_islem_yap():
         if cooldown_aktif_mi(symbol):
             continue
         res = skorla_coin(exchange, symbol, btc_trend)
-        # --- KATI FİLTRE: SADECE 80 VE ÜZERİ PUAN ALANLAR LİSTEYE EKLENİR ---
         if res and res["score"] >= MINIMUM_PROCESS_SCORE:
             adaylar.append(res)
 
@@ -605,7 +594,7 @@ def piyasa_tara_ve_islem_yap():
         adaylar.sort(key=lambda x: x["score"], reverse=True)
 
         print("\n" + "="*50, flush=True)
-        print("📊 GELİŞMİŞ PİYASA ANALİZ SONUÇLARI (80+ PUAN LİSTESİ)", flush=True)
+        print("📊 PULLBACK ONAYLI PİYASA ANALİZ SONUÇLARI (80+ PUAN LİSTESİ)", flush=True)
         print("="*50, flush=True)
         
         firsat_adaylari = adaylar[:5]
@@ -622,7 +611,7 @@ def piyasa_tara_ve_islem_yap():
             print("\n⚡ SCALP ADAYI: (80+ puan sağlayan scalp adayı bulunamadı)", flush=True)
         print("="*50 + "\n", flush=True)
     else:
-        print(f"[ANALİZ] Gelişmiş hacim, BTC ve destek filtreleri sonucunda minimum {MINIMUM_PROCESS_SCORE} puan barajını sağlayan coin bulunamadı. İşlem açılmadan sonraki döngü bekleniyor.", flush=True)
+        print(f"[ANALİZ] Minimum {MINIMUM_PROCESS_SCORE} puan barajını sağlayan uygun pullback adayı bulunamadı. Bekleniyor.", flush=True)
 
     print("="*50, flush=True)
     print(f"📌 ANLIK AÇIK İŞLEM DURUMU (Aktif İşlem Sayısı: {aktif_sayisi}/{MAX_TOTAL_POSITIONS})", flush=True)
@@ -664,7 +653,6 @@ def piyasa_tara_ve_islem_yap():
         s = aday["symbol"]
         score = aday["score"]
         
-        # Ekstra güvenlik katmanı: Puan kesinlikle 80 ve üzeri olmalı
         if score < MINIMUM_PROCESS_SCORE:
             continue
         
@@ -685,7 +673,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Kesintisiz Çalışıyor (Hacim, Destek ve BTC Korelasyonlu Gelişmiş Sürüm)", 
+        "status": "Bot Kesintisiz Çalışıyor (Pullback Giriş ve ATR Stop Optimizasyonlu Sürüm)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -694,7 +682,7 @@ def index():
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Gelişmiş filtrelemeli tarama tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Pullback optimizasyonlu tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
