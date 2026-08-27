@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - PULLBACK & ATR STOP OPTİMİZE SÜRÜM
+# BINANCE FUTURES BOT - 30M, ATR STOP & %4 ROI OPTİMİZE SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -29,19 +29,18 @@ POSITION_MONITOR_ENABLED = True
 # AYARLAR VE STRATEJİ PARAMETRELERİ
 # ============================================================
 SCALP_ENABLED = True
-SCALP_MARGIN = 10.0      # Scalp işlemleri için 10 USDT teminat
+SCALP_MARGIN = 15.0      # Komisyonlar düşünce net anlamlı kâr için 15 USDT teminat
 MAX_SCALP_POSITIONS = 1
-SCALP_TP_ROI = 3.0       # %3 ROI hedeflenir
+SCALP_TP_ROI = 4.0       # Hedef ROI net %4 olarak ayarlandı
 
 OPPORTUNITY_ENABLED = True
-OPPORTUNITY_MARGIN = 12.0  # Fırsat işlemleri için 12 USDT teminat
+OPPORTUNITY_MARGIN = 20.0  # Fırsat işlemleri için 20 USDT teminat
 MAX_OPPORTUNITY_POSITIONS = 1
 
 MAX_TOTAL_POSITIONS = 2 
 
-# --- KATI PUAN SINIRLARI (80 ALTI İŞLEM YASAK) ---
+# --- KATI PUAN SINIRLARI ---
 MINIMUM_PROCESS_SCORE = 80
-OPPORTUNITY_MIN_SCORE = 80
 SCALP_MIN_SCORE = 80
 
 COOLDOWN_HOURS = 4
@@ -172,8 +171,6 @@ def teknik_indikatorleri_hesapla(df):
     df["bb_lower"] = df["bb_mid"] - 2 * std
     df["volume_ma20"] = df["volume"].rolling(20).mean()
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
-    df["recent_high"] = df["high"].rolling(20).max().shift(1)
-    df["recent_low"] = df["low"].rolling(20).min().shift(1)
     return df
 
 def ohlcv_getir(exchange, symbol, timeframe, limit=250):
@@ -205,7 +202,7 @@ def btc_egilimini_getir(exchange):
         return "neutral"
 
 # ============================================================
-# PULLBACK VE ATR TABANLI HASSAS SKORLAMA SİSTEMİ
+# 30M PULLBACK VE ATR TABANLI HASSAS SKORLAMA SİSTEMİ
 # ============================================================
 def skorla_coin(exchange, symbol, btc_trend):
     result = {
@@ -222,22 +219,23 @@ def skorla_coin(exchange, symbol, btc_trend):
         except Exception:
             funding = 0
 
-        df15 = ohlcv_getir(exchange, symbol, "15m", 150)
+        # Zaman dilimi 30 dakikalık (30m) olarak güncellendi
+        df30 = ohlcv_getir(exchange, symbol, "30m", 150)
         df1 = ohlcv_getir(exchange, symbol, "1h", 250)
         df4 = ohlcv_getir(exchange, symbol, "4h", 250)
 
-        if df15 is None or df1 is None or df4 is None:
+        if df30 is None or df1 is None or df4 is None:
             return None
 
-        d15, d1, d4 = df15.iloc[-2], df1.iloc[-2], df4.iloc[-2]
-        price, atr = float(d15["close"]), float(d15["atr"])
+        d30, d1, d4 = df30.iloc[-2], df1.iloc[-2], df4.iloc[-2]
+        price, atr = float(d30["close"]), float(d30["atr"])
         result["price"], result["atr"] = price, atr
 
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
             return None
 
-        vol_ratio = float(d15["volume_ratio"])
-        if vol_ratio < 1.5:  # Hacim şartı korunuyor ancak esnetildi
+        vol_ratio = float(d30["volume_ratio"])
+        if vol_ratio < 1.4:
             return None
 
         trend4_long = (d4["close"] > d4["ema50"]) and (d4["ema50"] > d4["ema200"])
@@ -249,16 +247,15 @@ def skorla_coin(exchange, symbol, btc_trend):
         if adx < 18:
             return None
 
-        rsi15 = float(d15["rsi"])
+        rsi30 = float(d30["rsi"])
         long_score, short_score = 0, 0
 
-        can_long = rsi15 < 70
-        can_short = rsi15 > 30
+        can_long = rsi30 < 70
+        can_short = rsi30 > 30
 
-        # --- PULLBACK (GERİ ÇEKİLME) KONTROLÜ ---
-        # Tepeden hemen atlamak yerine EMA9 ile EMA21 arasına veya desteğe yakınsalı tasarlandık
-        is_pullback_long = (price <= d15["ema9"]) and (price >= d15["ema21"])
-        is_pullback_short = (price >= d15["ema9"]) and (price <= d15["ema21"])
+        # Pullback (Geri çekilme) kontrolü 30m baz alındı
+        is_pullback_long = (price <= d30["ema9"]) and (price >= d30["ema21"])
+        is_pullback_short = (price >= d30["ema9"]) and (price <= d30["ema21"])
 
         if can_long:
             if btc_trend == "bearish":
@@ -268,13 +265,12 @@ def skorla_coin(exchange, symbol, btc_trend):
 
             if trend4_long: long_score += 15
             if trend1_long: long_score += 15
-            if d15["macd"] > d15["macd_signal"]: long_score += 10
-            if d15["plus_di"] > d15["minus_di"]: long_score += 8
+            if d30["macd"] > d30["macd_signal"]: long_score += 10
+            if d30["plus_di"] > d30["minus_di"]: long_score += 8
             if adx >= 25: long_score += 8
-            if 45 <= rsi15 <= 60: long_score += 12  # Sağlıklı RSI bölgesi
-            if d15["obv"] > d15["obv_ma"]: long_score += 8
+            if 45 <= rsi30 <= 60: long_score += 12
+            if d30["obv"] > d30["obv_ma"]: long_score += 8
             
-            # Doğrudan tepe yerine Pullback (Sağlam Taban) Puanlaması
             if is_pullback_long:
                 long_score += 15
             if funding < 0:
@@ -288,11 +284,11 @@ def skorla_coin(exchange, symbol, btc_trend):
 
             if trend4_short: short_score += 15
             if trend1_short: short_score += 15
-            if d15["macd"] < d15["macd_signal"]: short_score += 10
-            if d15["minus_di"] > d15["plus_di"]: short_score += 8
+            if d30["macd"] < d30["macd_signal"]: short_score += 10
+            if d30["minus_di"] > d30["plus_di"]: short_score += 8
             if adx >= 25: short_score += 8
-            if 40 <= rsi15 <= 55: short_score += 12  # Sağlıklı RSI bölgesi
-            if d15["obv"] < d15["obv_ma"]: long_score += 8
+            if 40 <= rsi30 <= 55: short_score += 12
+            if d30["obv"] < d30["obv_ma"]: short_score += 8
             
             if is_pullback_short:
                 short_score += 15
@@ -355,7 +351,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
             if len(active_positions) >= MAX_TOTAL_POSITIONS:
-                print(f"[ENGELLENDİ] Borsa üzerinde zaten {len(active_positions)} aktif pozisyon var. Yeni işlem açılmadı.", flush=True)
+                print(f"[ENGELLENDİ] Borsa üzerinde zaten {len(active_positions)} aktif pozisyon var.", flush=True)
                 return False
 
             for p in active_positions:
@@ -385,17 +381,18 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 try:
                     close_side = "sell" if side == "buy" else "buy"
                     
-                    # Güncel ATR bilgisini çekip esnek stop mesafesi veriyoruz
-                    df_temp = ohlcv_getir(exchange, symbol, "15m", 30)
+                    df_temp = ohlcv_getir(exchange, symbol, "30m", 30)
                     current_atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
                     
+                    # %4 ROI hedefi ve güvenli marj ayarlaması
+                    guvenli_tp_roi = SCALP_TP_ROI * 1.15 
+                    
                     if side == "buy":
-                        tp_price = price * (1 + (SCALP_TP_ROI / 100) / leverage)
-                        # ATR tabanlı stop (fiyatın 1.5 katı ATR kadar nefes almasına izin verilir)
-                        sl_price = price - (current_atr * 1.5)
+                        tp_price = price * (1 + (guvenli_tp_roi / 100) / leverage)
+                        sl_price = price - (current_atr * 1.8) # 30m için ATR stop nefes payı artırıldı
                     else:
-                        tp_price = price * (1 - (SCALP_TP_ROI / 100) / leverage)
-                        sl_price = price + (current_atr * 1.5)
+                        tp_price = price * (1 - (guvenli_tp_roi / 100) / leverage)
+                        sl_price = price + (current_atr * 1.8)
                     
                     tp_price = float(exchange.price_to_precision(symbol, tp_price))
                     sl_price = float(exchange.price_to_precision(symbol, sl_price))
@@ -409,7 +406,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                         'stopPrice': sl_price,
                         'reduceOnly': True
                     })
-                    print(f"[TP/SL AYARLANDI (ATR Nefes Paylı)] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
+                    print(f"[TP/SL AYARLANDI (%{SCALP_TP_ROI} ROI)] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
                 except Exception as tp_err:
                     print(f"[TP/SL HATA] {symbol}: {tp_err}", flush=True)
 
@@ -423,19 +420,23 @@ def market_pozisyon_kapat(exchange, symbol, side, amount, sebep):
         return False
     with pozisyon_kapatma_lock:
         try:
+            # Bekleyen tüm conditional (TP/SL) emirlerini kesin olarak temizle
             try:
                 exchange.cancel_all_orders(symbol)
-            except Exception:
-                pass
+                print(f"[EMİR TEMİZLİĞİ] {symbol} için kalan tüm bekleyen emirler iptal edildi.", flush=True)
+            except Exception as e:
+                print(f"[EMİR TEMİZLİK UYARI] {symbol}: {e}", flush=True)
 
             close_side = "sell" if side == "buy" else "buy"
             exchange.create_order(symbol, "market", close_side, abs(amount), None, {'reduceOnly': True})
+            
             son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
             if symbol in pozisyon_en_yuksek_kar:
                 del pozisyon_en_yuksek_kar[symbol]
             if symbol in pozisyon_tipleri:
                 del pozisyon_tipleri[symbol]
-            print(f"[POZİSYON KAPATILDI] {symbol} | Sebep: {sebep} (Bekleyen ek emirler temizlendi)", flush=True)
+                
+            print(f"[POZİSYON KAPATILDI] {symbol} | Sebep: {sebep}", flush=True)
             return True
         except Exception as e:
             print(f"[KAPATMA HATA] {symbol}: {e}", flush=True)
@@ -448,7 +449,7 @@ def pozisyonlari_yonet(exchange, positions):
         if sym not in aktif_semboller:
             try:
                 exchange.cancel_all_orders(sym)
-                print(f"[YETİM EMİR TEMİZLİĞİ] {sym} pozisyonu kapanmış, arkada kalan ek emirler iptal edildi.", flush=True)
+                print(f"[YETİM EMİR TEMİZLİĞİ] {sym} pozisyonu kapandı, arkada kalan tüm emirler temizlendi.", flush=True)
             except Exception:
                 pass
             if sym in pozisyon_tipleri:
@@ -521,7 +522,7 @@ def monitor_baslat():
         thread.start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ, PUANLAMA VE ANLIK İŞLEM RAPORU
+# ANA TARAMA DÖNGÜSÜ
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
@@ -548,7 +549,7 @@ def piyasa_tara_ve_islem_yap():
         losers = [item["symbol"] for item in coin_listesi[-25:]]
         hedef_coini_listesi = list(set(gainers + losers))
         
-        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} adet hareketli coin Pullback ve ATR süzgecinden geçiriliyor...", flush=True)
+        print(f"[TARAMA] Toplam {len(hedef_coini_listesi)} coin 30m Pullback ve ATR süzgecinden geçiriliyor...", flush=True)
         
     except Exception as e:
         print(f"[PİYASA LİSTE HATA]: {e}", flush=True)
@@ -569,7 +570,7 @@ def piyasa_tara_ve_islem_yap():
             p_lev = float(p.get("leverage") or 1)
             approx_margin = (p_contracts * p_entry) / p_lev if p_lev > 0 else 0
             
-            if approx_margin >= 11.0:
+            if approx_margin >= 18.0:
                 firsat_var = True
                 pozisyon_tipleri[p_sym] = "opportunity"
             else:
@@ -577,7 +578,6 @@ def piyasa_tara_ve_islem_yap():
                 pozisyon_tipleri[p_sym] = "scalp"
                 
     except Exception as e:
-        print(f"[POZİSYON SORGULAMA HATA]: {e}", flush=True)
         active_positions = []
         aktif_sayisi = 0
         scalp_var, firsat_var = False, False
@@ -594,51 +594,17 @@ def piyasa_tara_ve_islem_yap():
         adaylar.sort(key=lambda x: x["score"], reverse=True)
 
         print("\n" + "="*50, flush=True)
-        print("📊 PULLBACK ONAYLI PİYASA ANALİZ SONUÇLARI (80+ PUAN LİSTESİ)", flush=True)
+        print("📊 30M PULLBACK & ATR ANALİZ SONUÇLARI (80+ PUAN)", flush=True)
         print("="*50, flush=True)
         
         firsat_adaylari = adaylar[:5]
-        print("🏆 80+ PUANLI FIRSAT ADAYLARI (12 USDT Margin):", flush=True)
         for i, c in enumerate(firsat_adaylari, 1):
             print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
-
-        scalp_adaylari = [c for c in adaylar if c['score'] >= SCALP_MIN_SCORE][:5]
-        if scalp_adaylari:
-            print("\n⚡ 80+ PUANLI SCALP ADAYLARI (10 USDT Margin):", flush=True)
-            for i, c in enumerate(scalp_adaylari, 1):
-                print(f"  {i}. {c['symbol']} | Yön: {c['direction'].upper()} | Puan: {c['score']} | Fiyat: {c['price']}", flush=True)
-        else:
-            print("\n⚡ SCALP ADAYI: (80+ puan sağlayan scalp adayı bulunamadı)", flush=True)
         print("="*50 + "\n", flush=True)
     else:
-        print(f"[ANALİZ] Minimum {MINIMUM_PROCESS_SCORE} puan barajını sağlayan uygun pullback adayı bulunamadı. Bekleniyor.", flush=True)
+        print(f"[ANALİZ] Minimum {MINIMUM_PROCESS_SCORE} puan sağlayan 30m aday bulunamadı.", flush=True)
 
-    print("="*50, flush=True)
-    print(f"📌 ANLIK AÇIK İŞLEM DURUMU (Aktif İşlem Sayısı: {aktif_sayisi}/{MAX_TOTAL_POSITIONS})", flush=True)
-    print("="*50, flush=True)
-    if active_positions:
-        for p in active_positions:
-            p_sym = sembol_duzelt(p.get("symbol"))
-            p_side = str(p.get("side")).upper()
-            p_entry = float(p.get("entryPrice") or 0)
-            p_mark = float(p.get("markPrice") or 0)
-            p_lev = float(p.get("leverage") or 1)
-            p_type_val = pozisyon_tipleri.get(p_sym, "BİLİNMİYOR").upper()
-            
-            if p_side == "LONG":
-                p_roi = ((p_mark - p_entry) / p_entry) * 100 * p_lev
-            else:
-                p_roi = ((p_entry - p_mark) / p_entry) * 100 * p_lev
-                
-            print(f"  • Tip: {p_type_val} | Coin: {p_sym} | Yön: {p_side} | Giriş: {p_entry} | Mark: {p_mark} | Kaldıraç: {p_lev}x | Anlık Kar (ROI): %{p_roi:.2f}", flush=True)
-    else:
-        print("  • Şu an borsada açık aktif bir işlem bulunmuyor.", flush=True)
-    print("="*50 + "\n", flush=True)
-
-    if aktif_sayisi >= MAX_TOTAL_POSITIONS:
-        return
-
-    if not adaylar:
+    if aktif_sayisi >= MAX_TOTAL_POSITIONS or not adaylar:
         return
 
     for aday in adaylar:
@@ -661,11 +627,6 @@ def piyasa_tara_ve_islem_yap():
                 scalp_var = True
                 aktif_sayisi += 1
                 break 
-        elif not firsat_var and not (s in pozisyon_tipleri):
-            if pozisyon_ac(exchange, s, aday["direction"], score, "opportunity"):
-                firsat_var = True
-                aktif_sayisi += 1
-                break
 
 # ============================================================
 # FLASK ENDPOINTLERİ
@@ -673,7 +634,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Kesintisiz Çalışıyor (Pullback Giriş ve ATR Stop Optimizasyonlu Sürüm)", 
+        "status": "Bot Kesintisiz Çalışıyor (30M, ATR Stop ve %4 ROI Sürüm)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -682,7 +643,7 @@ def index():
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Pullback optimizasyonlu tarama tetiklendi."}), 200
+        return jsonify({"success": True, "message": "30m tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
