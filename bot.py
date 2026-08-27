@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - GELİŞTİRİLMİŞ LİSTELEME VE 4H MUM COOLDOWN
+# BINANCE FUTURES BOT - 5M & 15M TEYİT, TOP 3 VE KORELASYON KORUMASI
 # ============================================================
 
 app = Flask(__name__)
@@ -94,6 +94,38 @@ def gecerli_kripto_mu(symbol):
     return True
 
 # ============================================================
+# ORGANİK BAĞLI / KORELE COİN KONTROLÜ (Örn: BTC & BCH)
+# ============================================================
+def organik_bag_kontrolu(exchange, symbol, direction):
+    try:
+        positions = exchange.fetch_positions()
+        active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
+        
+        bagli_gruplar = [
+            ["BTC/USDT", "BCH/USDT", "BTCUSDT", "BCHUSDT"]
+        ]
+        
+        target_group = None
+        for grup in bagli_gruplar:
+            if any(sembol_duzelt(symbol) in g for g in grup):
+                target_group = grup
+                break
+                
+        if target_group:
+            for p in active_pos:
+                p_sym = sembol_duzelt(p.get("symbol"))
+                p_side = str(p.get("side")).lower()
+                
+                if any(p_sym in g for g in target_group):
+                    mapped_direction = "buy" if p_side == "long" else "sell"
+                    if mapped_direction == direction:
+                        print(f"[ORGANİK BAĞ FİLTRESİ] {symbol} ({direction.upper()}), gruptaki {p_sym} ile aynı yönde. İşlem engellendi.", flush=True)
+                        return False
+    except Exception:
+        pass
+    return True
+
+# ============================================================
 # 4 SAATLİK MUM TABANLI COOLDOWN KONTROLÜ
 # ============================================================
 def can_open_position_4h_cooldown(exchange, symbol, direction):
@@ -103,13 +135,11 @@ def can_open_position_4h_cooldown(exchange, symbol, direction):
     
     last_trade_4h_ts = cooldown_4h_tracker[key]
     try:
-        # 4h verisini çekerek son mum zamanını kontrol et
         df_4h = ohlcv_getir(exchange, symbol, "4h", 5)
         if df_4h is not None and not df_4h.empty:
             current_last_4h_ts = int(df_4h.iloc[-1]["timestamp"])
-            # Eğer üzerinden en az 1 adet 4 saatlik mum geçmediyse engelle
             if current_last_4h_ts <= last_trade_4h_ts:
-                print(f"[4H COOLDOWN AKTİF] {symbol} ({direction.upper.lower() if hasattr(direction, 'upper') else direction}) | Henüz yeni bir 4H mum kapanmadı. İşlem engellendi.", flush=True)
+                print(f"[4H COOLDOWN AKTİF] {symbol} ({direction.upper()}) | Henüz yeni bir 4H mum kapanmadı. İşlem engellendi.", flush=True)
                 return False
     except Exception:
         pass
@@ -299,7 +329,6 @@ def destek_direnc_konum_teyidi(df, price, atr, yon):
     recent_low = df["low"].iloc[-50:].min()
     
     puan_katkisi = 0
-    
     if yon == "buy":
         ema50 = df["ema50"].iloc[-2]
         dist_to_support = abs(price - recent_low)
@@ -404,20 +433,40 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
         return None
 
 # ============================================================
-# ANLIK GİRİŞ VE ZAMANLAMA TEYİDİ
+# ANLIK 5M VE 15M MUM GÖVDE VE TREND UYUM TEYİDİ
 # ============================================================
 def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
     try:
+        # 5m ve 15m verilerini çek
         df_5m = ohlcv_getir(exchange, symbol, "5m", 15)
-        if df_5m is None or len(df_5m) < 5: return True
+        df_15m = ohlcv_getir(exchange, symbol, "15m", 15)
+
+        if df_5m is not None and len(df_5m) >= 3:
+            last_5m = df_5m.iloc[-1]
+            body_5m = last_5m['close'] - last_5m['open']
+            atr_5m = last_5m.get('atr', 0)
             
-        last_candle = df_5m.iloc[-1]
-        body_size = last_candle['close'] - last_candle['open']
-        
-        if direction == "buy" and body_size < 0 and abs(body_size) > (last_candle.get('atr', 0) * 0.4):
-            return False
-        elif direction == "sell" and body_size > 0 and body_size > (last_candle.get('atr', 0) * 0.4):
-            return False
+            # 5m ters yönde büyük mum kontrolü
+            if direction == "buy" and body_5m < 0 and abs(body_5m) > (atr_5m * 0.4):
+                print(f"[5M TEYİDİ REDDİ] {symbol} (BUY) | 5m mum ters yönde güçlü.", flush=True)
+                return False
+            elif direction == "sell" and body_5m > 0 and body_5m > (atr_5m * 0.4):
+                print(f"[5M TEYİDİ REDDİ] {symbol} (SELL) | 5m mum ters yönde güçlü.", flush=True)
+                return False
+
+        if df_15m is not None and len(df_15m) >= 3:
+            last_15m = df_15m.iloc[-1]
+            body_15m = last_15m['close'] - last_15m['open']
+            atr_15m = last_15m.get('atr', 0)
+            
+            # 15m ters yönde büyük mum ve trend uyum kontrolü
+            if direction == "buy" and body_15m < 0 and abs(body_15m) > (atr_15m * 0.4):
+                print(f"[15M TEYİDİ REDDİ] {symbol} (BUY) | 15m mum ters yönde güçlü.", flush=True)
+                return False
+            elif direction == "sell" and body_15m > 0 and body_15m > (atr_15m * 0.4):
+                print(f"[15M TEYİDİ REDDİ] {symbol} (SELL) | 15m mum ters yönde güçlü.", flush=True)
+                return False
+
         return True
     except Exception:
         return True
@@ -460,6 +509,11 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not can_open_position_4h_cooldown(exchange, symbol, direction):
         return False
 
+    # Organik Bağ / Korelasyon Kontrolü (Örn: BTC ve BCH aynı yönde olamaz)
+    if not organik_bag_kontrolu(exchange, symbol, direction):
+        return False
+
+    # 5m ve 15m Doğru Yer / Zaman Teyidi
     if not anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
         return False
 
@@ -501,9 +555,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_tipleri[symbol] = p_type
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
-                # İşlem açıldığında 4h mum takip zamanını kaydet
                 record_trade_4h_cooldown(exchange, symbol, direction)
-                
                 print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT", flush=True)
                 
                 time.sleep(1)
@@ -530,7 +582,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
                             'stopPrice': sl_price, 'reduceOnly': True
                         })
-                        print(f"[SCALP EMİRLERİ] TP: {tp_price} ({SCALP_TARGET_PROFIT_USDT} USDT Kar) | SL: {sl_price}", flush=True)
                     else:
                         if side == "buy":
                             sl_price = price - (current_atr * 2.0)
@@ -541,10 +592,9 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
                             'stopPrice': sl_price, 'reduceOnly': True
                         })
-                        print(f"[FIRSAT İLK SL] Başlangıç Stop: {sl_price}", flush=True)
 
                 except Exception as tp_err:
-                    print(f"[EMİR HATA]: {tp_err}", flush=True)
+                    pass
 
                 return True
         except Exception as e:
@@ -623,7 +673,6 @@ def pozisyon_monitor_loop():
                     positions = exchange.fetch_positions()
                     active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
                     
-                    # --- DEVAM EDEN İŞLEMLERİN TAKİP BİLGİLERİNİ LİSTELE ---
                     if active_pos:
                         print("\n========== [AKTİF İŞLEMLER TAKİP PANELİ] ==========", flush=True)
                         for p in active_pos:
@@ -650,7 +699,7 @@ def monitor_baslat():
         threading.Thread(target=pozisyon_monitor_loop, daemon=True, name="PositionMonitor").start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ (AYRI SCALP VE FIRSAT LİSTELERİ)
+# ANA TARAMA DÖNGÜSÜ (TOP 3 VE 5M/15M TEYİTLİ SEÇİM)
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
@@ -693,7 +742,6 @@ def piyasa_tara_ve_islem_yap():
         aktif_sayisi = 0
         scalp_var, firsat_var = False, False
 
-    # Adayları tarayıp topla
     scalp_adaylari = []
     firsat_adaylari = []
 
@@ -705,32 +753,31 @@ def piyasa_tara_ve_islem_yap():
             else:
                 scalp_adaylari.append(res)
 
-    # Listeleri puana göre sırala
     scalp_adaylari.sort(key=lambda x: x["score"], reverse=True)
     firsat_adaylari.sort(key=lambda x: x["score"], reverse=True)
 
-    # --- AYRI AYRI LOGLAMA ---
-    print("\n--- [SCALP ANALİZ ADAYLARI LİSTESİ] ---", flush=True)
-    if scalp_adaylari:
-        for sa in scalp_adaylari[:5]:
+    print("\n--- [EN İYİ 3 SCALP ANALİZ ADAYI] ---", flush=True)
+    top_scalp = scalp_adaylari[:3]
+    if top_scalp:
+        for sa in top_scalp:
             print(f" -> {sa['symbol']} | Yön: {sa['direction'].upper()} | Puan: {sa['score']}", flush=True)
     else:
         print(" (Uygun Scalp adayı bulunamadı)", flush=True)
 
-    print("--- [FIRSAT ANALİZ ADAYLARI LİSTESİ] ---", flush=True)
-    if firsat_adaylari:
-        for fa in firsat_adaylari[:5]:
+    print("--- [EN İYİ 3 FIRSAT ANALİZ ADAYI] ---", flush=True)
+    top_firsat = firsat_adaylari[:3]
+    if top_firsat:
+        for fa in top_firsat:
             print(f" -> {fa['symbol']} | Formasyon: {fa['formasyon']} | Yön: {fa['direction'].upper()} | Puan: {fa['score']}", flush=True)
     else:
         print(" (Uygun Fırsat adayı bulunamadı)", flush=True)
-    print("-----------------------------------------\n", flush=True)
+    print("---------------------------------------\n", flush=True)
 
     if aktif_sayisi >= MAX_TOTAL_POSITIONS: 
         return
 
-    # İşlem açma öncelik mantığı
-    if not firsat_var and firsat_adaylari:
-        for aday in firsat_adaylari:
+    if not firsat_var and top_firsat:
+        for aday in top_firsat:
             s = aday["symbol"]
             score = aday["score"]
             if not (s in pozisyon_tipleri) and score >= SCALP_MIN_SCORE:
@@ -738,8 +785,8 @@ def piyasa_tara_ve_islem_yap():
                     firsat_var = True
                     break
         
-    if not scalp_var and scalp_adaylari:
-        for aday in scalp_adaylari:
+    if not scalp_var and top_scalp:
+        for aday in top_scalp:
             s = aday["symbol"]
             score = aday["score"]
             if not (s in pozisyon_tipleri) and score >= SCALP_MIN_SCORE:
@@ -752,14 +799,14 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Ayrı Scalp/Fırsat Listesi, Aktif İşlem Paneli & 4H Mum Cooldown Aktif)"})
+    return jsonify({"status": "Bot Çalışıyor (Top 3 Aday, 5m & 15m Zamanlama Teyidi Aktif)"})
 
 @app.route("/tetikle")
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Tarama ve analiz tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Tarama, Top 3 analizi ve 5m/15m teyit tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
