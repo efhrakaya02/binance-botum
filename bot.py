@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - SABİT LİMİTLİ FIRSAT & SCALP AVCISI
+# BINANCE FUTURES BOT - 50 COİN HAVUZU & 85 PUAN KİLİTLİ SİSTEM
 # ============================================================
 
 app = Flask(__name__)
@@ -26,21 +26,22 @@ TRADING_ENABLED = True
 POSITION_MONITOR_ENABLED = True
 
 # ============================================================
-# AYARLAR VE KESİN İŞLEM LİMİTLERİ
+# AYARLAR VE KESİN İŞLEM LİMİTLERİ (85 PUAN KİLİTLİ)
 # ============================================================
 SCALP_ENABLED = True
-SCALP_MARGIN = 10.0      # Kesin kural: Scalp için tam 10 USDT
-MAX_SCALP_POSITIONS = 1  # En fazla 1 adet Scalp
-SCALP_TP_ROI = 4.0       # Hedef net %4 ROI
+SCALP_MARGIN = 10.0            # Kesin kural: Scalp için tam 10 USDT
+MAX_SCALP_POSITIONS = 1        # En fazla 1 adet Scalp
+SCALP_TP_ROI = 4.0             # Hedef net %4 ROI
 
 OPPORTUNITY_ENABLED = True
-OPPORTUNITY_MARGIN = 12.0  # Kesin kural: Fırsat için tam 12 USDT
+OPPORTUNITY_MARGIN = 12.0      # Kesin kural: Fırsat için tam 12 USDT
 MAX_OPPORTUNITY_POSITIONS = 1  # En fazla 1 adet Fırsat
 
-MAX_TOTAL_POSITIONS = 2  # Toplamda kesinlikle aynı anda maksimum 2 işlem
+MAX_TOTAL_POSITIONS = 2        # Toplamda kesinlikle aynı anda maksimum 2 işlem
 
-MINIMUM_PROCESS_SCORE = 75  
-SCALP_MIN_SCORE = 80
+# İstediğin gibi işlem puan alt sınırları 85 olarak güncellendi
+MINIMUM_PROCESS_SCORE = 85  
+SCALP_MIN_SCORE = 85
 
 COOLDOWN_HOURS = 2       
 cooldown_ms = COOLDOWN_HOURS * 60 * 60 * 1000
@@ -321,8 +322,8 @@ def skorla_coin(exchange, symbol, btc_trend):
 # KALDIRAÇ VE İŞLEM YÖNETİMİ
 # ============================================================
 def kaldirac_belirle(score):
-    if score >= 90: return 5
-    elif score >= 80: return 4
+    if score >= 92: return 5
+    elif score >= 85: return 4
     return 3
 
 def miktar_hesapla(exchange, symbol, margin, leverage, price):
@@ -364,7 +365,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 if sembol_duzelt(p.get("symbol")) == symbol:
                     return False
 
-            # Tür bazlı tekil limit kontrolü
             if p_type == "opportunity":
                 mevcut_firsat = sum(1 for p in active_positions if sembol_duzelt(p.get("symbol")) in pozisyon_tipleri and pozisyon_tipleri[sembol_duzelt(p.get("symbol"))] == "opportunity")
                 if mevcut_firsat >= MAX_OPPORTUNITY_POSITIONS:
@@ -381,7 +381,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            # KESİN BÜTÇE KONTROLÜ: Fırsat için 12 USDT, Scalp için 10 USDT
             margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             amount = miktar_hesapla(exchange, symbol, margin, leverage, price)
 
@@ -467,7 +466,6 @@ def pozisyonlari_yonet(exchange, positions):
             leverage = float(p.get("leverage") or 1)
             if entry_price == 0 or mark_price == 0: continue
 
-            # Otomatik tip atama (Eğer hafızada yoksa teminata göre etiketle)
             approx_margin = (contracts * entry_price) / leverage if leverage > 0 else 0
             if symbol not in pozisyon_tipleri:
                 if approx_margin >= 11.0:
@@ -509,7 +507,7 @@ def monitor_baslat():
         threading.Thread(target=pozisyon_monitor_loop, daemon=True, name="PositionMonitor").start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ
+# ANA TARAMA DÖNGÜSÜ (GAINERS / LOSERS İLK 25'ER COİN - TOPLAM 50)
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
@@ -523,8 +521,13 @@ def piyasa_tara_ve_islem_yap():
             if gecerli_kripto_mu(symbol):
                 coin_listesi.append({"symbol": symbol, "change": float(ticker.get("percentage", 0) or 0)})
                 
+        # Yüzdesel değişime göre sırala
         coin_listesi.sort(key=lambda x: x["change"], reverse=True)
-        hedef_coini_listesi = list(set([i["symbol"] for i in coin_listesi[:30]] + [i["symbol"] for i in coin_listesi[-30:]]))
+        
+        # İstediğin gibi: En çok kazananlar ilk 25 ve en çok kaybedenler ilk 25 (Toplam 50 coin)
+        gainers_25 = [i["symbol"] for i in coin_listesi[:25]]
+        losers_25 = [i["symbol"] for i in coin_listesi[-25:]]
+        hedef_coini_listesi = list(set(gainers_25 + losers_25))
     except Exception as e:
         return
 
@@ -556,6 +559,7 @@ def piyasa_tara_ve_islem_yap():
     for symbol in hedef_coini_listesi:
         if cooldown_aktif_mi(symbol): continue
         res = skorla_coin(exchange, symbol, btc_trend)
+        # Güncellenen kural: Minimum 85 puan alt sınırı
         if res and res["score"] >= MINIMUM_PROCESS_SCORE:
             adaylar.append(res)
 
@@ -569,14 +573,14 @@ def piyasa_tara_ve_islem_yap():
         score = aday["score"]
         is_firsat = aday["is_firsat"]
         
-        # 1. Fırsat İşlemi (12 USDT, Max 1 adet)
-        if is_firsat and not firsat_var and not (s in pozisyon_tipleri):
+        # 1. Fırsat İşlemi (12 USDT, Max 1 adet, Formasyon/Pump-Dump tetiklemeli)
+        if is_firsat and not firsat_var and not (s in pozisyon_tipleri) and score >= SCALP_MIN_SCORE:
             if pozisyon_ac(exchange, s, aday["direction"], score, "opportunity"):
                 firsat_var = True
                 break
         
-        # 2. Scalp İşlemi (10 USDT, Max 1 adet)
-        elif score >= SCALP_MIN_SCORE and not scalp_var and not (s in pozisyon_tipleri):
+        # 2. Scalp İşlemi (10 USDT, Max 1 adet, 85+ puan trend/pullback teyitli)
+        elif not scalp_var and not (s in pozisyon_tipleri) and score >= SCALP_MIN_SCORE:
             if pozisyon_ac(exchange, s, aday["direction"], score, "scalp"):
                 scalp_var = True
                 break
@@ -586,7 +590,7 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (12 USDT Fırsat & 10 USDT Scalp Sürümü)"})
+    return jsonify({"status": "Bot Çalışıyor (50 Coin Havuzu & 85 Puan Limitli Sürüm)"})
 
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
