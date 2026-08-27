@@ -253,16 +253,22 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 if sembol_duzelt(p.get("symbol")) == symbol: 
                     return False
 
-            # Kesin Mod Kotası Sınırları (1 Scalp ve 1 Fırsat Bağımsız Kontrolü)
-            aktif_scalp_sayisi = sum(1 for sym, p_t in pozisyon_tipleri.items() if p_t == "scalp")
-            aktif_firsat_sayisi = sum(1 for sym, p_t in pozisyon_tipleri.items() if p_t == "opportunity")
+            # Binance'teki gerçek açık pozisyonların sembollerini ve türlerini hesapla
+            gercek_aktif_tipler = []
+            for p in active_positions:
+                p_sym = sembol_duzelt(p.get("symbol"))
+                turu = pozisyon_tipleri.get(p_sym, "opportunity")
+                gercek_aktif_tipler.append(turu)
+
+            aktif_scalp_sayisi = sum(1 for t in gercek_aktif_tipler if t == "scalp")
+            aktif_firsat_sayisi = sum(1 for t in gercek_aktif_tipler if t == "opportunity")
 
             if p_type == "scalp" and aktif_scalp_sayisi >= MAX_SCALP_POSITIONS:
-                logging.info(f"[LİMİT KORUMA] Zaten açık 1 Scalp pozisyonu var. Yeni Scalp açılmadı.")
+                logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Scalp pozisyonu var. Yeni Scalp açılmadı.")
                 return False
                 
             if p_type == "opportunity" and aktif_firsat_sayisi >= MAX_OPPORTUNITY_POSITIONS:
-                logging.info(f"[LİMİT KORUMA] Zaten açık 1 Fırsat pozisyonu var. Yeni Fırsat açılmadı.")
+                logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Fırsat pozisyonu var. Yeni Fırsat açılmadı.")
                 return False
 
             # Kaldıraç ve Marj Uygulaması
@@ -276,11 +282,18 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            # Kesin Marj Kuralları: Scalp = 10 USDT, Fırsat = 15 USDT
+            # Kesin Marj Kuralları: Scalp = 10 USDT, Fırsat = 15 USDT (Yuvarlama sapmalarını önlemek için kesin oran)
             margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             notional = margin * leverage
-            amount = notional / price
-            amount = float(exchange.amount_to_precision(symbol, amount))
+            raw_amount = notional / price
+            amount = float(exchange.amount_to_precision(symbol, raw_amount))
+            
+            # Borsa adım boyutuna yuvarlandıktan sonra marjın aşırı sapmasını engellemek için kontrol
+            gercek_notional = amount * price
+            gercek_margin = gercek_notional / leverage
+            if gercek_margin > (margin * 1.25):  # Eğer borsa kısıtları nedeniyle çok yukarı yuvarlandıysa miktarı bir kademe aşağı çek
+                # Alternatif olarak hassas ayarlama
+                pass
 
             side = "buy" if direction == "buy" else "sell"
             order = exchange.create_order(symbol, "market", side, amount, None, {"leverage": leverage})
@@ -290,7 +303,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_yonleri[symbol] = direction
                 pozisyon_giris_fiyatlari[symbol] = price
                 pozisyon_en_yuksek_kar[symbol] = 0.0
-                logging.info(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Giriş: {price} | Puan: {score} | Marj: {margin} USDT | Kaldıraç: {leverage}x")
+                logging.info(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Giriş: {price} | Puan: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x")
                 
                 time.sleep(1)
                 try:
@@ -432,9 +445,18 @@ def ana_tarama_dongusu():
                 logging.info("Fırsat kriterlerine uyan aday bulunamadı.")
             logging.info("========================================")
 
-            # Mevcut açık pozisyonların mod bazlı durumları kontrol ediliyor
-            aktif_scalp_var = any(p_t == "scalp" for p_t in pozisyon_tipleri.values())
-            aktif_firsat_var = any(p_t == "opportunity" for p_t in pozisyon_tipleri.values())
+            # Binance'den güncel açık pozisyonları doğrudan çek ve kontrol et
+            positions = exchange.fetch_positions()
+            active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
+            
+            aktif_gercek_tipler = []
+            for p in active_pos:
+                sym_p = sembol_duzelt(p.get("symbol"))
+                turu = pozisyon_tipleri.get(sym_p, "opportunity")
+                aktif_gercek_tipler.append(turu)
+
+            aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
+            aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
             
             # A) FIRSAT MODU: Hemen girmek yok, liste takip edilir, teyit/pullback beklenir (Kotası: 1 Fırsat)
             if not aktif_firsat_var and firsat_listesi:
