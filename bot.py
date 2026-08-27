@@ -4,11 +4,11 @@ import pandas as pd
 import numpy as np
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - TEYİTLİ (KORELASYON, FUNDING, S/R) & 85 PUAN
+# BINANCE FUTURES BOT - TEYİTLİ & COOLDOWN KORUMALI TAM SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -42,10 +42,12 @@ MAX_TOTAL_POSITIONS = 2        # Toplamda kesinlikle aynı anda maksimum 2 işle
 MINIMUM_PROCESS_SCORE = 85  
 SCALP_MIN_SCORE = 85
 
-COOLDOWN_HOURS = 2       
-cooldown_ms = COOLDOWN_HOURS * 60 * 60 * 1000
-son_kapanis_zamanlari = {}
+# --- COOLDOWN / SÜRE KISITLAMASI AYARLARI ---
+# Aynı parite ve aynı yönde tekrar işlem açılması için geçmesi gereken süre (Örn: 4 Saat)
+COOLDOWN_HOURS = 4 
+cooldown_tracker = {}          # { "BTC/USDT_buy": datetime_objesi, ... }
 
+son_kapanis_zamanlari = {}
 POSITION_MONITOR_INTERVAL = 2.0
 
 # ============================================================
@@ -91,12 +93,29 @@ def gecerli_kripto_mu(symbol):
             return False
     return True
 
-def cooldown_aktif_mi(symbol):
-    son_zaman = son_kapanis_zamanlari.get(symbol, 0)
-    simdiki_zaman = int(time.time() * 1000)
-    if simdiki_zaman - son_zaman < cooldown_ms:
-        return True
-    return False
+# ============================================================
+# COOLDOWN KONTROL FONKSİYONLARI (YENİ EKLENEN KORUMA)
+# ============================================================
+def can_open_position_cooldown(symbol, direction):
+    """
+    Belirli bir paritede ve yönde (buy/sell) cooldown süresi dolup dolmadığını denetler.
+    """
+    key = f"{symbol}_{direction}"
+    if key in cooldown_tracker:
+        last_trade_time = cooldown_tracker[key]
+        elapsed_time = datetime.now() - last_trade_time
+        if elapsed_time < timedelta(hours=COOLDOWN_HOURS):
+            remaining_minutes = int((timedelta(hours=COOLDOWN_HOURS) - elapsed_time).total_seconds() / 60)
+            print(f"[COOLDOWN AKTİF] {symbol} ({direction.upper()}) | Kalan süre: {remaining_minutes} dk. İşlem engellendi.", flush=True)
+            return False
+    return True
+
+def record_trade_cooldown(symbol, direction):
+    """
+    İşlem açıldığında cooldown süresini başlatmak üzere kaydeder.
+    """
+    key = f"{symbol}_{direction}"
+    cooldown_tracker[key] = datetime.now()
 
 # ============================================================
 # İNDİKATÖRLER VE FORMASYON / PUMP-DUMP TESPİT MOTORU
@@ -246,22 +265,20 @@ def btc_egilimini_getir(exchange):
 # ============================================================
 def btc_korelasyon_kontrolu(df_alt, df_btc, yon):
     if df_alt is None or df_btc is None or len(df_alt) < 10 or len(df_btc) < 10:
-        return True, 0  # Veri yetersizse engelleme
+        return True, 0  
     
     alt_returns = df_alt["close"].pct_change().tail(10)
     btc_returns = df_btc["close"].pct_change().tail(10)
     
-    # Pearson Korelasyonu
     corr = alt_returns.corr(btc_returns)
     
-    # Long yönlü teyit: Genel olarak BTC yükseliyorken altcoin de ayak uydurmalı veya korelasyon pozitif olmalı
     if yon == "buy":
-        if corr < -0.65: # BTC ile ters yönde agresif ayrışıyorsa tehlikeli olabilir
+        if corr < -0.65: 
             return False, -15
         elif corr > 0.3:
             return True, 10
-    else: # Short yönlü teyit
-        if corr > 0.7 and btc_returns.iloc[-1] > 0: # BTC coşmuşken short açmak riskli
+    else: 
+        if corr > 0.7 and btc_returns.iloc[-1] > 0: 
             return False, -20
         elif corr < 0 or btc_returns.iloc[-1] < 0:
             return True, 10
@@ -269,7 +286,6 @@ def btc_korelasyon_kontrolu(df_alt, df_btc, yon):
     return True, 0
 
 def destek_direnc_konum_teyidi(df, price, atr, yon):
-    # Son 50 mumun en yüksek ve en düşük yerel seviyeleri (S/R noktaları)
     recent_high = df["high"].iloc[-50:].max()
     recent_low = df["low"].iloc[-50:].min()
     
@@ -277,7 +293,6 @@ def destek_direnc_konum_teyidi(df, price, atr, yon):
     not_aciklama = ""
     
     if yon == "buy":
-        # Fiyat güçlü bir desteğe mi yakın? (Yerel dibe veya EMA50 desteğine)
         ema50 = df["ema50"].iloc[-2]
         dist_to_support = abs(price - recent_low)
         if dist_to_support < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
@@ -286,7 +301,6 @@ def destek_direnc_konum_teyidi(df, price, atr, yon):
         else:
             not_aciklama = "Destek Bölgesinden Uzakta"
     else:
-        # Fiyat güçlü bir dirence mi yakın?
         ema50 = df["ema50"].iloc[-2]
         dist_to_resistance = abs(recent_high - price)
         if dist_to_resistance < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
@@ -384,13 +398,8 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
                 short_score += 15
                 log_detay.append("EMA Pullback (+15)")
 
-        # Geçici Yön Belirleme
         temp_dir = "buy" if long_score >= short_score else "sell"
 
-        # ========================================================
-        # EK TEYİT FİLTRELERİ UYGULANIYOR
-        # ========================================================
-        # 1. Funding Rate Teyidi (Long için negatif/nötr avantaj, Short için pozitif avantaj)
         if temp_dir == "buy" and funding < 0:
             long_score += 10
             log_detay.append(f"Funding Rate Long Teyidi [Negatif: {funding:.5f}] (+10)")
@@ -398,7 +407,6 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
             short_score += 10
             log_detay.append(f"Funding Rate Short Teyidi [Pozitif: {funding:.5f}] (+10)")
 
-        # 2. Destek / Direnç Konum Teyidi
         sr_puan, sr_aciklama = destek_direnc_konum_teyidi(df30, price, atr, temp_dir)
         if temp_dir == "buy":
             long_score += sr_puan
@@ -407,10 +415,9 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
             short_score += sr_puan
             log_detay.append(sr_aciklama)
 
-        # 3. BTC Korelasyon Teyidi
         kor_gecerli, kor_puan = btc_korelasyon_kontrolu(df30, df_btc, temp_dir)
         if not kor_gecerli:
-            print(f"[FİLTRE - TEYİT REDDİ] {symbol} | BTC Korelasyonu Sinyalle Uyuşmuyor (Korelasyon Kriteri Takıldı)", flush=True)
+            print(f"[FİLTRE - TEYİT REDDİ] {symbol} | BTC Korelasyonu Sinyalle Uyuşmuyor", flush=True)
             return None
         
         if temp_dir == "buy":
@@ -419,20 +426,17 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
             short_score += kor_puan
         log_detay.append(f"BTC Korelasyon Teyidi ({kor_puan:+d} Puan)")
 
-        # Final Yön ve Skor
         if long_score >= short_score:
             result["direction"], result["score"] = "buy", long_score
         else:
             result["direction"], result["score"] = "sell", short_score
 
         if abs(long_score - short_score) < 8 and not formasyon_adi:
-            print(f"[ANALİZ] {symbol} | Yön Kararsızlığı (Long: {long_score}, Short: {short_score}) -> Elerndi", flush=True)
+            print(f"[ANALİZ] {symbol} | Yön Kararsızlığı -> Elerndi", flush=True)
             return None
 
-        # DETAYLI ANALİZ VE PUANLAMA LOGU
         print(f"[TEYİTLİ ANALİZ RAPORU] {symbol} | Fiyat: {price} | RSI(30m): {rsi30:.1f} | Funding: {funding:.5f} | "
-              f"Seçilen Yön: {result['direction'].upper()} | Toplam Puan: {result['score']} (Long: {long_score}, Short: {short_score}) | "
-              f"Teyit Detayları: {', '.join(log_detay)}", flush=True)
+              f"Seçilen Yön: {result['direction'].upper()} | Toplam Puan: {result['score']} | Detaylar: {', '.join(log_detay)}", flush=True)
 
         return result
     except Exception as e:
@@ -473,6 +477,10 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not islem_izni_var_mi(): return False
     
+    # === COOLDOWN KONTROLÜ (YENİ EKLEME) ===
+    if not can_open_position_cooldown(symbol, direction):
+        return False
+
     with islem_acma_lock:
         try:
             positions = exchange.fetch_positions()
@@ -510,6 +518,10 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             if order:
                 pozisyon_tipleri[symbol] = p_type
                 pozisyon_en_yuksek_kar[symbol] = 0.0
+                
+                # Cooldown süresini başarılı işlem açılışıyla tetikle
+                record_trade_cooldown(symbol, direction)
+                
                 print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT | Kaldıraç: {leverage}x", flush=True)
                 
                 time.sleep(1)
@@ -634,7 +646,7 @@ def piyasa_tara_ve_islem_yap():
     try:
         exchange.load_markets()
         btc_trend, df_btc = btc_egilimini_getir(exchange)
-        print(f"\n--- TEYİTLİ PİYASA TARAMASI BAŞLADI | BTC Trend: {btc_trend.upper()} ---", flush=True)
+        print(f"\n--- TEYİTLİ & COOLDOWN KORUMALI PİYASA TARAMASI | BTC Trend: {btc_trend.upper()} ---", flush=True)
         
         tickers = exchange.fetch_tickers()
         coin_listesi = []
@@ -679,7 +691,6 @@ def piyasa_tara_ve_islem_yap():
 
     adaylar = []
     for symbol in hedef_coini_listesi:
-        if cooldown_aktif_mi(symbol): continue
         res = skorla_coin(exchange, symbol, btc_trend, df_btc)
         if res and res["score"] >= MINIMUM_PROCESS_SCORE:
             adaylar.append(res)
@@ -714,13 +725,13 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Teyitli & Loglu Sürüm)"})
+    return jsonify({"status": "Bot Çalışıyor (Teyitli & Cooldown Korumalı Sürüm)"})
 
 @app.route("/otomatik-analiz")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Teyitli piyasa analizi tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
