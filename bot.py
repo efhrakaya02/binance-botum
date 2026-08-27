@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - TEYİTLİ, COOLDOWN VE ANINDA GİRİŞ ZAMANLAMALI SÜRÜM
+# BINANCE FUTURES BOT - SCALP (0.30 USDT TP) & FIRSAT (DİNAMİK STOP) SÜRÜMÜ
 # ============================================================
 
 app = Flask(__name__)
@@ -31,7 +31,9 @@ POSITION_MONITOR_ENABLED = True
 SCALP_ENABLED = True
 SCALP_MARGIN = 10.0            # Kesin kural: Scalp için tam 10 USDT
 MAX_SCALP_POSITIONS = 1        # En fazla 1 adet Scalp
-SCALP_TP_ROI = 4.0             # Hedef net %4 ROI
+
+# --- SCALP 0.30 USDT NET KAR HEDEFİ ---
+SCALP_TARGET_PROFIT_USDT = 0.30
 
 OPPORTUNITY_ENABLED = True
 OPPORTUNITY_MARGIN = 12.0      # Kesin kural: Fırsat için tam 12 USDT
@@ -291,16 +293,12 @@ def destek_direnc_konum_teyidi(df, price, atr, yon):
         if dist_to_support < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
             puan_katkisi += 15
             not_aciklama = "Güçlü Destek / EMA50 Temas Teyidi (+15 Puan)"
-        else:
-            not_aciklama = "Destek Bölgesinden Uzakta"
     else:
         ema50 = df["ema50"].iloc[-2]
         dist_to_resistance = abs(recent_high - price)
         if dist_to_resistance < (1.5 * atr) or abs(price - ema50) < (1.0 * atr):
             puan_katkisi += 15
             not_aciklama = "Güçlü Direnç / EMA50 Red Teyidi (+15 Puan)"
-        else:
-            not_aciklama = "Direnç Bölgesinden Uzakta"
             
     return puan_katkisi, not_aciklama
 
@@ -344,16 +342,11 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
 
         rsi30 = float(d30["rsi"])
         long_score, short_score = 0, 0
-        log_detay = []
 
         if formasyon_adi:
             result["is_firsat"] = True
-            if formasyon_yonu == "buy":
-                long_score += 35
-                log_detay.append(f"Formasyon [{formasyon_adi.upper()}]: Long +35")
-            else:
-                short_score += 35
-                log_detay.append(f"Formasyon [{formasyon_adi.upper()}]: Short +35")
+            if formasyon_yonu == "buy": long_score += 35
+            else: short_score += 35
 
         trend4_long = (d4["close"] > d4["ema50"])
         trend4_short = (d4["close"] < d4["ema50"])
@@ -374,18 +367,15 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
 
         temp_dir = "buy" if long_score >= short_score else "sell"
 
-        if temp_dir == "buy" and funding < 0:
-            long_score += 10
-        elif temp_dir == "sell" and funding > 0.0005:
-            short_score += 10
+        if temp_dir == "buy" and funding < 0: long_score += 10
+        elif temp_dir == "sell" and funding > 0.0005: short_score += 10
 
-        sr_puan, sr_aciklama = destek_direnc_konum_teyidi(df30, price, atr, temp_dir)
+        sr_puan, _ = destek_direnc_konum_teyidi(df30, price, atr, temp_dir)
         if temp_dir == "buy": long_score += sr_puan
         else: short_score += sr_puan
 
         kor_gecerli, kor_puan = btc_korelasyon_kontrolu(df30, df_btc, temp_dir)
-        if not kor_gecerli:
-            return None
+        if not kor_gecerli: return None
         
         if temp_dir == "buy": long_score += kor_puan
         else: short_score += kor_puan
@@ -398,45 +388,31 @@ def skorla_coin(exchange, symbol, btc_trend, df_btc):
         if abs(long_score - short_score) < 8 and not formasyon_adi:
             return None
 
-        print(f"[TEYİTLİ ANALİZ RAPORU] {symbol} | Fiyat: {price} | Yön: {result['direction'].upper()} | Toplam Puan: {result['score']}", flush=True)
+        print(f"[TEYİTLİ ANALİZ] {symbol} | Yön: {result['direction'].upper()} | Puan: {result['score']}", flush=True)
         return result
     except Exception as e:
         return None
 
 # ============================================================
-# YENİ EKLENEN: ANLIK GİRİŞ VE ZAMANLAMA TEYİDİ (ENTRY MOMENTUM CHECK)
+# ANLIK GİRİŞ VE ZAMANLAMA TEYİDİ
 # ============================================================
 def anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
-    """
-    İşlem tetiklenmeden hemen önce son mumların ve anlık fiyat hareketinin 
-    doğru yönde momentum taşıdığını (aniden tersine dönmediğini) mikroseviyede denetler.
-    """
     try:
-        # En hızlı mikro hareket için son 5 dakikalık (5m) mumları çekelim
         df_5m = ohlcv_getir(exchange, symbol, "5m", 15)
-        if df_5m is None or len(df_5m) < 5:
-            return True # Veri alınamazsa ana strateji onayına güvenip devam et
+        if df_5m is None or len(df_5m) < 5: return True
             
         last_candle = df_5m.iloc[-1]
-        prev_candle = df_5m.iloc[-2]
+        body_size = last_candle['close'] - last_candle['open']
         
-        # Long için son 5m mumunun rengi tamamen kırmızı (mum kapanışı açılışın çok altındaysa) veya fitil analizi
-        if direction == "buy":
-            # Eğer son mum sert bir şekilde düşüş gösteriyorsa (gövde aşağı yönlüyse) biraz bekle
-            body_size = last_candle['close'] - last_candle['open']
-            if body_size < 0 and abs(body_size) > (last_candle['atr'] * 0.5 if 'atr' in last_candle else 0):
-                print(f"[ZAMANLAMA REDDİ] {symbol} (LONG) | 5m mumunda ani baskı/satış var, giriş ertelendi.", flush=True)
-                return False
-        elif direction == "sell":
-            body_size = last_candle['close'] - last_candle['open']
-            if body_size > 0 and body_size > (last_candle['atr'] * 0.5 if 'atr' in last_candle else 0):
-                print(f"[ZAMANLAMA REDDİ] {symbol} (SHORT) | 5m mumunda ani alım baskısı var, giriş ertelendi.", flush=True)
-                return False
-                
+        if direction == "buy" and body_size < 0 and abs(body_size) > (last_candle.get('atr', 0) * 0.4):
+            print(f"[ZAMANLAMA REDDİ] {symbol} (LONG) | 5m mumunda satış baskısı var, bekleniyor.", flush=True)
+            return False
+        elif direction == "sell" and body_size > 0 and body_size > (last_candle.get('atr', 0) * 0.4):
+            print(f"[ZAMANLAMA REDDİ] {symbol} (SHORT) | 5m mumunda alım baskısı var, bekleniyor.", flush=True)
+            return False
         return True
-    except Exception as e:
-        print(f"[ZAMANLAMA TEYİT HATA] {symbol}: {e}", flush=True)
-        return True # Hata durumunda akışı tıkamamak için True döner
+    except Exception:
+        return True
 
 # ============================================================
 # KALDIRAÇ VE İŞLEM YÖNETİMİ
@@ -466,17 +442,15 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
     try:
         exchange.set_leverage(leverage, symbol)
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not islem_izni_var_mi(): return False
     
-    # 1. Cooldown Kontrolü
     if not can_open_position_cooldown(symbol, direction):
         return False
 
-    # 2. YENİ EKLENEN: Anlık Giriş / Zamanlama Teyit Kontrolü
     if not anlik_giris_zamanlama_teyidi(exchange, symbol, direction):
         return False
 
@@ -518,10 +492,9 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_tipleri[symbol] = p_type
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
-                # Cooldown süresini başlat
                 record_trade_cooldown(symbol, direction)
                 
-                print(f"[DOĞRU ZAMAN & İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT", flush=True)
+                print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT", flush=True)
                 
                 time.sleep(1)
                 try:
@@ -529,26 +502,41 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                     df_temp = ohlcv_getir(exchange, symbol, "30m", 30)
                     current_atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
                     
-                    guvenli_tp_roi = SCALP_TP_ROI * 1.15 
-                    
-                    if side == "buy":
-                        tp_price = price * (1 + (guvenli_tp_roi / 100) / leverage)
-                        sl_price = price - (current_atr * 1.8)
-                    else:
-                        tp_price = price * (1 - (guvenli_tp_roi / 100) / leverage)
-                        sl_price = price + (current_atr * 1.8)
-                    
-                    tp_price = float(exchange.price_to_precision(symbol, tp_price))
-                    sl_price = float(exchange.price_to_precision(symbol, sl_price))
+                    if p_type == "scalp":
+                        # --- SCALP İÇİN 0.30 USDT NET KAR HEDEFİ ---
+                        fiyat_farki = SCALP_TARGET_PROFIT_USDT / amount
+                        if side == "buy":
+                            tp_price = price + fiyat_farki
+                            sl_price = price - (current_atr * 2.0)
+                        else:
+                            tp_price = price - fiyat_farki
+                            sl_price = price + (current_atr * 2.0)
+                        
+                        tp_price = float(exchange.price_to_precision(symbol, tp_price))
+                        sl_price = float(exchange.price_to_precision(symbol, sl_price))
 
-                    exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {
-                        'stopPrice': tp_price, 'reduceOnly': True
-                    })
-                    exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
-                        'stopPrice': sl_price, 'reduceOnly': True
-                    })
+                        exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {
+                            'stopPrice': tp_price, 'reduceOnly': True
+                        })
+                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
+                            'stopPrice': sl_price, 'reduceOnly': True
+                        })
+                        print(f"[SCALP EMİRLERİ] TP: {tp_price} ({SCALP_TARGET_PROFIT_USDT} USDT Kar) | SL: {sl_price}", flush=True)
+                    else:
+                        # --- FIRSAT İÇİN İLK BAŞLANGIÇ STOP SEVİYESİ ---
+                        if side == "buy":
+                            sl_price = price - (current_atr * 2.0)
+                        else:
+                            sl_price = price + (current_atr * 2.0)
+                        
+                        sl_price = float(exchange.price_to_precision(symbol, sl_price))
+                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
+                            'stopPrice': sl_price, 'reduceOnly': True
+                        })
+                        print(f"[FIRSAT İLK SL] Başlangıç Stop: {sl_price} (Dinamik Takip Aktif)", flush=True)
+
                 except Exception as tp_err:
-                    pass
+                    print(f"[EMİR HATA]: {tp_err}", flush=True)
 
                 return True
         except Exception as e:
@@ -563,7 +551,6 @@ def market_pozisyon_kapat(exchange, symbol, side, amount, sebep):
                 exchange.cancel_all_orders(symbol)
             except Exception:
                 pass
-
             close_side = "sell" if side == "buy" else "buy"
             exchange.create_order(symbol, "market", close_side, abs(amount), None, {'reduceOnly': True})
             son_kapanis_zamanlari[symbol] = int(time.time() * 1000)
@@ -589,7 +576,7 @@ def pozisyonlari_yonet(exchange, positions):
         try:
             contracts = float(p.get("contracts") or 0)
             if contracts <= 0: continue
-            side = p.get("side") 
+            side = p.get("side") # 'long' veya 'short'
             entry_price = float(p.get("entryPrice") or 0)
             mark_price = float(p.get("markPrice") or 0)
             leverage = float(p.get("leverage") or 1)
@@ -597,14 +584,40 @@ def pozisyonlari_yonet(exchange, positions):
 
             approx_margin = (contracts * entry_price) / leverage if leverage > 0 else 0
             if symbol not in pozisyon_tipleri:
-                if approx_margin >= 11.0:
-                    pozisyon_tipleri[symbol] = "opportunity"
-                else:
-                    pozisyon_tipleri[symbol] = "scalp"
+                if approx_margin >= 11.0: pozisyon_tipleri[symbol] = "opportunity"
+                else: pozisyon_tipleri[symbol] = "scalp"
 
-            roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
-            current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
-            if roi > current_max: pozisyon_en_yuksek_kar[symbol] = roi
+            # Fırsat işlemleri için dinamik kar takip (Trailing Stop) mekanizması
+            if pozisyon_tipleri.get(symbol) == "opportunity":
+                roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
+                current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
+                
+                if roi > current_max:
+                    pozisyon_en_yuksek_kar[symbol] = roi
+                    current_max = roi
+
+                # Kademeli dinamik stop mantığı
+                yeni_sl = None
+                if current_max >= 8.0:
+                    # %8 ve üzeri karda, zirvenin %3 gerisinde kar kilitle
+                    yeni_sl = mark_price * (1 - 0.03 / leverage) if side == "long" else mark_price * (1 + 0.03 / leverage)
+                    print(f"[DİNAMİK STOP - KÂR KİLİDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Güncellenen Stop: {yeni_sl}", flush=True)
+                elif current_max >= 4.0:
+                    # %4 ve üzeri karda, breakeven + güvenli marj (maliyeti koruma)
+                    yeni_sl = entry_price * (1 + 0.005 / leverage) if side == "long" else entry_price * (1 - 0.005 / leverage)
+                    print(f"[DİNAMİK STOP - RİSK SIFIRLAMA] {symbol} | Zirve ROI: %{current_max:.2f} | Maliyet Koruma Stopu: {yeni_sl}", flush=True)
+
+                if yeni_sl is not None:
+                    try:
+                        exchange.cancel_all_orders(symbol)
+                        close_side = "sell" if side == "long" else "buy"
+                        yeni_sl = float(exchange.price_to_precision(symbol, yeni_sl))
+                        exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {
+                            'stopPrice': yeni_sl, 'reduceOnly': True
+                        })
+                    except Exception as sl_err:
+                        pass
+
         except Exception:
             pass
 
@@ -670,7 +683,7 @@ def piyasa_tara_ve_islem_yap():
             p_lev = float(p.get("leverage") or 1)
             approx_margin = (p_contracts * p_entry) / p_lev if p_lev > 0 else 0
             if approx_margin >= 11.0:
-                firsat_var = true
+                firsat_var = True
                 pozisyon_tipleri[p_sym] = "opportunity"
             else:
                 scalp_var = True
@@ -711,13 +724,13 @@ def piyasa_tara_ve_islem_yap():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (Zamanlama Teyitli & Cooldown Sürüm)"})
+    return jsonify({"status": "Bot Çalışıyor (Scalp: 0.30 USDT TP / Fırsat: Dinamik Trailing Stop)"})
 
-@app.route("/otomatik-analiz")
+@app.route("/tetikle")
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Tarama ve anlık zamanlama teyidi tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
