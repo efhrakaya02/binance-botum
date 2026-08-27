@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - RAILWAY 502 ÇÖZÜMLÜ SÜRÜM
+# BINANCE FUTURES BOT - 404 VE TARAMA DÜZELTMELİ SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -32,7 +32,7 @@ SCALP_ENABLED = True
 SCALP_MARGIN = 10.0
 MAX_SCALP_POSITIONS = 1
 
-SCALP_TP_ROI = 3.0  # Kesin Hedef: %3 ROI ve üzeri olunca kapat
+SCALP_TP_ROI = 3.0  # %3 ROI ve üzeri olunca kapat
 
 OPPORTUNITY_ENABLED = True
 OPPORTUNITY_MARGIN = 10.0
@@ -89,7 +89,8 @@ def sembol_duzelt(symbol):
 
 def gecerli_kripto_mu(symbol):
     yasakli = ["UP/", "DOWN/", "BEAR/", "BULL/", "_", "BID", "ASK"]
-    if not symbol.endswith("/USDT"):
+    # CCXT Futures formatı genellikle 'BTC/USDT:USDT' veya 'BTC/USDT' şeklindedir
+    if not symbol.endswith("/USDT") and not "/USDT:" in symbol:
         return False
     for yasak in yasakli:
         if yasak in symbol:
@@ -501,6 +502,9 @@ def piyasa_tara_ve_islem_yap():
                 firsat_var = True
                 aktif_sayisi += 1
 
+# ============================================================
+# FLASK ENDPOINTLERİ (404 ÇÖZÜMLERİ)
+# ============================================================
 @app.route("/")
 def index():
     return jsonify({
@@ -508,6 +512,15 @@ def index():
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
+
+@app.route("/otomatik-analiz")
+def otomatik_analiz_tetikle():
+    # Cron veya dış servislerin tetiklemesi için eklenen endpoint
+    try:
+        threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
+        return jsonify({"success": True, "message": "Tarama arka planda tetiklendi."}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 def bot_ana_dongu():
     monitor_baslat()
@@ -519,10 +532,8 @@ def bot_ana_dongu():
         time.sleep(60)
 
 if __name__ == "__main__":
-    # Arka plan tarama döngüsünü başlat
     t = threading.Thread(target=bot_ana_dongu, daemon=True)
     t.start()
     
-    # Railway'in dinamik PORT değerini al (502 hatasını çözen kritik kısım)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
