@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - GELİŞMİŞ SİNYAL TEYİT VE KONTROL SÜRÜMÜ
+# BINANCE FUTURES BOT - KATI LİMİT VE YETİM EMİR TEMİZLİKLİ SÜRÜM
 # ============================================================
 
 app = Flask(__name__)
@@ -55,6 +55,7 @@ pozisyon_en_yuksek_kar = {}
 pozisyon_tipleri = {}
 pozisyon_kapatma_lock = threading.Lock()
 pozisyon_monitor_lock = threading.Lock()
+islem_acma_lock = threading.Lock()
 monitor_basladi = False
 
 # ============================================================
@@ -192,17 +193,15 @@ def skorla_coin(exchange, symbol):
         "direction": None, "score": 0, "atr": None, "price": None, "funding": 0
     }
     try:
-        # 1. Teyit: Fonlama Oranı (Funding Rate) Güvenlik Kontrolü
         try:
             funding_data = exchange.fetch_funding_rate(symbol)
             funding = float(funding_data.get("fundingRate", 0) or 0)
             result["funding"] = funding
             if abs(funding) >= 0.0015:
-                return None  # Aşırı fonlama riski olan coinleri eledik
+                return None
         except Exception:
             funding = 0
 
-        # Çoklu Zaman Dilimi Verilerinin Çekilmesi
         df15 = ohlcv_getir(exchange, symbol, "15m", 150)
         df1 = ohlcv_getir(exchange, symbol, "1h", 250)
         df4 = ohlcv_getir(exchange, symbol, "4h", 250)
@@ -214,24 +213,20 @@ def skorla_coin(exchange, symbol):
         price, atr = float(d15["close"]), float(d15["atr"])
         result["price"], result["atr"] = price, atr
 
-        # 2. Teyit: Volatilite ve ATR Sınırı (%10 üstü çok risklidir)
         if not np.isfinite(price) or not np.isfinite(atr) or (atr / price * 100) > 10:
             return None
 
-        # 3. Teyit: Hacim Onayı (Ortalamanın altında hacimle işlem açılmaz)
         if float(d15["volume_ratio"]) < 0.70:
             return None
 
-        # 4. Teyit: Çoklu Zaman Dilimi Trend Uyumu (4h, 1h ve 15m uyumu)
         trend4_long = (d4["close"] > d4["ema50"]) and (d4["ema50"] > d4["ema200"])
         trend4_short = (d4["close"] < d4["ema50"]) and (d4["ema50"] < d4["ema200"])
-        
         trend1_long = (d1["close"] > d1["ema50"]) and (d1["ema9"] > d1["ema21"])
         trend1_short = (d1["close"] < d1["ema50"]) and (d1["ema9"] < d1["ema21"])
         
         adx = float(d1["adx"])
         if adx < 18:
-            return None  # Yetersiz trend gücü
+            return None
 
         rsi15 = float(d15["rsi"])
         long_score, short_score = 0, 0
@@ -239,7 +234,6 @@ def skorla_coin(exchange, symbol):
         can_long = rsi15 < 72
         can_short = rsi15 > 28
 
-        # Sinyal Puanlama ve Teyit Matrisi
         if can_long:
             if trend4_long: long_score += 18
             if trend1_long: long_score += 16
@@ -265,7 +259,6 @@ def skorla_coin(exchange, symbol):
         else:
             result["direction"], result["score"] = "sell", short_score
 
-        # 5. Teyit: Yön Belirsizliği Filtresi (Long ve Short puanları birbirine çok yakınsa net değildir, iptal et)
         if abs(long_score - short_score) < 8:
             return None
 
@@ -310,62 +303,77 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not islem_izni_var_mi():
         return False
-    try:
-        leverage = kaldirac_belirle(score)
-        if not isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
-            return False
-
-        ticker = exchange.fetch_ticker(symbol)
-        price = float(ticker["last"])
-        
-        margin = SCALP_MARGIN if p_type == "scalp" else OPPORTUNITY_MARGIN
-        amount = miktar_hesapla(exchange, symbol, margin, leverage, price)
-
-        side = "buy" if direction == "buy" else "sell"
-        order = exchange.create_order(symbol, "market", side, amount, None, {"leverage": leverage})
-        
-        if order:
-            pozisyon_tipleri[symbol] = p_type
-            pozisyon_en_yuksek_kar[symbol] = 0.0
-            print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT | Kaldıraç: {leverage}x", flush=True)
+    
+    with islem_acma_lock:
+        try:
+            positions = exchange.fetch_positions()
+            active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
-            time.sleep(1)
-            try:
-                close_side = "sell" if side == "buy" else "buy"
-                
-                if side == "buy":
-                    tp_price = price * (1 + (SCALP_TP_ROI / 100) / leverage)
-                    sl_price = price * (1 - 2.5 / 100 / leverage)
-                else:
-                    tp_price = price * (1 - (SCALP_TP_ROI / 100) / leverage)
-                    sl_price = price * (1 + 2.5 / 100 / leverage)
-                
-                tp_price = float(exchange.price_to_precision(symbol, tp_price))
-                sl_price = float(exchange.price_to_precision(symbol, sl_price))
+            if len(active_positions) >= MAX_TOTAL_POSITIONS:
+                print(f"[ENGELLENDİ] Borsa üzerinde zaten {len(active_positions)} aktif pozisyon var. Yeni işlem açılmadı.", flush=True)
+                return False
 
-                exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {
-                    'stopPrice': tp_price,
-                    'reduceOnly': True
-                })
-                
-                exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
-                    'stopPrice': sl_price,
-                    'reduceOnly': True
-                })
-                print(f"[TP/SL AYARLANDI] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
-            except Exception as tp_err:
-                print(f"[TP/SL HATA] {symbol}: {tp_err}", flush=True)
+            for p in active_positions:
+                if sembol_duzelt(p.get("symbol")) == symbol:
+                    print(f"[ENGELLENDİ] {symbol} üzerinde zaten açık pozisyon mevcut.", flush=True)
+                    return False
 
-            return True
-    except Exception as e:
-        print(f"[İŞLEM AÇMA HATA] {symbol}: {e}", flush=True)
-    return False
+            leverage = kaldirac_belirle(score)
+            if not isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
+                return False
+
+            ticker = exchange.fetch_ticker(symbol)
+            price = float(ticker["last"])
+            
+            margin = SCALP_MARGIN if p_type == "scalp" else OPPORTUNITY_MARGIN
+            amount = miktar_hesapla(exchange, symbol, margin, leverage, price)
+
+            side = "buy" if direction == "buy" else "sell"
+            order = exchange.create_order(symbol, "market", side, amount, None, {"leverage": leverage})
+            
+            if order:
+                pozisyon_tipleri[symbol] = p_type
+                pozisyon_en_yuksek_kar[symbol] = 0.0
+                print(f"[İŞLEM AÇILDI] {p_type.upper()} | {symbol} {side.upper()} | Puan: {score} | Teminat: {margin} USDT | Kaldıraç: {leverage}x", flush=True)
+                
+                time.sleep(1)
+                try:
+                    close_side = "sell" if side == "buy" else "buy"
+                    
+                    if side == "buy":
+                        tp_price = price * (1 + (SCALP_TP_ROI / 100) / leverage)
+                        sl_price = price * (1 - 2.5 / 100 / leverage)
+                    else:
+                        tp_price = price * (1 - (SCALP_TP_ROI / 100) / leverage)
+                        sl_price = price * (1 + 2.5 / 100 / leverage)
+                    
+                    tp_price = float(exchange.price_to_precision(symbol, tp_price))
+                    sl_price = float(exchange.price_to_precision(symbol, sl_price))
+
+                    exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {
+                        'stopPrice': tp_price,
+                        'reduceOnly': True
+                    })
+                    
+                    exchange.create_order(symbol, 'stop_market', close_side, amount, None, {
+                        'stopPrice': sl_price,
+                        'reduceOnly': True
+                    })
+                    print(f"[TP/SL AYARLANDI] {symbol} | TP: {tp_price} | SL: {sl_price}", flush=True)
+                except Exception as tp_err:
+                    print(f"[TP/SL HATA] {symbol}: {tp_err}", flush=True)
+
+                return True
+        except Exception as e:
+            print(f"[İŞLEM AÇMA HATA] {symbol}: {e}", flush=True)
+        return False
 
 def market_pozisyon_kapat(exchange, symbol, side, amount, sebep):
     if not islem_izni_var_mi():
         return False
     with pozisyon_kapatma_lock:
         try:
+            # İşlem kapatılırken veya kapanmadan önce o coine ait tüm bekleyen ek emirleri (TP/SL) temizle
             try:
                 exchange.cancel_all_orders(symbol)
             except Exception:
@@ -378,13 +386,29 @@ def market_pozisyon_kapat(exchange, symbol, side, amount, sebep):
                 del pozisyon_en_yuksek_kar[symbol]
             if symbol in pozisyon_tipleri:
                 del pozisyon_tipleri[symbol]
-            print(f"[POZİSYON KAPATILDI] {symbol} | Sebep: {sebep}", flush=True)
+            print(f"[POZİSYON KAPATILDI] {symbol} | Sebep: {sebep} (Bekleyen ek emirler temizlendi)", flush=True)
             return True
         except Exception as e:
             print(f"[KAPATMA HATA] {symbol}: {e}", flush=True)
             return False
 
 def pozisyonlari_yonet(exchange, positions):
+    # Aktif pozisyon sembollerini takip etmek için küme oluşturuyoruz
+    aktif_semboller = {sembol_duzelt(p.get("symbol")) for p in positions if float(p.get("contracts") or 0) > 0}
+
+    # Eğer daha önceden botun hafızasında olan ancak borsada artık kontratı kalmamış (TP/SL ile kapanmış) coin varsa, ek emirlerini temizle
+    for sym in list(pozisyon_tipleri.keys()):
+        if sym not in aktif_semboller:
+            try:
+                exchange.cancel_all_orders(sym)
+                print(f"[YETİM EMİR TEMİZLİĞİ] {sym} pozisyonu kapanmış, arkada kalan ek emirler iptal edildi.", flush=True)
+            except Exception:
+                pass
+            if sym in pozisyon_tipleri:
+                del pozisyon_tipleri[sym]
+            if sym in pozisyon_en_yuksek_kar:
+                del pozisyon_en_yuksek_kar[sym]
+
     for p in positions:
         symbol = sembol_duzelt(p.get("symbol"))
         try:
@@ -437,9 +461,8 @@ def pozisyon_monitor_loop():
             if pozisyon_monitor_lock.acquire(blocking=False):
                 try:
                     positions = exchange.fetch_positions()
-                    active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
-                    if active_positions:
-                        pozisyonlari_yonet(exchange, active_positions)
+                    # Tüm pozisyonları göndererek hem kar yönetimi hem de kapanan pozisyonların emir temizliğini yap
+                    pozisyonlari_yonet(exchange, positions)
                 finally:
                     pozisyon_monitor_lock.release()
         except Exception as e:
@@ -486,10 +509,25 @@ def piyasa_tara_ve_islem_yap():
         active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
         aktif_sayisi = len(active_positions)
         
-        acik_tipler = [pozisyon_tipleri.get(sembol_duzelt(p.get("symbol"))) for p in active_positions]
-        scalp_var = "scalp" in acik_tipler
-        firsat_var = "opportunity" in acik_tipler
-    except Exception:
+        scalp_var = False
+        firsat_var = False
+        
+        for p in active_positions:
+            p_sym = sembol_duzelt(p.get("symbol"))
+            p_contracts = float(p.get("contracts") or 0)
+            p_entry = float(p.get("entryPrice") or 0)
+            p_lev = float(p.get("leverage") or 1)
+            approx_margin = (p_contracts * p_entry) / p_lev if p_lev > 0 else 0
+            
+            if approx_margin >= 11.0:
+                firsat_var = True
+                pozisyon_tipleri[p_sym] = "opportunity"
+            else:
+                scalp_var = True
+                pozisyon_tipleri[p_sym] = "scalp"
+                
+    except Exception as e:
+        print(f"[POZİSYON SORGULAMA HATA]: {e}", flush=True)
         active_positions = []
         aktif_sayisi = 0
         scalp_var, firsat_var = False, False
@@ -535,7 +573,7 @@ def piyasa_tara_ve_islem_yap():
             p_entry = float(p.get("entryPrice") or 0)
             p_mark = float(p.get("markPrice") or 0)
             p_lev = float(p.get("leverage") or 1)
-            p_type_val = pozisyon_tipleri.get(p_sym, "bilinmiyor").upper()
+            p_type_val = pozisyon_tipleri.get(p_sym, "BİLİNMİYOR").upper()
             
             if p_side == "LONG":
                 p_roi = ((p_mark - p_entry) / p_entry) * 100 * p_lev
@@ -554,8 +592,13 @@ def piyasa_tara_ve_islem_yap():
         return
 
     for aday in adaylar:
-        if aktif_sayisi >= MAX_TOTAL_POSITIONS:
-            break
+        try:
+            current_check_pos = exchange.fetch_positions()
+            active_check_count = len([p for p in current_check_pos if float(p.get("contracts") or 0) > 0])
+            if active_check_count >= MAX_TOTAL_POSITIONS:
+                break
+        except Exception:
+            pass
 
         s = aday["symbol"]
         score = aday["score"]
@@ -577,7 +620,7 @@ def piyasa_tara_ve_islem_yap():
 @app.route("/")
 def index():
     return jsonify({
-        "status": "Bot Kesintisiz Çalışıyor (Teyitli Sinyal Motoru Aktif)", 
+        "status": "Bot Kesintisiz Çalışıyor (Yetim Emir Temizliği Aktif)", 
         "trading_enabled": TRADING_ENABLED, 
         "monitor_active": POSITION_MONITOR_ENABLED
     })
@@ -586,7 +629,7 @@ def index():
 def otomatik_analiz_tetikle():
     try:
         threading.Thread(target=piyasa_tara_ve_islem_yap, daemon=True).start()
-        return jsonify({"success": True, "message": "Çoklu teyitli tarama tetiklendi."}), 200
+        return jsonify({"success": True, "message": "Emir temizlikli tarama tetiklendi."}), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
