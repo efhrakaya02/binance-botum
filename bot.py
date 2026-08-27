@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 
 # ============================================================
-# BINANCE FUTURES BOT - GÜNCELLENMİŞ 15M & ATR STOP & %3 TP SÜRÜMÜ
+# BINANCE FUTURES BOT - GAINERS/LOSERS (İLK 25'ER) 15M SÜRÜMÜ
 # ============================================================
 
 app = Flask(__name__)
@@ -188,7 +188,6 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
         return teknik_indikatorleri_hesapla(df)
     except Exception as e:
-        print(f"[OHLCV HATA] {symbol} {timeframe}: {e}", flush=True)
         return None
 
 # ============================================================
@@ -271,7 +270,6 @@ def skorla_coin(exchange, symbol):
 
         return result
     except Exception as e:
-        print(f"[SKOR HATA] {symbol}: {e}", flush=True)
         return None
 
 # ============================================================
@@ -306,7 +304,6 @@ def isolated_ve_kaldirac_ayarla(exchange, symbol, leverage):
         exchange.set_leverage(leverage, symbol)
         return True
     except Exception as e:
-        print(f"[LEVERAGE HATA] {symbol}: {e}", flush=True)
         return False
 
 # ============================================================
@@ -386,14 +383,12 @@ def pozisyonlari_yonet(exchange, positions):
 
             print(f"[MONITOR] {symbol} ({p_type}) | ROI: %{roi:.2f} | Max Kar: %{current_max:.2f}", flush=True)
 
-            # ================= SCALP MODU (%3 HEDEF & ATR STOP) =================
             if p_type == "scalp":
                 if roi >= SCALP_TP_ROI:
                     market_pozisyon_kapat(exchange, symbol, "buy" if side == "long" else "sell", contracts, f"Scalp TP Hedefi Ulaşıldı (%{roi:.2f})")
                 elif roi <= -2.5: 
                     market_pozisyon_kapat(exchange, symbol, "buy" if side == "long" else "sell", contracts, f"Scalp ATR Stop Loss (%{roi:.2f})")
 
-            # ================= FIRSAT MODU (KAR KİLİTLEME) =================
             elif p_type == "opportunity":
                 if current_max >= 3.0 and roi <= (current_max * 0.65):
                     market_pozisyon_kapat(exchange, symbol, "buy" if side == "long" else "sell", contracts, f"Fırsat Kar Kilitleme (Max: %{current_max:.2f})")
@@ -401,7 +396,7 @@ def pozisyonlari_yonet(exchange, positions):
                     market_pozisyon_kapat(exchange, symbol, "buy" if side == "long" else "sell", contracts, "Fırsat Acil Stop Loss")
 
         except Exception as e:
-            print(f"[YÖNETİM HATA] {symbol}: {e}", flush=True)
+            pass
 
 # ============================================================
 # POZİSYON MONİTÖR LOOP
@@ -429,7 +424,6 @@ def pozisyon_monitor_loop():
                 finally:
                     pozisyon_monitor_lock.release()
         except Exception as e:
-            print(f"[MONITOR HATA] {e}", flush=True)
             exchange = None
         time.sleep(POSITION_MONITOR_INTERVAL)
 
@@ -439,17 +433,36 @@ def monitor_baslat():
         thread.start()
 
 # ============================================================
-# ANA TARAMA DÖNGÜSÜ
+# ANA TARAMA DÖNGÜSÜ (GAINERS / LOSERS İLK 25'ER COİN)
 # ============================================================
 def piyasa_tara_ve_islem_yap():
     exchange = get_exchange()
     try:
         exchange.load_markets()
-    except Exception:
+        
+        tickers = exchange.fetch_tickers()
+        coin_listesi = []
+        
+        for symbol, ticker in tickers.items():
+            if gecerli_kripto_mu(symbol):
+                yuzde_degisim = ticker.get("percentage", 0) or 0
+                coin_listesi.append({
+                    "symbol": symbol, 
+                    "change": float(yuzde_degisim)
+                })
+                
+        # Yüzde değişimine göre sırala (En çok artandan en çok düşene)
+        coin_listesi.sort(key=lambda x: x["change"], reverse=True)
+        
+        # En çok yükselen ilk 25 ve en çok düşen ilk 25 coin (Toplam 50 coinlik hedef havuz)
+        gainers = [item["symbol"] for item in coin_listesi[:25]]
+        losers = [item["symbol"] for item in coin_listesi[-25:]]
+        hedef_coini_listesi = list(set(gainers + losers))
+        
+    except Exception as e:
+        print(f"[PİYASA LİSTE HATA]: {e}", flush=True)
         return
 
-    symbols = [s for s in exchange.symbols if gecerli_kripto_mu(s)]
-    
     try:
         positions = exchange.fetch_positions()
         active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
@@ -466,7 +479,7 @@ def piyasa_tara_ve_islem_yap():
         return
 
     adaylar = []
-    for symbol in symbols:
+    for symbol in hedef_coini_listesi:
         if cooldown_aktif_mi(symbol):
             continue
         res = skorla_coin(exchange, symbol)
@@ -496,7 +509,11 @@ def piyasa_tara_ve_islem_yap():
 
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Çalışıyor (15M & ATR Stop)", "trading_enabled": TRADING_ENABLED, "monitor_active": POSITION_MONITOR_ENABLED})
+    return jsonify({
+        "status": "Bot Çalışıyor (Gainers/Losers İlk 25'er Havuz)", 
+        "trading_enabled": TRADING_ENABLED, 
+        "monitor_active": POSITION_MONITOR_ENABLED
+    })
 
 def bot_ana_dongu():
     monitor_baslat()
