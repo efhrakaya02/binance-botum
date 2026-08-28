@@ -112,6 +112,50 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=50):
         return None
 
 # ============================================================
+# REGRESYON TRENDİ VE YÖN TEYİT KONTROLÜ
+# ============================================================
+def regresyon_trend_teyidi(df, direction, periyot=20):
+    """
+    Lineer Regresyon eğimini (slope) ve fiyatın regresyon doğrusuna göre 
+    konumunu hesaplayarak detaylı teyit raporu ve onay döner.
+    """
+    if df is None or len(df) < periyot:
+        return False, "Yetersiz veri uzunluğu nedeniyle regresyon hesaplanamadı."
+
+    closes = df["close"].iloc[-periyot:].values
+    x = np.arange(periyot)
+    
+    # Lineer Regresyon Katsayıları (Eğim ve Kesişim)
+    slope, intercept = np.polyfit(x, closes, 1)
+    
+    # Anlık fiyat ve regresyon orta nokta değeri
+    anlik_fiyat = closes[-1]
+    regresyon_orta = intercept + slope * (periyot - 1)
+    
+    # Açıklayıcı detay log metni oluşturma
+    detay_aciklama = (
+        f"[REGRESYON ANALİZİ] Eğim (Slope): {slope:.4f} | "
+        f"Anlık Fiyat: {anlik_fiyat:.4f} | Regresyon Çizgi Değeri: {regresyon_orta:.4f} | "
+        f"Hedef Yön: {direction.upper()}"
+    )
+
+    if direction == "buy":
+        # Yükselen trend teyidi: Eğim pozitif olmalı ve fiyat regresyon çizgisinin üstünde veya toparlanma eğiliminde olmalı
+        if slope > 0 and anlik_fiyat >= (regresyon_orta * 0.998):
+            return True, f"{detay_aciklama} -> ONAYLANDI: Regresyon eğimi pozitif yukarı yönlü ve fiyat kanal destek/orta çizgisine uyumlu."
+        else:
+            return False, f"{detay_aciklama} -> REDDEDİLDİ: Yükseliş için regresyon eğimi yeterince pozitif değil veya fiyat kanal altında."
+            
+    elif direction == "sell":
+        # Düşen trend teyidi: Eğim negatif olmalı ve fiyat regresyon çizgisinin altında veya baskı altında olmalı
+        if slope < 0 and anlik_fiyat <= (regresyon_orta * 1.002):
+            return True, f"{detay_aciklama} -> ONAYLANDI: Regresyon eğimi negatif aşağı yönlü ve fiyat kanal baskı çizgisine uyumlu."
+        else:
+            return False, f"{detay_aciklama} -> REDDEDİLDİ: Düşüş için regresyon eğimi yeterince negatif değil veya fiyat kanal üstünde."
+
+    return False, "Geçersiz yön parametresi."
+
+# ============================================================
 # PULLBACK VE FAKEOUT KORUMA TEYİDİ
 # ============================================================
 def check_pullback_and_confirmation(df, direction):
@@ -455,39 +499,57 @@ def ana_tarama_dongusu():
             aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
             aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
             
+            # A) FIRSAT MODU: Takipten işleme geçiş ve Regresyon Trendi Teyidi
             if not aktif_firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
                     dir_val = candidate['direction']
                     df_check = candidate.get('df')
                     
-                    if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
-                        logging.info(f"[FIRSAT TEYİT ALINDI] {sym} için pullback onayı sağlandı, işleme giriliyor...")
-                        basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
-                        if basarili:
-                            break
-                        else:
-                            logging.info(f"[FIRSAT ATLANDI] {sym} sınıra takıldı, sonraki adaya geçiliyor...")
-                            continue
-                    else:
-                        logging.info(f"[FIRSAT TAKİPTE] {sym} izleniyor, henüz teyit oluşmadı.")
+                    if df_check is not None:
+                        # 1. Pullback Kontrolü
+                        pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
+                        # 2. Regresyon Trendi Yön Teyidi
+                        reg_ok, reg_mesaj = regresyon_trend_teyidi(df_check, dir_val)
+                        
+                        logging.info(f"[FIRSAT ANALİZ RAPORU] {sym} | {reg_mesaj}")
 
+                        if pullback_ok and reg_ok:
+                            logging.info(f"[FIRSAT ONAYLANDI] {sym} için hem pullback hem de regresyon trend teyidi sağlandı. İşleme giriliyor...")
+                            basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
+                            if basarili:
+                                break
+                            else:
+                                logging.info(f"[FIRSAT ATLANDI] {sym} kural sınırına/bakiyeye takıldı, sonrakine geçiliyor.")
+                                continue
+                        else:
+                            logging.info(f"[FIRSAT BEKLEMEDE] {sym} takip listesinde izleniyor, henüz tüm teyitler sağlanamadı.")
+
+            # B) SCALP MODU: Adayları tarama ve Regresyon Trendi Teyidi
             if not aktif_scalp_var and scalp_listesi:
                 for candidate in scalp_listesi:
                     sym = candidate['symbol']
                     dir_val = candidate['direction']
                     df_check = candidate.get('df')
                     
-                    if df_check is not None and check_pullback_and_confirmation(df_check, dir_val):
-                        logging.info(f"[SCALP TEYİT ALINDI] {sym} işleme alınıyor...")
-                        basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
-                        if basarili:
-                            break
+                    if df_check is not None:
+                        # 1. Pullback Kontrolü
+                        pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
+                        # 2. Regresyon Trendi Yön Teyidi
+                        reg_ok, reg_mesaj = regresyon_trend_teyidi(df_check, dir_val)
+                        
+                        logging.info(f"[SCALP ANALİZ RAPORU] {sym} | {reg_mesaj}")
+
+                        if pullback_ok and reg_ok:
+                            logging.info(f"[SCALP ONAYLANDI] {sym} için regresyon trend teyidi alındı. İşleme alınıyor...")
+                            basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
+                            if basarili:
+                                break
+                            else:
+                                logging.info(f"[SCALP ATLANDI] {sym} kural sınırına/bakiyeye takıldı, sonrakine geçiliyor.")
+                                continue
                         else:
-                            logging.info(f"[SCALP ATLANDI] {sym} sınıra takıldı, sonraki adaya geçiliyor...")
-                            continue
-                    else:
-                        logging.info(f"[SCALP BEKLİYOR] {sym} için teyit bekleniyor.")
+                            logging.info(f"[SCALP BEKLEMEDE] {sym} için trend teyidi bekleniyor.")
 
             # Bellek Temizliği (Garbage Collection & DataFrame Freeing)
             for item in scalp_listesi:
