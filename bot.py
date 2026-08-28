@@ -370,7 +370,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE İŞLEM BÜYÜKLÜĞÜNE DAYALI ROI TRAILING STOP
+# POZİSYON MONİTÖRÜ VE BİNANCE STANDART KALDIRAÇLI ROI TRAILING STOP
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -402,18 +402,11 @@ def pozisyonlari_yonet(exchange, positions):
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # KESİN VE DOĞRU HESAPLAMA: İşlem büyüklüğü (notional) ve kaldıraçlı teminat bazlı net ROI
-            notional_deger = contracts * mark_price
-            baslangic_teminati = (contracts * entry_price) / leverage
-            
-            if baslangic_teminati > 0:
-                if side == "long":
-                    net_kar_usdt = notional_deger - (contracts * entry_price)
-                else:
-                    net_kar_usdt = (contracts * entry_price) - notional_deger
-                roi = (net_kar_usdt / baslangic_teminati) * 100
+            # BİNANCE STANDART KALDIRAÇLI ROI FORMÜLÜ (Fiyat değişimi * Kaldıraç)
+            if side == "long":
+                roi = ((mark_price - entry_price) / entry_price) * 100 * leverage
             else:
-                roi = 0.0
+                roi = ((entry_price - mark_price) / entry_price) * 100 * leverage
             
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max:
@@ -422,7 +415,7 @@ def pozisyonlari_yonet(exchange, positions):
 
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
-            # Fırsat Modu İçin Gerçek İşlem Büyüklüğü ROI Zirvesinden %3 Geri Çekilmeli Trailing Stop
+            # Fırsat Modu İçin Kaldıraçlı ROI Zirvesinden %3 Geri Çekilmeli Trailing Stop
             if p_type == "opportunity":
                 yeni_sl = None
                 hedef_roi_koruma = 0.0
@@ -639,12 +632,7 @@ def durum():
             lev = float(p.get("leverage", 1))
             side = p.get("side")
             
-            contracts = float(p.get("contracts", 0))
-            notional = contracts * mark
-            baslangic_teminat = (contracts * entry) / lev if lev > 0 else 1
-            net_kar = (notional - (contracts * entry)) if side == "long" else ((contracts * entry) - notional)
-            roi = (net_kar / baslangic_teminat) * 100 if baslangic_teminat > 0 else 0.0
-            
+            roi = ((mark - entry) / entry) * 100 * lev if side == "long" else ((entry - mark) / entry) * 100 * lev
             max_kar = pozisyon_en_yuksek_kar.get(sym, 0.0)
             
             detaylar.append({
