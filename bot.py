@@ -402,7 +402,6 @@ def pozisyonlari_yonet(exchange, positions):
             leverage = float(p.get("leverage") or 1)
             if entry_price == 0 or mark_price == 0: continue
 
-            # Bot yeniden başlarsa state kaybında "bilinmiyor" olabilir, fırlatmayalım.
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
             # 1. Binance net ROI hesabını doğrudan API'den veya formülden al
@@ -423,8 +422,6 @@ def pozisyonlari_yonet(exchange, positions):
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Binance Net ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
             # Fırsat Modu İçin Kademeli ve Zirveden Geri Çekilmeli Trailing Stop Mantığı
-            # Bot yeniden başlatıldığında pozisyon türü bilinmiyorsa fırsat modu kuralları uygulansın diye default kabul edilebilir 
-            # Ancak biz mevcut state yapısını bozmuyoruz.
             if p_type == "opportunity" or p_type == "bilinmiyor":
                 yeni_sl = None
                 log_aciklama = ""
@@ -444,23 +441,32 @@ def pozisyonlari_yonet(exchange, positions):
 
                 # KURAL 2: %5 ile %15 Arası -> Kademeli Yükseltme ve Giriş Üstüne Taşıma
                 elif current_max >= 5.0:
-                    # %5 ile %15 arasındaki ilerlemeye göre stobu oransal olarak girişe ve üstüne çekiyoruz
-                    # İlerleme oranı: (%5 ile current_max arasındaki mesafe / 10) -> %5'te 0, %15'te 1.0 (Tam koruma/giriş üstü)
                     oran = (current_max - 5.0) / 10.0
                     
                     if side == "long":
-                        # Giriş fiyatı ile anlık fiyat arasındaki mesafenin oranına göre ara kademe stop
                         yeni_sl = entry_price + ((mark_price - entry_price) * oran * 0.5)
-                        if yeni_sl < entry_price: yeni_sl = entry_price # En azından başa başa sabitle
+                        if yeni_sl < entry_price: yeni_sl = entry_price
                     else:
                         yeni_sl = entry_price - ((entry_price - mark_price) * oran * 0.5)
                         if yeni_sl > entry_price: yeni_sl = entry_price
                         
                     log_aciklama = f"KADEMELİ GEÇİŞ (%5-%15) | Zirve ROI: %{current_max:.2f} | Oran: %{oran*100:.1f}"
 
-                # Yeni bir SL seviyesi hesaplandıysa emri güncelle
+                # Yeni bir SL seviyesi hesaplandıysa emri güvenli şekilde güncelle
                 if yeni_sl is not None:
                     try:
+                        # ========================================================
+                        # GÜVENLİK FİLTRESİ: "Order would immediately trigger" Koruması
+                        # ========================================================
+                        guvenli_marj = mark_price * 0.001  # %0.1 güvenlik payı
+                        if side == "long" and yeni_sl >= mark_price:
+                            logging.warning(f"[STOP GÜNCELLEME ATLANDI] {symbol} | Long stop fiyatı ({yeni_sl}) anlık fiyata ({mark_price}) eşit veya büyük. Hemen tetikleneceği için iptal edildi.")
+                            continue
+                        elif side == "short" and yeni_sl <= mark_price:
+                            logging.warning(f"[STOP GÜNCELLEME ATLANDI] {symbol} | Short stop fiyatı ({yeni_sl}) anlık fiyata ({mark_price}) eşit veya küçük. Hemen tetikleneceği için iptal edildi.")
+                            continue
+                        # ========================================================
+
                         exchange.cancel_all_orders(symbol)
                         time.sleep(0.5)
                         
