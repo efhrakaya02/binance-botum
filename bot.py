@@ -373,7 +373,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE DOĞRUDAN (ROI YÜZDESİ * KALDIRAÇ) TRAILING STOP
+# POZİSYON MONİTÖRÜ VE KALDIRACA GÖRE ÖLÇEKLENMİŞ TRAILING STOP
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -405,33 +405,40 @@ def pozisyonlari_yonet(exchange, positions):
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # DOĞRUDAN KALDIRAÇLI ROI HESABI = (Fiyat Değişim Oranı * 100 * Kaldıraç)
-            if side == "long":
-                roi = ((mark_price - entry_price) / entry_price) * 100 * leverage
+            # Binance'in doğrudan API üzerinden döndürdüğü kaldıraçlı net ROI değeri
+            api_percentage = p.get("percentage")
+            if api_percentage is not None:
+                roi = float(api_percentage)
             else:
-                roi = ((entry_price - mark_price) / entry_price) * 100 * leverage
+                initial_margin = float(p.get("initialMargin") or ( (contracts * entry_price) / leverage ))
+                unrealized_pnl = float(p.get("unrealizedPnl") or 0.0)
+                roi = (unrealized_pnl / initial_margin) * 100 if initial_margin > 0 else 0.0
             
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max:
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
 
-            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Kaldıraçlı ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
+            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Binance Net ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
-            # Fırsat Modu İçin Kaldıraçlı ROI Zirvesinden %3 Geri Çekilmeli Trailing Stop
+            # Fırsat Modu İçin Zirveden Geri Çekilme (Kaldıraca Bölünmüş Fiyat Ölçeği)
             if p_type == "opportunity":
                 yeni_sl = None
                 hedef_roi_koruma = 0.0
                 
-                # ROI zirvesi %10 ve üzerine çıktıysa: Zirve ROI'den tam %3 geriye esneme payı ver
+                # ROI zirvesi %10 ve üzerine çıktıysa: Zirve ROI'den %3 geriye esneme
                 if current_max >= 10.0:
                     hedef_roi_koruma = current_max - 3.0
+                    
+                    # Kaldıraca bölünmüş fiyat değişim oranı
+                    fiyat_degisim_orani = (hedef_roi_koruma / 100.0) / leverage
+                    
                     if side == "long":
-                        yeni_sl = entry_price * (1 + (hedef_roi_koruma / (100.0 * leverage)))
+                        yeni_sl = entry_price * (1 + fiyat_degisim_orani)
                         if yeni_sl < entry_price:
                             yeni_sl = entry_price
                     else: # short
-                        yeni_sl = entry_price * (1 - (hedef_roi_koruma / (100.0 * leverage)))
+                        yeni_sl = entry_price * (1 - fiyat_degisim_orani)
                         if yeni_sl > entry_price:
                             yeni_sl = entry_price
                             
@@ -460,7 +467,7 @@ def pozisyonlari_yonet(exchange, positions):
                                 'workingType': 'MARK_PRICE'
                             }
                         )
-                        logging.info(f"[ROI ZİRVE TRAILING GÜNCELLENDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Hedef Koruma ROI: %{hedef_roi_koruma:.2f} | Yeni SL Fiyatı: {precision_sl}")
+                        logging.info(f"[ROI ZİRVE TRAILING GÜNCELLENDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Hedef Koruma ROI: %{hedef_roi_koruma:.2f} | Kaldıraç: {leverage}x | Yeni SL Fiyatı: {precision_sl}")
                     except Exception as ex:
                         logging.error(f"[TRAILING STOP HATA] {symbol} emir güncellenemedi: {ex}")
 
@@ -635,7 +642,9 @@ def durum():
             lev = float(p.get("leverage", 1))
             side = p.get("side")
             
-            roi = ((mark - entry) / entry) * 100 * lev if side == "long" else ((entry - mark) / entry) * 100 * lev
+            # Doğrudan Binance'in hesapladığı net yüzdeyi (ROI) al
+            api_percentage = p.get("percentage")
+            roi = float(api_percentage) if api_percentage is not None else 0.0
             max_kar = pozisyon_en_yuksek_kar.get(sym, 0.0)
             
             detaylar.append({
@@ -645,7 +654,7 @@ def durum():
                 "giris_fiyati": entry,
                 "anlik_fiyat": mark,
                 "kaldirac": lev,
-                "roi_yuzde": round(roi, 2),
+                "binance_net_roi_yuzde": round(roi, 2),
                 "max_gorulen_kar": round(max_kar, 2)
             })
             
