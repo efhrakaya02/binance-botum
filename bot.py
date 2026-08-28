@@ -74,6 +74,9 @@ def gecerli_kripto_mu(symbol):
     yasakli = ["UP/", "DOWN/", "BEAR/", "BULL/", "_", "BID", "ASK"]
     if not symbol.endswith("/USDT") and not "/USDT:" in symbol:
         return False
+    # BTC ve XAU türevlerini/kontratlarını analiz dışı bırak
+    if "BTC" in symbol or "XAU" in symbol:
+        return False
     for yasak in yasakli:
         if yasak in symbol:
             return False
@@ -190,7 +193,7 @@ def scan_scalp_market(exchange):
             key=lambda x: float(x.get('quoteVolume', 0) or 0), 
             reverse=True
         )
-        top_symbols = [t['symbol'] for t in sorted_tickers[:20]]
+        top_symbols = [t['symbol'] for t in sorted_tickers[:25]]
         
         candidates = []
         for symbol in top_symbols:
@@ -237,7 +240,7 @@ def scan_opportunity_market(exchange):
         tickers = exchange.fetch_tickers()
         usdt_tickers = [t for t in tickers.values() if gecerli_kripto_mu(t['symbol']) and t.get('percentage') is not None]
         
-        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:15]
+        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:20]
         losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:10]
         target_pool = list(set([t['symbol'] for t in gainers + losers]))
         
@@ -370,7 +373,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE BİNANCE STANDART KALDIRAÇLI ROI TRAILING STOP
+# POZİSYON MONİTÖRÜ VE DOĞRUDAN (ROI YÜZDESİ * KALDIRAÇ) TRAILING STOP
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -402,7 +405,7 @@ def pozisyonlari_yonet(exchange, positions):
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # BİNANCE STANDART KALDIRAÇLI ROI FORMÜLÜ (Fiyat değişimi * Kaldıraç)
+            # ROI HESABI = (Fiyat Değişim Yüzdesi) * Kaldıraç
             if side == "long":
                 roi = ((mark_price - entry_price) / entry_price) * 100 * leverage
             else:
@@ -420,7 +423,7 @@ def pozisyonlari_yonet(exchange, positions):
                 yeni_sl = None
                 hedef_roi_koruma = 0.0
                 
-                # Kaldıraçlı ROI zirvesi %10 ve üzerine çıktıysa: Zirve ROI'den tam %3 geriye esneme payı ver
+                # ROI zirvesi %10 ve üzerine çıktıysa: Zirve ROI'den tam %3 geriye esneme payı ver
                 if current_max >= 10.0:
                     hedef_roi_koruma = current_max - 3.0
                     if side == "long":
@@ -432,7 +435,7 @@ def pozisyonlari_yonet(exchange, positions):
                         if yeni_sl > entry_price:
                             yeni_sl = entry_price
                             
-                # Kaldıraçlı ROI %5 ile %10 arasındaysa: Başa baş (Breakeven) noktasına sabitle
+                # ROI %5 ile %10 arasındaysa: Başa baş (Breakeven) noktasına sabitle
                 elif current_max >= 5.0:
                     yeni_sl = entry_price
 
