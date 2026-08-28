@@ -189,7 +189,7 @@ def check_pullback_and_confirmation(df, direction):
     return False
 
 # ============================================================
-# TARAMA FONKSİYONLARI
+# TARAMA FONKSİYONLARI (İLK 5 ADAY)
 # ============================================================
 def scan_scalp_market(exchange):
     try:
@@ -436,7 +436,7 @@ def monitor_baslat():
         threading.Thread(target=pozisyon_monitor_loop, daemon=True, name="PositionMonitor").start()
 
 # ============================================================
-# ANA HİBRİT ÇALIŞMA DÖNGÜSÜ VE ANLIK LOGLAMA
+# ANA HİBRİT ÇALIŞMA DÖNGÜSÜ VE SIRALI PUANLAMA/TEYİT
 # ============================================================
 def ana_tarama_dongusu():
     global son_detayli_analiz_raporu
@@ -468,24 +468,25 @@ def ana_tarama_dongusu():
                 else:
                     aktif_firsat_var = True
 
-            # 1. FIRSAT KONTROLÜ
+            # 1. FIRSAT KONTROLÜ VE PUANLAMA LİSTESİ
             if not aktif_firsat_var:
                 msg = "Fırsat pozisyonu eksik, Fırsat pazarı (Gainers/Losers) taranıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
                 firsat_listesi = scan_opportunity_market(exchange)
-                logging.info(f"[FIRSAT TARAMA] Tespit edilen aday sayısı: {len(firsat_listesi)}")
+                logging.info(f"[FIRSAT PUANLAMA LİSTESİ] En yüksek puan alan ilk {len(firsat_listesi)} aday:")
                 
-                for cand in firsat_listesi:
+                for i, cand in enumerate(firsat_listesi, 1):
                     firsat_takip.append({
                         "symbol": cand['symbol'],
                         "skor": cand['score'],
                         "yon": cand['direction']
                     })
-                    logging.info(f"   -> Fırsat Adayı: {cand['symbol']} | Yön: {cand['direction'].upper()} | Skor: {cand['score']}")
+                    logging.info(f"   {i}. Fırsat Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']}")
 
                 if firsat_listesi:
+                    # En yüksek puandan başlayarak (sırayla) teyit süzgecinden geçirilir
                     for candidate in firsat_listesi:
                         sym = candidate['symbol']
                         dir_val = candidate['direction']
@@ -495,12 +496,12 @@ def ana_tarama_dongusu():
                             pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
                             reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=20)
 
-                            detay_str = f"Fırsat Teyit [{sym}] -> Pullback: {pullback_ok} | {reg_mesaj}"
+                            detay_str = f"Fırsat Teyit Süzgeci [{sym}] (Puan: {candidate['score']}) -> Pullback: {pullback_ok} | {reg_mesaj}"
                             logging.info(f"   {detay_str}")
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok:
-                                basari_mesaji = f"[FIRSAT ONAYLANDI] {sym} için tüm şartlar sağlandı, pozisyon açılıyor..."
+                                basari_mesaji = f"[FIRSAT ONAYLANDI] {sym} en doğru zamanda şartları sağladı, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
@@ -515,24 +516,25 @@ def ana_tarama_dongusu():
                 logging.info(msg)
                 aciklama_loglari.append(msg)
 
-            # 2. SCALP KONTROLÜ
+            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ
             if not aktif_scalp_var:
                 msg = "Scalp pozisyonu eksik, Scalp pazarı (Top Volume) taranıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
                 scalp_listesi = scan_scalp_market(exchange)
-                logging.info(f"[SCALP TARAMA] Tespit edilen aday sayısı: {len(scalp_listesi)}")
+                logging.info(f"[SCALP PUANLAMA LİSTESİ] En yüksek puan alan ilk {len(scalp_listesi)} aday:")
                 
-                for cand in scalp_listesi:
+                for i, cand in enumerate(scalp_listesi, 1):
                     scalp_takip.append({
                         "symbol": cand['symbol'],
                         "skor": cand['score'],
                         "yon": cand['direction']
                     })
-                    logging.info(f"   -> Scalp Adayı: {cand['symbol']} | Yön: {cand['direction'].upper()} | Skor: {cand['score']}")
+                    logging.info(f"   {i}. Scalp Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']}")
 
                 if scalp_listesi:
+                    # En yüksek puandan başlayarak (sırayla) teyit süzgecinden geçirilir
                     for candidate in scalp_listesi:
                         sym = candidate['symbol']
                         dir_val = candidate['direction']
@@ -542,12 +544,12 @@ def ana_tarama_dongusu():
                             pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
                             reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=12)
 
-                            detay_str = f"Scalp Teyit [{sym}] -> Pullback: {pullback_ok} | {reg_mesaj}"
+                            detay_str = f"Scalp Teyit Süzgeci [{sym}] (Puan: {candidate['score']}) -> Pullback: {pullback_ok} | {reg_mesaj}"
                             logging.info(f"   {detay_str}")
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok:
-                                basari_mesaji = f"[SCALP ONAYLANDI] {sym} için tüm şartlar sağlandı, pozisyon açılıyor..."
+                                basari_mesaji = f"[SCALP ONAYLANDI] {sym} en doğru zamanda şartları sağladı, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
@@ -579,7 +581,7 @@ def ana_tarama_dongusu():
         finally:
             gc.collect()
             
-        logging.info(">>> TARAMA DÖNGÜSÜ TAMAMLANDI, 1 DAKİKA BEKLENİYOR <<<")
+        logging.info(">>> TARAMA DÖNGÜSÜ TAMAMLANDI, 2 DAKİKA BEKLENİYOR <<<")
         time.sleep(120)
 
 # ============================================================
