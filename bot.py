@@ -103,7 +103,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=50):
         
         high_low = df["high"] - df["low"]
         high_close = abs(df["high"] - df["close"].shift())
-        low_close = abs(df["low"] - df["low"].shift())
+        low_close = abs(df["low"] - df["close"].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
         
@@ -345,7 +345,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 logging.info(f"[ İŞLEM AÇILDI ] {p_type.upper()} | {symbol} {side.upper()} | Giriş: {price} | Skor: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x")
                 
-                time.sleep(1)
+                time.sleep(1.5)
                 try:
                     close_side = "sell" if side == "buy" else "buy"
                     df_temp = ohlcv_getir(exchange, symbol, "30m", 20)
@@ -357,20 +357,20 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
                         sl_price = (price - (atr * 2.0)) if side == "buy" else (price + (atr * 2.0))
                         
-                        exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True})
-                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True})
+                        exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
+                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                     else:
                         sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5))
-                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True})
-                except Exception:
-                    pass
+                        exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
+                except Exception as e:
+                    logging.error(f"İlk SL/TP emirleri atılamadı: {e}")
                 return True
         except Exception as e:
             logging.error(f"İşlem açma hata {symbol}: {e}")
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE ZİRVE TAKİPLİ TRAILING STOP SİSTEMİ
+# POZİSYON MONİTÖRÜ VE KALDIRAÇLI ROI ZİRVESİNDEN TRAILING STOP
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -402,7 +402,7 @@ def pozisyonlari_yonet(exchange, positions):
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # Anlık ROI Hesaplama
+            # Kaldıraçlı Toplam ROI Hesaplama (Net Getiri Yüzdesi)
             roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
             
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
@@ -410,20 +410,18 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
 
-            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Zirve Kar: %{current_max:.2f}")
+            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
-            # Fırsat Modu İçin Zirve Takipli Trailing Stop Mekanizması
+            # Fırsat Modu İçin Kaldıraçlı ROI Zirvesinden %3 Geri Çekilmeli Trailing Stop
             if p_type == "opportunity":
                 yeni_sl = None
+                hedef_roi_koruma = 0.0
                 
-                # Kar %10 ve üzerine çıktıysa: Zirveden %3 geri çekilme toleransıyla kar kilitleme
+                # Kaldıraçlı ROI zirvesi %10 ve üzerine çıktıysa: Zirve ROI'den tam %3 geriye esneme payı ver
                 if current_max >= 10.0:
-                    # Zirve ROI değerine karşılık gelen hedef fiyatı hesapla
-                    # Örn: Long için giriş * (1 + (zirve_roi - %3) / (100 * kaldıraç))
                     hedef_roi_koruma = current_max - 3.0
                     if side == "long":
                         yeni_sl = entry_price * (1 + (hedef_roi_koruma / (100.0 * leverage)))
-                        # Güvenlik: Zirveden geri çekilme stopu asla giriş fiyatının altına düşemez
                         if yeni_sl < entry_price:
                             yeni_sl = entry_price
                     else: # short
@@ -431,7 +429,7 @@ def pozisyonlari_yonet(exchange, positions):
                         if yeni_sl > entry_price:
                             yeni_sl = entry_price
                             
-                # Kar %5 ile %10 arasındaysa: Başa baş (Breakeven) noktasına sabitle
+                # Kaldıraçlı ROI %5 ile %10 arasındaysa: Başa baş (Breakeven) noktasına sabitle
                 elif current_max >= 5.0:
                     yeni_sl = entry_price
 
@@ -439,10 +437,24 @@ def pozisyonlari_yonet(exchange, positions):
                 if yeni_sl is not None:
                     try:
                         exchange.cancel_all_orders(symbol)
+                        time.sleep(0.5)
+                        
                         close_side = "sell" if side == "long" else "buy"
                         precision_sl = float(exchange.price_to_precision(symbol, yeni_sl))
-                        exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {'stopPrice': precision_sl, 'reduceOnly': True})
-                        logging.info(f"[ZİRVE TRAILING STOP GÜNCELLENDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Yeni Borsaya Yazılan SL: {precision_sl}")
+                        
+                        exchange.create_order(
+                            symbol, 
+                            'stop_market', 
+                            close_side, 
+                            contracts, 
+                            None, 
+                            {
+                                'stopPrice': precision_sl, 
+                                'reduceOnly': True,
+                                'workingType': 'MARK_PRICE'
+                            }
+                        )
+                        logging.info(f"[ROI ZİRVE TRAILING GÜNCELLENDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Hedef Koruma ROI: %{hedef_roi_koruma:.2f} | Yeni SL Fiyatı: {precision_sl}")
                     except Exception as ex:
                         logging.error(f"[TRAILING STOP HATA] {symbol} emir güncellenemedi: {ex}")
 
