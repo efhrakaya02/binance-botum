@@ -82,6 +82,31 @@ def gecerli_kripto_mu(symbol):
     return True
 
 # ============================================================
+# POZİSYON TİPİNİ MARJ/BÜYÜKLÜĞE GÖRE TESPİT ETME
+# ============================================================
+def pozisyon_tipini_cozumle(p):
+    sym = sembol_duzelt(p.get("symbol"))
+    if sym in pozisyon_tipleri:
+        return pozisyon_tipleri[sym]
+    
+    try:
+        contracts = float(p.get("contracts") or 0)
+        entry_price = float(p.get("entryPrice") or 0)
+        leverage = float(p.get("leverage") or LEVERAGE)
+        if contracts > 0 and entry_price > 0:
+            notional = contracts * entry_price
+            margin = notional / leverage
+            # 12.5 USDT eşik değeri: 10 USDT'lik Scalp ile 15 USDT'lik Fırsat'ı kusursuz ayırır
+            if margin < 12.5:
+                pozisyon_tipleri[sym] = "scalp"
+            else:
+                pozisyon_tipleri[sym] = "opportunity"
+            return pozisyon_tipleri[sym]
+    except Exception:
+        pass
+    return "opportunity"
+
+# ============================================================
 # VERİ ÇEKME VE İNDİKATÖRLER
 # ============================================================
 def ohlcv_getir(exchange, symbol, timeframe, limit=50):
@@ -229,7 +254,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM AÇMA (KESİN 5X KALDIRAÇ VE 1 SCALP + 1 FIRSAT KURALI)
+# İŞLEM AÇMA (KESİN 5X KALDIRAÇ VE MODA ÖZGÜ TP/SL KURULUMU)
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not TRADING_ENABLED: return False
@@ -251,8 +276,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             aktif_firsat_var = False
 
             for p in active_positions:
-                p_sym = sembol_duzelt(p.get("symbol"))
-                turu = pozisyon_tipleri.get(p_sym, "opportunity")
+                turu = pozisyon_tipini_cozumle(p)
                 if turu == "scalp":
                     aktif_scalp_var = True
                 else:
@@ -310,15 +334,19 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                     del df_temp
                     
                     if p_type == "scalp":
+                        # SCALP: Sabit TP ve Sabit Sıkı SL (Hızlı Kar Al / Korun)
                         fiyat_farki = SCALP_TARGET_USDT / amount
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
                         sl_price = (price - (atr * 2.0)) if side == "buy" else (price + (atr * 2.0))
                         
                         exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
+                        logging.info(f"[SCALP EMİRLERİ] TP: {tp_price:.4f} | SL: {sl_price:.4f} ayarlandı.")
                     else:
+                        # FIRSAT: Sabit TP YOK, sadece Başlangıç SL (Kademeli Trailing Stop yönetecek)
                         sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5))
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
+                        logging.info(f"[FIRSAT EMİRLERİ] Başlangıç SL: {sl_price:.4f} ayarlandı (Kademeli Trailing aktif).")
                 except Exception as e:
                     logging.error(f"SL/TP emir hatası: {e}")
                 return True
@@ -327,7 +355,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP
+# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (SADECE FIRSAT İÇİN)
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -357,7 +385,7 @@ def pozisyonlari_yonet(exchange, positions):
             leverage = float(p.get("leverage") or LEVERAGE)
             if entry_price == 0 or mark_price == 0: continue
 
-            p_type = pozisyon_tipleri.get(symbol, "opportunity")
+            p_type = pozisyon_tipini_cozumle(p)
             
             api_percentage = p.get("percentage")
             roi = float(api_percentage) if api_percentage is not None else 0.0
@@ -367,15 +395,15 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
 
+            # KRİTİK KURAL: Trailing Stop ve Kademeli Güncelleme SADECE "Opportunity" (Fırsat) Moduna Uygulanır!
+            # Scalp modunda sabit TP/SL kullanıldığı için monitör bu pozisyona müdahale etmez.
             if p_type == "opportunity":
                 yeni_sl = None
-                log_aciklama = ""
                 
                 if current_max >= 15.0:
                     hedef_roi_koruma = current_max - 3.0
                     fiyat_degisim_orani = (hedef_roi_koruma / 100.0) / leverage
                     yeni_sl = entry_price * (1 + fiyat_degisim_orani) if side == "long" else entry_price * (1 - fiyat_degisim_orani)
-                    log_aciklama = f"KRİTİK ZİRVE (%15+) | Hedef ROI: %{hedef_roi_koruma:.2f}"
 
                 elif current_max >= 5.0:
                     oran = (current_max - 5.0) / 10.0
@@ -385,7 +413,6 @@ def pozisyonlari_yonet(exchange, positions):
                     else:
                         yeni_sl = entry_price - ((entry_price - mark_price) * oran * 0.5)
                         if yeni_sl > entry_price: yeni_sl = entry_price
-                    log_aciklama = f"KADEMELİ (%5-%15) | Zirve: %{current_max:.2f}"
 
                 if yeni_sl is not None:
                     try:
@@ -397,7 +424,7 @@ def pozisyonlari_yonet(exchange, positions):
                         close_side = "sell" if side == "long" else "buy"
                         exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {'stopPrice': float(exchange.price_to_precision(symbol, yeni_sl)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                     except Exception as ex:
-                        logging.error(f"Trailing Stop Hata {symbol}: {ex}")
+                        logging.error(f"Fırsat Trailing Stop Hata {symbol}: {ex}")
         except Exception as e:
             logging.error(f"Pozisyon yönetimi hata {symbol}: {e}")
 
@@ -445,8 +472,7 @@ def ana_tarama_dongusu():
             aktif_scalp_var = False
             aktif_firsat_var = False
             for p in active_pos:
-                sym_p = sembol_duzelt(p.get("symbol"))
-                turu = pozisyon_tipleri.get(sym_p, "opportunity")
+                turu = pozisyon_tipini_cozumle(p)
                 if turu == "scalp":
                     aktif_scalp_var = True
                 else:
@@ -510,11 +536,11 @@ def ana_tarama_dongusu():
         time.sleep(120)
 
 # ============================================================
-# FLASK WEB ENDPOINTLERİ
+# FLASK WEB ENDPOINTLERİ (CRON JOB GEREKTİRMEZ - ÖZERK YAPI)
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Aktif", "acik_pozisyonlar": list(pozisyon_tipleri.keys())})
+    return jsonify({"status": "Bot Aktif ve Özerk Çalışıyor", "acik_pozisyonlar": list(pozisyon_tipleri.keys())})
 
 @app.route("/durum")
 def durum():
@@ -527,7 +553,7 @@ def durum():
         detaylar = []
         for p in active_pos:
             sym = sembol_duzelt(p.get("symbol"))
-            p_type = pozisyon_tipleri.get(sym, "Opportunity")
+            p_type = pozisyon_tipini_cozumle(p)
             entry = float(p.get("entryPrice", 0))
             mark = float(p.get("markPrice", 0))
             lev = float(p.get("leverage", 1))
@@ -547,11 +573,6 @@ def durum():
         return jsonify({"success": True, "aktif_islem_sayisi": len(detaylar), "islemler": detaylar})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
-
-@app.route("/tetikle")
-def tetikle():
-    threading.Thread(target=ana_tarama_dongusu, daemon=True).start()
-    return jsonify({"success": True, "message": "Manuel tetikleme başarılı."})
 
 if __name__ == "__main__":
     t = threading.Thread(target=ana_tarama_dongusu, daemon=True)
