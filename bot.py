@@ -708,7 +708,7 @@ def durum():
                 "max_gorulen_zirve_kar_yuzde": round(pozisyon_en_yuksek_kar.get(sym, 0.0), 2)
             })
         return jsonify({"success": True, "aktif_islem_sayisi": len(detaylar), "islemler": detaylar})
-    end except Exception as e:
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
 @app.route("/otomatik-analiz")
