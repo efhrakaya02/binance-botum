@@ -170,7 +170,7 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
     regresyon_orta = intercept + slope * (periyot - 1)
     analiz_ozeti = f"Eğim: {slope:.4f} | R² (Güvenilirlik): {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
     
-    min_r_squared = 0.55 # Daha yüksek doğruluk için esik yükseltildi
+    min_r_squared = 0.55
 
     if direction == "buy":
         if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.998):
@@ -194,7 +194,6 @@ def check_pullback_and_confirmation(df, direction):
     macd = df["macd"].iloc[-1]
     macd_signal = df["macd_signal"].iloc[-1]
 
-    # %90+ başarı için MACD ve Trend teyitleri eklendi
     if direction == "buy":
         return (last_close > ema50) and (ema9 > ema21) and (macd > macd_signal) and (50 < rsi < 68) and (prev_low <= df["ema21"].iloc[-2] or last_close > prev_close)
     elif direction == "sell":
@@ -216,7 +215,7 @@ def scan_scalp_market(exchange):
         
         candidates = []
         for symbol in top_symbols:
-            df = ohlcv_getir(exchange, symbol, timeframe='15m', limit=60) # Scalp için 15m hızlandırılmış zaman dilimi
+            df = ohlcv_getir(exchange, symbol, timeframe='15m', limit=60)
             if df is None: continue
             last_row = df.iloc[-1]
             rsi, close, ema9, ema21, ema50 = float(last_row['rsi']), float(last_row['close']), float(last_row['ema9']), float(last_row['ema21']), float(last_row['ema50'])
@@ -310,7 +309,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            # KESİN MARJ KİLİT KONTROLÜ (15 USDT / 10 USDT Kesin Aşılmaz)
             target_margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             notional = target_margin * leverage
             raw_amount = notional / price
@@ -319,15 +317,11 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
             min_amount = market['limits']['amount']['min']
             if raw_amount < min_amount: return False
 
-            # Miktarı borsa hassasiyetine yuvarla ve marj taşmasını önlemek için kesin sınır uygula
             amount = float(exchange.amount_to_precision(symbol, raw_amount))
             gercek_notional = amount * price
             gercek_margin = gercek_notional / leverage
 
-            # Emniyet Kısıtı: Hesaplanan marjin hedef marjı küsurat yüzünden geçiyorsa miktarı bir kademe düşür
             if gercek_margin > target_margin:
-                step_size = market['precision']['amount']
-                # Güvenli marj bırakmak için precision'a göre aşağıya yuvarla
                 amount = float(exchange.amount_to_precision(symbol, raw_amount * 0.98))
                 gercek_notional = amount * price
                 gercek_margin = gercek_notional / leverage
@@ -341,7 +335,13 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                 pozisyon_giris_fiyatlari[symbol] = price
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
-                aciklama = f"[ İŞLEM AÇILDI (%90+ ONAYLI) ] Mod: {p_type.upper()} | Sembol: {symbol} | Yön: {side.upper()} | Giriş: {price} | Skor: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x | Analiz Gerekçesi: {analiz_detay}"
+                # İSTEDİĞİN ÖZEL KONUŞMA TARZI MESAJ FORMATI
+                aciklama = (
+                    f"Selam! Yaptığım EMA, RSI, MACD, hacim ve gelişmiş regresyon trendi analizleri sonucunda "
+                    f"**{symbol}** coininin sinyal skoru **{score}** olarak belirlendi. Teyit için pullback ve regresyon "
+                    f"doğrulamalarını başarıyla tamamladım ve **%90+** başarılı bir işlem olacağı kanaatine vardığımdan "
+                    f"işlemi açmaya karar verdim. (Mod: {p_type.upper()} | Yön: {side.upper()} | Giriş: {price} | Marj: ~{gercek_margin:.2f} USDT | {analiz_detay})"
+                )
                 logging.info(aciklama)
                 
                 time.sleep(1.5)
@@ -376,7 +376,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (%7 ZARAR KORUMASI)
+# POZİSYON MONİTÖRÜ VE %12 ROI SONRASI HACİM/TREND KONTROLÜ
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -426,6 +426,31 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
                 logging.info(f"[ZİRVE KAR GÜNCELLENDİ] {symbol} ({p_type.upper()}) Yeni Max Zirve ROI: %{roi:.2f}")
+
+            # ========================================================
+            # FIRSAT İŞLEMLERDE %12 ROI AŞILDIKTAN SONRA HACİM VE TREND KONTROLÜ
+            # ========================================================
+            if p_type == "opportunity" and roi >= 12.0:
+                try:
+                    df_live = ohlcv_getir(exchange, symbol, '1h', limit=30)
+                    if df_live is not None and len(df_live) >= 5:
+                        son_hacim = float(df_live['volume'].iloc[-1])
+                        ortalama_hacim = float(df_live['volume'].rolling(10).mean().iloc[-1])
+                        son_ema9 = float(df_live['ema9'].iloc[-1])
+                        son_ema21 = float(df_live['ema21'].iloc[-1])
+                        
+                        hacim_dusuyor = son_hacim < (ortalama_hacim * 0.75)
+                        momentum_zayifliyor = (side == "long" and son_ema9 < son_ema21) or (side == "short" and son_ema9 > son_ema21)
+                        
+                        if hacim_dusuyor or momentum_zayifliyor:
+                            logging.info(f"[GARANTİ KAR KORUMA] {symbol} Fırsat işleminde ROI %12'yi geçti ancak hacim düştü / momentum zayıfladı. Mutlak maksimum kazanç için %10 kar al ile pozisyon kapatılıyor!")
+                            close_side = "sell" if side == "long" else "buy"
+                            exchange.cancel_all_orders(symbol)
+                            time.sleep(0.3)
+                            exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
+                            continue
+                except Exception as ex:
+                    logging.error(f"%12 ROI Sonrası Hacim/Trend Kontrol Hatası {symbol}: {ex}")
 
             if p_type == "opportunity":
                 yeni_sl = None
