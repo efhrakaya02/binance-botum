@@ -31,8 +31,8 @@ POSITION_MONITOR_ENABLED = True
 # Finansal ve Risk Kısıtları (Kesin Kurallar)
 SCALP_MARGIN = 10.0          # Kesin kural: Scalp için tam 10 USDT
 OPPORTUNITY_MARGIN = 15.0    # Kesin kural: Fırsat için tam 15 USDT
-MAX_SCALP_POSITIONS = 1      # Maksimum 1 Scalp pozisyonu
-MAX_OPPORTUNITY_POSITIONS = 1# Maksimum 1 Fırsat pozisyonu
+MAX_SCALP_POSITIONS = 1      # Maksimum 1 Scalp pozisyonu (Kesin kural)
+MAX_OPPORTUNITY_POSITIONS = 1# Maksimum 1 Fırsat pozisyonu (Kesin kural)
 MAX_TOTAL_POSITIONS = 2      # Toplamda maksimum 2 pozisyon (1 Scalp + 1 Fırsat)
 LEVERAGE = 5                 # Maksimum kaldıraç kesin olarak 5x
 
@@ -277,7 +277,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM YÖNETİMİ VE LİMİT KONTROLLÜ EMİR GÖNDERİMİ (GÜNCELLENDİ)
+# İŞLEM YÖNETİMİ VE LİMİT KONTROLLÜ EMİR GÖNDERİMİ (KESİN 1 SCALP + 1 FIRSAT)
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not TRADING_ENABLED: return False
@@ -295,23 +295,25 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 if sembol_duzelt(p.get("symbol")) == symbol: 
                     return False
 
-            # Aktif pozisyonların tiplerini belirle (Bellek + Binance Eşlemesi)
-            gercek_aktif_tipler = []
+            # Aktif pozisyonların modlarını sözlük ve kontrakttan kesin olarak ayırt et
+            aktif_scalp_var = False
+            aktif_firsat_var = False
+
             for p in active_positions:
                 p_sym = sembol_duzelt(p.get("symbol"))
                 turu = pozisyon_tipleri.get(p_sym, "opportunity")
-                gercek_aktif_tipler.append(turu)
+                if turu == "scalp":
+                    aktif_scalp_var = True
+                else:
+                    aktif_firsat_var = True
 
-            aktif_scalp_sayisi = sum(1 for t in gercek_aktif_tipler if t == "scalp")
-            aktif_firsat_sayisi = sum(1 for t in gercek_aktif_tipler if t == "opportunity")
-
-            # KESİN KURALLAR: Scalp için 1, Fırsat için 1 sınırının kontrolü
-            if p_type == "scalp" and aktif_scalp_sayisi >= MAX_SCALP_POSITIONS:
-                logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Scalp pozisyonu var. Yeni Scalp açılmadı.")
+            # KESİN KURAL KONTROLÜ: Asla ikinci aynı tip pozisyon açılamaz
+            if p_type == "scalp" and aktif_scalp_var:
+                logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Scalp pozisyonu var. Yeni Scalp AÇILMAYACAK.")
                 return False
                 
-            if p_type == "opportunity" and aktif_firsat_sayisi >= MAX_OPPORTUNITY_POSITIONS:
-                logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Fırsat pozisyonu var. Yeni Fırsat açılmadı.")
+            if p_type == "opportunity" and aktif_firsat_var:
+                logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Fırsat pozisyonu var. Yeni Fırsat AÇILMAYACAK.")
                 return False
 
             leverage = LEVERAGE
@@ -374,7 +376,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP
+# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (GÜNCELLENDİ)
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -404,7 +406,7 @@ def pozisyonlari_yonet(exchange, positions):
             leverage = float(p.get("leverage") or 1)
             if entry_price == 0 or mark_price == 0: continue
 
-            p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
+            p_type = pozisyon_tipleri.get(symbol, "opportunity")
             
             api_percentage = p.get("percentage")
             if api_percentage is not None:
@@ -421,10 +423,11 @@ def pozisyonlari_yonet(exchange, positions):
 
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Binance Net ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
-            if p_type == "opportunity" or p_type == "bilinmiyor":
+            if p_type == "opportunity":
                 yeni_sl = None
                 log_aciklama = ""
                 
+                # KURAL 1: Kritik Eşik %15 ve Üzeri -> Zirveden %3 Geri Çekilme (Kârı Kilitle)
                 if current_max >= 15.0:
                     hedef_roi_koruma = current_max - 3.0
                     fiyat_degisim_orani = (hedef_roi_koruma / 100.0) / leverage
@@ -436,6 +439,7 @@ def pozisyonlari_yonet(exchange, positions):
                         
                     log_aciklama = f"KRİTİK ZİRVE (%15+) | Zirve ROI: %{current_max:.2f} | Korunan Hedef ROI: %{hedef_roi_koruma:.2f}"
 
+                # KURAL 2: %5 ile %15 Arası -> Kademeli Yükseltme ve Giriş Üstüne Taşıma
                 elif current_max >= 5.0:
                     oran = (current_max - 5.0) / 10.0
                     
@@ -518,103 +522,83 @@ def ana_tarama_dongusu():
             
             logging.info("Hibrit Piyasa Taraması Başlatılıyor...")
             
-            scalp_listesi = scan_scalp_market(exchange)
-            firsat_listesi = scan_opportunity_market(exchange)
-            
-            logging.info("========================================")
-            logging.info("--- 1. SCALP MODU ADAY LİSTESİ ---")
-            if scalp_listesi:
-                for idx, c in enumerate(scalp_listesi, 1):
-                    logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']}")
-            else:
-                logging.info("Scalp kriterlerine uyan aday bulunamadı.")
-
-            logging.info("--- 2. FIRSAT MODU TAKİP LİSTESİ (%50+ PUMP / TEYİT BEKLENİYOR) ---")
-            if firsat_listesi:
-                for idx, c in enumerate(firsat_listesi, 1):
-                    logging.info(f"{idx}. {c['symbol']} | Yön: {c['direction'].upper()} | Skor: {c['score']}")
-            else:
-                logging.info("Fırsat kriterlerine uyan aday bulunamadı.")
-            logging.info("========================================")
-
             positions = exchange.fetch_positions()
             active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
-            aktif_gercek_tipler = []
+            aktif_scalp_var = False
+            aktif_firsat_var = False
             for p in active_pos:
                 sym_p = sembol_duzelt(p.get("symbol"))
                 turu = pozisyon_tipleri.get(sym_p, "opportunity")
-                aktif_gercek_tipler.append(turu)
+                if turu == "scalp":
+                    aktif_scalp_var = True
+                else:
+                    aktif_firsat_var = True
 
-            aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
-            aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
-            
-            # Fırsat pozisyonu yoksa ve fırsat listesi doluysa yeni fırsat açmayı dene
-            if not aktif_firsat_var and firsat_listesi:
-                for candidate in firsat_listesi:
-                    sym = candidate['symbol']
-                    dir_val = candidate['direction']
-                    df_check = candidate.get('df')
-                    
-                    if df_check is not None:
-                        pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
-                        reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=20)
+            # 1. FIRSAT KONTROLÜ (Eğer aktif fırsat pozisyonu yoksa ara ve aç)
+            if not aktif_firsat_var:
+                logging.info("Fırsat pozisyonu eksik, Fırsat pazarı taranıyor...")
+                firsat_listesi = scan_opportunity_market(exchange)
+                
+                if firsat_listesi:
+                    for candidate in firsat_listesi:
+                        sym = candidate['symbol']
+                        dir_val = candidate['direction']
+                        df_check = candidate.get('df')
                         
-                        logging.info(f"[FIRSAT DETAYLI ANALİZ] {sym} -> {reg_mesaj} | Pullback Onayı: {pullback_ok}")
+                        if df_check is not None:
+                            pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
+                            reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=20)
+                            
+                            logging.info(f"[FIRSAT DETAYLI ANALİZ] {sym} -> {reg_mesaj} | Pullback Onayı: {pullback_ok}")
 
-                        if pullback_ok and reg_ok:
-                            logging.info(
-                                f"[ŞEFFAF İŞLEM GİRİŞ GEREKÇESİ - FIRSAT] {sym} coini için yaptığım analizler sonucunda; "
-                                f"1) Fiyat hacim patlaması (%50+ hareket potansiyeli) gösteriyor, "
-                                f"2) Regresyon eğimi ({slope_val:.4f}) ve R-Kare istikrar skoru ({r2_val:.2f}) kriterleri başarıyla sağlandı, "
-                                f"3) Pullback ve momentum teyitleri doğrulandı. Bu nedenle işlemi ONAYLADIM ve pozisyona giriyorum."
-                            )
-                            basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
-                            if basarili:
-                                break
-                            else:
-                                logging.info(f"[FIRSAT ATLANDI] {sym} kural sınırına veya bakiyeye takıldı, sonrakine geçiliyor.")
-                                continue
-                        else:
-                            logging.info(f"[FIRSAT BEKLEMEDE] {sym} takip listesinde, tüm teyitler henüz eşik değerde değil.")
+                            if pullback_ok and reg_ok:
+                                logging.info(
+                                    f"[ŞEFFAF İŞLEM GİRİŞ GEREKÇESİ - FIRSAT] {sym} coini için yaptığım analizler sonucunda; "
+                                    f"1) Fiyat hacim patlaması (%50+ hareket potansiyeli) gösteriyor, "
+                                    f"2) Regresyon eğimi ({slope_val:.4f}) ve R-Kare istikrar skoru ({r2_val:.2f}) sağlandı, "
+                                    f"3) Pullback ve momentum teyitleri doğrulandı. İşlemi ONAYLADIM ve pozisyona giriyorum."
+                                )
+                                basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
+                                if basarili:
+                                    break
+                for item in firsat_listesi:
+                    if 'df' in item and item['df'] is not None: del item['df']
+            else:
+                logging.info("[KORUMA] Binance'te zaten aktif 1 Fırsat pozisyonu var. Yeni Fırsat taranmıyor.")
 
-            # Scalp pozisyonu yoksa ve scalp listesi doluysa yeni scalp açmayı dene
-            if not aktif_scalp_var and scalp_listesi:
-                for candidate in scalp_listesi:
-                    sym = candidate['symbol']
-                    dir_val = candidate['direction']
-                    df_check = candidate.get('df')
-                    
-                    if df_check is not None:
-                        pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
-                        reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=12)
+            # 2. SCALP KONTROLÜ (Eğer aktif scalp pozisyonu yoksa ara ve aç)
+            if not aktif_scalp_var:
+                logging.info("Scalp pozisyonu eksik, Scalp pazarı taranıyor...")
+                scalp_listesi = scan_scalp_market(exchange)
+                
+                if scalp_listesi:
+                    for candidate in scalp_listesi:
+                        sym = candidate['symbol']
+                        dir_val = candidate['direction']
+                        df_check = candidate.get('df')
                         
-                        logging.info(f"[SCALP DETAYLI ANALİZ] {sym} -> {reg_mesaj} | İvme & Pullback: {pullback_ok}")
+                        if df_check is not None:
+                            pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
+                            reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=12)
+                            
+                            logging.info(f"[SCALP DETAYLI ANALİZ] {sym} -> {reg_mesaj} | İvme & Pullback: {pullback_ok}")
 
-                        if pullback_ok and reg_ok:
-                            logging.info(
-                                f"[ŞEFFAF İŞLEM GİRİŞ GEREKÇESİ - SCALP] {sym} coini için yaptığım analizler sonucunda; "
-                                f"1) Kısa periyotlu anlık ivme (EMA9/EMA21) ve RSI koşulları sağlandı, "
-                                f"2) Regresyon eğimi ({slope_val:.4f}) ve R² kanal istikrarı ({r2_val:.2f}) onay verdi, "
-                                f"3) 0.30$ net kar hedefine hızlı ulaşılacak yapı doğrulandı. İşlemi ONAYLADIM ve pozisyona giriyorum."
-                            )
-                            basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
-                            if basarili:
-                                break
-                            else:
-                                logging.info(f"[SCALP ATLANDI] {sym} kural sınırına veya bakiyeye takıldı, sonrakine geçiliyor.")
-                                continue
-                        else:
-                            logging.info(f"[SCALP BEKLEMEDE] {sym} için anlık ivme ve trend teyidi bekleniyor.")
+                            if pullback_ok and reg_ok:
+                                logging.info(
+                                    f"[ŞEFFAF İŞLEM GİRİŞ GEREKÇESİ - SCALP] {sym} coini için yaptığım analizler sonucunda; "
+                                    f"1) Kısa periyotlu anlık ivme (EMA9/EMA21) ve RSI koşulları sağlandı, "
+                                    f"2) Regresyon eğimi ({slope_val:.4f}) ve R² kanal istikrarı ({r2_val:.2f}) onay verdi, "
+                                    f"3) 0.30$ net kar hedefine hızlı ulaşılacak yapı doğrulandı. İşlemi ONAYLADIM ve pozisyona giriyorum."
+                                )
+                                basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
+                                if basarili:
+                                    break
+                for item in scalp_listesi:
+                    if 'df' in item and item['df'] is not None: del item['df']
+            else:
+                logging.info("[KORUMA] Binance'te zaten aktif 1 Scalp pozisyonu var. Yeni Scalp taranmıyor.")
 
-            for item in scalp_listesi:
-                if 'df' in item and item['df'] is not None: 
-                    del item['df']
-            for item in firsat_listesi:
-                if 'df' in item and item['df'] is not None: 
-                    del item['df']
-            scalp_listesi.clear()
-            firsat_listesi.clear()
             active_pos.clear()
 
         except Exception as e:
@@ -642,7 +626,7 @@ def durum():
         detaylar = []
         for p in active_pos:
             sym = sembol_duzelt(p.get("symbol"))
-            p_type = pozisyon_tipleri.get(sym, "Bilinmiyor")
+            p_type = pozisyon_tipleri.get(sym, "Opportunity")
             entry = float(p.get("entryPrice", 0))
             mark = float(p.get("markPrice", 0))
             lev = float(p.get("leverage", 1))
