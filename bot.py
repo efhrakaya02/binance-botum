@@ -37,7 +37,7 @@ MAX_TOTAL_POSITIONS = 2      # Toplamda maksimum 2 pozisyon (1 Scalp + 1 Fırsat
 LEVERAGE = 5                 # KALDIRAÇ KESİN OLARAK 5X (Değiştirilemez)
 
 MIN_SCORE_THRESHOLD = 90     # Başarı oranını artırmak için minimum skor sınırı %90'a çıkarıldı
-SCALP_TARGET_USDT = 0.50     # Scalp modunda güncellenmiş minimum net kar hedefi (0.50 USDT)
+SCALP_TARGET_USDT = 0.35     # Scalp modunda güncellenmiş minimum net kar hedefi (%3.5 ROI için 0.35 USDT)
 
 # Runtime State
 pozisyon_en_yuksek_kar = {}
@@ -223,7 +223,7 @@ def scan_scalp_market(exchange):
             score = 75
             direction = None
             
-            # Scalp için daha kaliteli ve kısa sürede TP yapacak hacim destekli koşullar
+            # Scalp için daha kaliteli ve hızlı sürede TP yapacak hacim destekli koşullar
             if close > ema50 and ema9 > ema21:
                 if 53 < rsi < 65 and volume_spike:
                     direction = "buy"
@@ -279,7 +279,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM AÇMA (DİNAMİK ATR STOP & 0.50 USDT SCALP TP)
+# İŞLEM AÇMA (DİNAMİK ATR STOP & 0.35 USDT SCALP TP)
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
     if not TRADING_ENABLED: return False
@@ -352,7 +352,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                     del df_temp
                     
                     if p_type == "scalp":
-                        fiyat_farki = SCALP_TARGET_USDT / amount  # 0.50 USDT hedefi için fiyat farkı
+                        fiyat_farki = SCALP_TARGET_USDT / amount  # 0.35 USDT (%3.5 ROI) hedefi için fiyat farkı
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
                         sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5)) # Scalp için dengeli ATR stop
                         
@@ -603,9 +603,9 @@ def ana_tarama_dongusu():
                 logging.info(msg)
                 aciklama_loglari.append(msg)
 
-            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (0.50 USDT HEDEF & YÜKSEK KALİTE TEYİT)
+            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (0.35 USDT (%3.5 ROI) HEDEF & YÜKSEK KALİTE TEYİT)
             if not aktif_scalp_var:
-                msg = "Scalp pozisyonu eksik, Scalp pazarı (0.50 USDT TP Hedefli Yüksek Kalite Tarama) başlatılıyor..."
+                msg = "Scalp pozisyonu eksik, Scalp pazarı (0.35 USDT / %3.5 ROI TP Hedefli Yüksek Kalite Tarama) başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
@@ -636,7 +636,7 @@ def ana_tarama_dongusu():
 
                             if pullback_ok and reg_ok:
                                 analiz_detayi = f"Skor: {candidate['score']}, Pullback: {pullback_ok}, {reg_mesaj}"
-                                basari_mesaji = f"[SCALP ONAYLANDI (0.50 USDT TP)] {sym} tüm teyitlerden geçti, işlem açılıyor... | Gerekçe: {analiz_detayi}"
+                                basari_mesaji = f"[SCALP ONAYLANDI (%3.5 ROI TP)] {sym} tüm teyitlerden geçti, işlem açılıyor... | Gerekçe: {analiz_detayi}"
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
