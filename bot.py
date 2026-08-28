@@ -30,13 +30,13 @@ POSITION_MONITOR_ENABLED = True
 
 # Finansal ve Risk Kısıtları (Kesin Kurallar)
 SCALP_MARGIN = 10.0          # Kesin kural: Scalp için tam 10 USDT
-OPPORTUNITY_MARGIN = 15.0    # Kesin kural: Fırsat için tam 15 USDT
+OPPORTUNITY_MARGIN = 15.0    # Kesin kural: Fırsat için kesinlikle en fazla 15 USDT
 MAX_SCALP_POSITIONS = 1      # Maksimum 1 Scalp pozisyonu (Kesin kural)
 MAX_OPPORTUNITY_POSITIONS = 1# Maksimum 1 Fırsat pozisyonu (Kesin kural)
 MAX_TOTAL_POSITIONS = 2      # Toplamda maksimum 2 pozisyon (1 Scalp + 1 Fırsat)
 LEVERAGE = 5                 # KALDIRAÇ KESİN OLARAK 5X (Değiştirilemez)
 
-MIN_SCORE_THRESHOLD = 85     # Minimum skor sınırı (%85+ Başarılı Sinyal Hedefi)
+MIN_SCORE_THRESHOLD = 90     # Başarı oranını artırmak için minimum skor sınırı %90'a çıkarıldı
 SCALP_TARGET_USDT = 0.30     # Scalp modunda minimum net kar hedefi
 MAX_ALLOWABLE_LOSS_ROI = 7.0 # Kesin kural: Maksimum %7 ROI zarar sınırı
 
@@ -115,18 +115,24 @@ def pozisyon_tipini_cozumle(p):
     return "opportunity"
 
 # ============================================================
-# VERİ ÇEKME VE İNDİKATÖRLER
+# VERİ ÇEKME VE GELİŞMİŞ İNDİKATÖRLER
 # ============================================================
-def ohlcv_getir(exchange, symbol, timeframe, limit=60):
+def ohlcv_getir(exchange, symbol, timeframe, limit=80):
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not data or len(data) < 30:
+        if not data or len(data) < 40:
             return None
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
         
-        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
         df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        
+        # MACD Hesaplama (Zamanlama Teyidi İçin)
+        exp12 = df["close"].ewm(span=12, adjust=False).mean()
+        exp26 = df["close"].ewm(span=26, adjust=False).mean()
+        df["macd"] = exp12 - exp26
+        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
         
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0.0)
@@ -147,7 +153,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=60):
         return None
 
 # ============================================================
-# GELİŞMİŞ REGRESYON VE TREND TEYİDİ (%85+ BAŞARI İÇİN)
+# GELİŞMİŞ REGRESYON VE TREND TEYİDİ (%90+ BAŞARI İÇİN)
 # ============================================================
 def gelismis_regresyon_teyidi(df, direction, periyot=15):
     if df is None or len(df) < periyot:
@@ -164,13 +170,13 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
     regresyon_orta = intercept + slope * (periyot - 1)
     analiz_ozeti = f"Eğim: {slope:.4f} | R² (Güvenilirlik): {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
     
-    min_r_squared = 0.40
+    min_r_squared = 0.55 # Daha yüksek doğruluk için esik yükseltildi
 
     if direction == "buy":
-        if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.997):
+        if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.998):
             return True, slope, r_squared, f"ONAYLANDI (BUY) -> {analiz_ozeti}"
     elif direction == "sell":
-        if slope < 0 and r_squared >= min_r_squared and anlik_fiyat <= (regresyon_orta * 1.003):
+        if slope < 0 and r_squared >= min_r_squared and anlik_fiyat <= (regresyon_orta * 1.002):
             return True, slope, r_squared, f"ONAYLANDI (SELL) -> {analiz_ozeti}"
 
     return False, slope, r_squared, f"REDDEDİLDİ -> {analiz_ozeti}"
@@ -181,15 +187,18 @@ def check_pullback_and_confirmation(df, direction):
     prev_close = df["close"].iloc[-2]
     prev_low = df["low"].iloc[-2]
     prev_high = df["high"].iloc[-2]
-    ema50 = df["ema50"].iloc[-1]
     ema9 = df["ema9"].iloc[-1]
     ema21 = df["ema21"].iloc[-1]
+    ema50 = df["ema50"].iloc[-1]
     rsi = df["rsi"].iloc[-1]
+    macd = df["macd"].iloc[-1]
+    macd_signal = df["macd_signal"].iloc[-1]
 
+    # %90+ başarı için MACD ve Trend teyitleri eklendi
     if direction == "buy":
-        return (last_close > ema50) and (ema9 > ema21) and (45 < rsi < 75) and (prev_low <= df["ema50"].iloc[-2] or last_close > prev_close)
+        return (last_close > ema50) and (ema9 > ema21) and (macd > macd_signal) and (50 < rsi < 68) and (prev_low <= df["ema21"].iloc[-2] or last_close > prev_close)
     elif direction == "sell":
-        return (last_close < ema50) and (ema9 < ema21) and (25 < rsi < 55) and (prev_high >= df["ema50"].iloc[-2] or last_close < prev_close)
+        return (last_close < ema50) and (ema9 < ema21) and (macd < macd_signal) and (32 < rsi < 50) and (prev_high >= df["ema21"].iloc[-2] or last_close < prev_close)
     return False
 
 # ============================================================
@@ -203,11 +212,11 @@ def scan_scalp_market(exchange):
             key=lambda x: float(x.get('quoteVolume', 0) or 0), 
             reverse=True
         )
-        top_symbols = [t['symbol'] for t in sorted_tickers[:30]]
+        top_symbols = [t['symbol'] for t in sorted_tickers[:35]]
         
         candidates = []
         for symbol in top_symbols:
-            df = ohlcv_getir(exchange, symbol, timeframe='30m', limit=60)
+            df = ohlcv_getir(exchange, symbol, timeframe='15m', limit=60) # Scalp için 15m hızlandırılmış zaman dilimi
             if df is None: continue
             last_row = df.iloc[-1]
             rsi, close, ema9, ema21, ema50 = float(last_row['rsi']), float(last_row['close']), float(last_row['ema9']), float(last_row['ema21']), float(last_row['ema50'])
@@ -216,17 +225,13 @@ def scan_scalp_market(exchange):
             direction = None
             
             if close > ema50 and ema9 > ema21:
-                if 50 < rsi < 70:
+                if 52 < rsi < 65:
                     direction = "buy"
-                    score += 15
-                elif rsi >= 70:
-                    score += 5
+                    score += 20
             elif close < ema50 and ema9 < ema21:
-                if 30 < rsi < 50:
+                if 35 < rsi < 48:
                     direction = "sell"
-                    score += 15
-                elif rsi <= 30:
-                    score += 5
+                    score += 20
                 
             if direction and score >= MIN_SCORE_THRESHOLD:
                 candidates.append({"symbol": symbol, "score": score, "direction": direction, "mode": "scalp", "df": df})
@@ -252,7 +257,7 @@ def scan_opportunity_market(exchange):
             if df is None: continue
             last_row = df.iloc[-1]
             vol_mean = df['volume'].rolling(20).mean().iloc[-1]
-            volume_spike = float(last_row['volume']) > (vol_mean * 2.2) if vol_mean > 0 else False
+            volume_spike = float(last_row['volume']) > (vol_mean * 2.5) if vol_mean > 0 else False
             rsi = float(last_row['rsi'])
             close = float(last_row['close'])
             ema50 = float(last_row['ema50'])
@@ -261,7 +266,7 @@ def scan_opportunity_market(exchange):
             direction = "buy" if close > ema50 else "sell"
             
             if volume_spike: score += 15
-            if 40 < rsi < 65: score += 12
+            if 45 < rsi < 60: score += 15
             
             if score >= MIN_SCORE_THRESHOLD:
                 candidates.append({"symbol": symbol, "score": score, "direction": direction, "mode": "opportunity", "df": df})
@@ -274,7 +279,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM AÇMA
+# İŞLEM AÇMA (MARJ KİLİT DÜZELTMELİ)
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not TRADING_ENABLED: return False
@@ -305,17 +310,27 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
-            notional = margin * leverage
+            # KESİN MARJ KİLİT KONTROLÜ (15 USDT / 10 USDT Kesin Aşılmaz)
+            target_margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
+            notional = target_margin * leverage
             raw_amount = notional / price
 
             market = exchange.market(symbol)
             min_amount = market['limits']['amount']['min']
             if raw_amount < min_amount: return False
 
+            # Miktarı borsa hassasiyetine yuvarla ve marj taşmasını önlemek için kesin sınır uygula
             amount = float(exchange.amount_to_precision(symbol, raw_amount))
             gercek_notional = amount * price
             gercek_margin = gercek_notional / leverage
+
+            # Emniyet Kısıtı: Hesaplanan marjin hedef marjı küsurat yüzünden geçiyorsa miktarı bir kademe düşür
+            if gercek_margin > target_margin:
+                step_size = market['precision']['amount']
+                # Güvenli marj bırakmak için precision'a göre aşağıya yuvarla
+                amount = float(exchange.amount_to_precision(symbol, raw_amount * 0.98))
+                gercek_notional = amount * price
+                gercek_margin = gercek_notional / leverage
 
             side = "buy" if direction == "buy" else "sell"
             order = exchange.create_order(symbol, "market", side, amount, None, {"leverage": leverage})
@@ -326,28 +341,25 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_giris_fiyatlari[symbol] = price
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
-                aciklama = f"[ İŞLEM AÇILDI (%85+ ONAYLI) ] Mod: {p_type.upper()} | Sembol: {symbol} | Yön: {side.upper()} | Giriş: {price} | Skor: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x"
+                aciklama = f"[ İŞLEM AÇILDI (%90+ ONAYLI) ] Mod: {p_type.upper()} | Sembol: {symbol} | Yön: {side.upper()} | Giriş: {price} | Skor: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x"
                 logging.info(aciklama)
                 
                 time.sleep(1.5)
                 try:
                     close_side = "sell" if side == "buy" else "buy"
-                    df_temp = ohlcv_getir(exchange, symbol, "30m" if p_type == "scalp" else "1h", 20)
+                    df_temp = ohlcv_getir(exchange, symbol, "15m" if p_type == "scalp" else "1h", 20)
                     atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
                     del df_temp
                     
                     if p_type == "scalp":
                         fiyat_farki = SCALP_TARGET_USDT / amount
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
-                        # Scalp için kesin %7 zarar kes fiyatı hesaplama (Kaldıraç hesaba katılarak)
                         sl_price = price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "buy" else price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
                         
                         exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                     else:
-                        # Fırsat işlem için ATR bazlı başlangıç stop loss
-                        atr_sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5))
-                        # Ancak %7'yi aşmaması kuralı: ATR stopu %7'den daha uzaksa (fazla risk veriyorsa) %7 sınırına sabitlenir
+                        atr_sl_price = (price - (atr * 2.0)) if side == "buy" else (price + (atr * 2.0))
                         max_loss_price = price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "buy" else price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
                         
                         if side == "buy":
@@ -398,7 +410,6 @@ def pozisyonlari_yonet(exchange, positions):
             api_percentage = p.get("percentage")
             roi = float(api_percentage) if api_percentage is not None else 0.0
 
-            # KESİN KURAL: Maksimum %7 ROI zarar sınırını aşan pozisyonu derhal kapat
             if roi <= -MAX_ALLOWABLE_LOSS_ROI:
                 logging.warning(f"[ACİL ZARAR KES (%7 ROI LİMİTİ)] {symbol} ({p_type.upper()}) Güncel ROI: %{roi:.2f} -> Pozisyon piyasa emriyle kapatılıyor!")
                 close_side = "sell" if side == "long" else "buy"
@@ -416,7 +427,6 @@ def pozisyonlari_yonet(exchange, positions):
                 current_max = roi
                 logging.info(f"[ZİRVE KAR GÜNCELLENDİ] {symbol} ({p_type.upper()}) Yeni Max Zirve ROI: %{roi:.2f}")
 
-            # Sadece fırsat (opportunity) işlemler için ATR bazlı dinamik stop loss / trailing yönetimi
             if p_type == "opportunity":
                 yeni_sl = None
                 if current_max >= 15.0:
@@ -434,7 +444,6 @@ def pozisyonlari_yonet(exchange, positions):
 
                 if yeni_sl is not None:
                     try:
-                        # Fırsat işlem stop fiyatı hiçbir koşulda %7 zararı aşamaz (emniyet kontrolü)
                         max_allowable_sl = entry_price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "long" else entry_price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
                         if side == "long" and yeni_sl < max_allowable_sl: yeni_sl = max_allowable_sl
                         elif side == "short" and yeni_sl > max_allowable_sl: yeni_sl = max_allowable_sl
@@ -530,9 +539,9 @@ def ana_tarama_dongusu():
                     logging.info(log_line)
                     aciklama_loglari.append(log_line)
 
-            # 1. FIRSAT KONTROLÜ VE PUANLAMA LİSTESİ (%85+ HEDEF)
+            # 1. FIRSAT KONTROLÜ VE PUANLAMA LİSTESİ (%90+ HEDEF)
             if not aktif_firsat_var:
-                msg = "Fırsat pozisyonu eksik, Fırsat pazarı (%85+ hedefli tarama) başlatılıyor..."
+                msg = "Fırsat pozisyonu eksik, Fırsat pazarı (%90+ yüksek teyitli tarama) başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
@@ -562,7 +571,7 @@ def ana_tarama_dongusu():
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok:
-                                basari_mesaji = f"[FIRSAT ONAYLANDI (%85+)] {sym} tüm teyitlerden geçti, işlem açılıyor..."
+                                basari_mesaji = f"[FIRSAT ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
@@ -577,9 +586,9 @@ def ana_tarama_dongusu():
                 logging.info(msg)
                 aciklama_loglari.append(msg)
 
-            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (%85+ HEDEF VE GELİŞMİŞ TEYİT)
+            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (%90+ HEDEF VE GELİŞMİŞ TEYİT)
             if not aktif_scalp_var:
-                msg = "Scalp pozisyonu eksik, Scalp pazarı (%85+ hedefli ve seçici tarama) başlatılıyor..."
+                msg = "Scalp pozisyonu eksik, Scalp pazarı (%90+ yüksek teyitli tarama) başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
@@ -609,7 +618,7 @@ def ana_tarama_dongusu():
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok:
-                                basari_mesaji = f"[SCALP ONAYLANDI (%85+)] {sym} tüm teyitlerden geçti, işlem açılıyor..."
+                                basari_mesaji = f"[SCALP ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, hızlı TP ile işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
