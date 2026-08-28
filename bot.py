@@ -281,7 +281,7 @@ def scan_opportunity_market(exchange):
 # ============================================================
 # İŞLEM AÇMA (MARJ KİLİT DÜZELTMELİ)
 # ============================================================
-def pozisyon_ac(exchange, symbol, direction, score, p_type):
+def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
     if not TRADING_ENABLED: return False
     
     with islem_acma_lock:
@@ -341,7 +341,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 pozisyon_giris_fiyatlari[symbol] = price
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
-                aciklama = f"[ İŞLEM AÇILDI (%90+ ONAYLI) ] Mod: {p_type.upper()} | Sembol: {symbol} | Yön: {side.upper()} | Giriş: {price} | Skor: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x"
+                aciklama = f"[ İŞLEM AÇILDI (%90+ ONAYLI) ] Mod: {p_type.upper()} | Sembol: {symbol} | Yön: {side.upper()} | Giriş: {price} | Skor: {score} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}x | Analiz Gerekçesi: {analiz_detay}"
                 logging.info(aciklama)
                 
                 time.sleep(1.5)
@@ -571,13 +571,14 @@ def ana_tarama_dongusu():
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok:
-                                basari_mesaji = f"[FIRSAT ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, işlem açılıyor..."
+                                analiz_detayi = f"Skor: {candidate['score']}, Pullback: {pullback_ok}, {reg_mesaj}"
+                                basari_mesaji = f"[FIRSAT ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, işlem açılıyor... | Gerekçe: {analiz_detayi}"
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
-                                basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
+                                basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity", analiz_detayi)
                                 if basarili:
-                                    anlik_islem_loglari.append(f"Fırsat Modu: {sym} ({dir_val.upper()}) açıldı.")
+                                    anlik_islem_loglari.append(f"Fırsat Modu: {sym} ({dir_val.upper()}) açıldı. | Analiz Verileri: {analiz_detayi}")
                                     break
                 for item in firsat_listesi:
                     if 'df' in item and item['df'] is not None: del item['df']
@@ -618,13 +619,14 @@ def ana_tarama_dongusu():
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok:
-                                basari_mesaji = f"[SCALP ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, hızlı TP ile işlem açılıyor..."
+                                analiz_detayi = f"Skor: {candidate['score']}, Pullback: {pullback_ok}, {reg_mesaj}"
+                                basari_mesaji = f"[SCALP ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, hızlı TP ile işlem açılıyor... | Gerekçe: {analiz_detayi}"
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
-                                basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
+                                basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp", analiz_detayi)
                                 if basarili:
-                                    anlik_islem_loglari.append(f"Scalp Modu: {sym} ({dir_val.upper()}) açıldı.")
+                                    anlik_islem_loglari.append(f"Scalp Modu: {sym} ({dir_val.upper()}) açıldı. | Analiz Verileri: {analiz_detayi}")
                                     break
                 for item in scalp_listesi:
                     if 'df' in item and item['df'] is not None: del item['df']
