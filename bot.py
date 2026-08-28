@@ -405,7 +405,7 @@ def pozisyonlari_yonet(exchange, positions):
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # ROI HESABI = (Fiyat Değişim Yüzdesi) * Kaldıraç
+            # DOĞRUDAN KALDIRAÇLI ROI HESABI = (Fiyat Değişim Oranı * 100 * Kaldıraç)
             if side == "long":
                 roi = ((mark_price - entry_price) / entry_price) * 100 * leverage
             else:
@@ -416,7 +416,7 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
 
-            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
+            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Kaldıraçlı ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
             # Fırsat Modu İçin Kaldıraçlı ROI Zirvesinden %3 Geri Çekilmeli Trailing Stop
             if p_type == "opportunity":
