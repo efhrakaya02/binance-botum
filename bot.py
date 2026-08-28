@@ -38,6 +38,7 @@ LEVERAGE = 5                 # KALDIRAÇ KESİN OLARAK 5X (Değiştirilemez)
 
 MIN_SCORE_THRESHOLD = 85     # Minimum skor sınırı (%85+ Başarılı Sinyal Hedefi)
 SCALP_TARGET_USDT = 0.30     # Scalp modunda minimum net kar hedefi
+MAX_ALLOWABLE_LOSS_ROI = 7.0 # Kesin kural: Maksimum %7 ROI zarar sınırı
 
 # Runtime State
 pozisyon_en_yuksek_kar = {}
@@ -163,7 +164,6 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
     regresyon_orta = intercept + slope * (periyot - 1)
     analiz_ozeti = f"Eğim: {slope:.4f} | R² (Güvenilirlik): {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
     
-    # Başarı oranını artırmak için R² eşiği güçlendirildi (0.40)
     min_r_squared = 0.40
 
     if direction == "buy":
@@ -186,7 +186,6 @@ def check_pullback_and_confirmation(df, direction):
     ema21 = df["ema21"].iloc[-1]
     rsi = df["rsi"].iloc[-1]
 
-    # Ekstra trend ve momentum süzgeci eklenerek başarı kriteri yükseltildi
     if direction == "buy":
         return (last_close > ema50) and (ema9 > ema21) and (45 < rsi < 75) and (prev_low <= df["ema50"].iloc[-2] or last_close > prev_close)
     elif direction == "sell":
@@ -213,22 +212,21 @@ def scan_scalp_market(exchange):
             last_row = df.iloc[-1]
             rsi, close, ema9, ema21, ema50 = float(last_row['rsi']), float(last_row['close']), float(last_row['ema9']), float(last_row['ema21']), float(last_row['ema50'])
             
-            # Dinamik Puanlama Sistemi (%85+ Sinyal Üretimi İçin Ağırlıklı Kriterler)
             score = 75
             direction = None
             
             if close > ema50 and ema9 > ema21:
                 if 50 < rsi < 70:
                     direction = "buy"
-                    score += 15  # Güçlü Boğa Momentum Puanı
+                    score += 15
                 elif rsi >= 70:
-                    score += 5   # Aşırı alım riskli bölge
+                    score += 5
             elif close < ema50 and ema9 < ema21:
                 if 30 < rsi < 50:
                     direction = "sell"
-                    score += 15  # Güçlü Ayı Momentum Puanı
+                    score += 15
                 elif rsi <= 30:
-                    score += 5   # Aşırı satım riskli bölge
+                    score += 5
                 
             if direction and score >= MIN_SCORE_THRESHOLD:
                 candidates.append({"symbol": symbol, "score": score, "direction": direction, "mode": "scalp", "df": df})
@@ -356,7 +354,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP
+# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (%7 ZARAR KORUMASI)
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -389,6 +387,18 @@ def pozisyonlari_yonet(exchange, positions):
             p_type = pozisyon_tipini_cozumle(p)
             api_percentage = p.get("percentage")
             roi = float(api_percentage) if api_percentage is not None else 0.0
+
+            # KESİN KURAL: Maksimum %7 ROI zarar sınırını aşan pozisyonu derhal kapat
+            if roi <= -MAX_ALLOWABLE_LOSS_ROI:
+                logging.warning(f"[ACİL ZARAR KES (%7 ROI LİMİTİ)] {symbol} ({p_type.upper()}) Güncel ROI: %{roi:.2f} -> Pozisyon piyasa emriyle kapatılıyor!")
+                close_side = "sell" if side == "long" else "buy"
+                try:
+                    exchange.cancel_all_orders(symbol)
+                    time.sleep(0.3)
+                    exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
+                except Exception as ex:
+                    logging.error(f"Acil zarar kes kapatma hatası {symbol}: {ex}")
+                continue
             
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max:
@@ -551,9 +561,9 @@ def ana_tarama_dongusu():
                 logging.info(msg)
                 aciklama_loglari.append(msg)
 
-            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (%85+ HEDEF)
+            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (%85+ HEDEF VE GELİŞMİŞ TEYİT)
             if not aktif_scalp_var:
-                msg = "Scalp pozisyonu eksik, Scalp pazarı (%85+ hedefli tarama) başlatılıyor..."
+                msg = "Scalp pozisyonu eksik, Scalp pazarı (%85+ hedefli ve seçici tarama) başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
