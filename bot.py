@@ -37,8 +37,7 @@ MAX_TOTAL_POSITIONS = 2      # Toplamda maksimum 2 pozisyon (1 Scalp + 1 Fırsat
 LEVERAGE = 5                 # KALDIRAÇ KESİN OLARAK 5X (Değiştirilemez)
 
 MIN_SCORE_THRESHOLD = 90     # Başarı oranını artırmak için minimum skor sınırı %90'a çıkarıldı
-SCALP_TARGET_USDT = 0.30     # Scalp modunda minimum net kar hedefi
-MAX_ALLOWABLE_LOSS_ROI = 7.0 # Kesin kural: Maksimum %7 ROI zarar sınırı
+SCALP_TARGET_USDT = 0.50     # Scalp modunda güncellenmiş minimum net kar hedefi (0.50 USDT)
 
 # Runtime State
 pozisyon_en_yuksek_kar = {}
@@ -170,7 +169,7 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
     regresyon_orta = intercept + slope * (periyot - 1)
     analiz_ozeti = f"Eğim: {slope:.4f} | R² (Güvenilirlik): {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
     
-    min_r_squared = 0.55
+    min_r_squared = 0.58  # Scalp ve Fırsat kalitesini artırmak için güvenilirlik eşiği optimize edildi
 
     if direction == "buy":
         if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.998):
@@ -195,9 +194,9 @@ def check_pullback_and_confirmation(df, direction):
     macd_signal = df["macd_signal"].iloc[-1]
 
     if direction == "buy":
-        return (last_close > ema50) and (ema9 > ema21) and (macd > macd_signal) and (50 < rsi < 68) and (prev_low <= df["ema21"].iloc[-2] or last_close > prev_close)
+        return (last_close > ema50) and (ema9 > ema21) and (macd > macd_signal) and (53 < rsi < 65) and (prev_low <= df["ema21"].iloc[-2] or last_close > prev_close)
     elif direction == "sell":
-        return (last_close < ema50) and (ema9 < ema21) and (macd < macd_signal) and (32 < rsi < 50) and (prev_high >= df["ema21"].iloc[-2] or last_close < prev_close)
+        return (last_close < ema50) and (ema9 < ema21) and (macd < macd_signal) and (35 < rsi < 47) and (prev_high >= df["ema21"].iloc[-2] or last_close < prev_close)
     return False
 
 # ============================================================
@@ -218,17 +217,21 @@ def scan_scalp_market(exchange):
             df = ohlcv_getir(exchange, symbol, timeframe='15m', limit=60)
             if df is None: continue
             last_row = df.iloc[-1]
+            vol_mean = df['volume'].rolling(20).mean().iloc[-1]
+            volume_spike = float(last_row['volume']) > (vol_mean * 1.5) if vol_mean > 0 else False
+            
             rsi, close, ema9, ema21, ema50 = float(last_row['rsi']), float(last_row['close']), float(last_row['ema9']), float(last_row['ema21']), float(last_row['ema50'])
             
             score = 75
             direction = None
             
+            # Scalp için daha kaliteli ve kısa sürede TP yapacak hacim destekli koşullar
             if close > ema50 and ema9 > ema21:
-                if 52 < rsi < 65:
+                if 53 < rsi < 65 and volume_spike:
                     direction = "buy"
                     score += 20
             elif close < ema50 and ema9 < ema21:
-                if 35 < rsi < 48:
+                if 35 < rsi < 47 and volume_spike:
                     direction = "sell"
                     score += 20
                 
@@ -278,7 +281,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM AÇMA (MARJ KİLİT DÜZELTMELİ)
+# İŞLEM AÇMA (DİNAMİK ATR STOP & 0.50 USDT SCALP TP)
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
     if not TRADING_ENABLED: return False
@@ -335,7 +338,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                 pozisyon_giris_fiyatlari[symbol] = price
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
-                # İSTEDİĞİN ÖZEL KONUŞMA TARZI MESAJ FORMATI
                 aciklama = (
                     f"Selam! Yaptığım EMA, RSI, MACD, hacim ve gelişmiş regresyon trendi analizleri sonucunda "
                     f"**{symbol}** coininin sinyal skoru **{score}** olarak belirlendi. Teyit için pullback ve regresyon "
@@ -352,21 +354,15 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                     del df_temp
                     
                     if p_type == "scalp":
-                        fiyat_farki = SCALP_TARGET_USDT / amount
+                        fiyat_farki = SCALP_TARGET_USDT / amount  # 0.50 USDT hedefi için fiyat farkı
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
-                        sl_price = price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "buy" else price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
+                        sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5)) # Scalp için dengeli ATR stop
                         
                         exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                     else:
-                        atr_sl_price = (price - (atr * 2.0)) if side == "buy" else (price + (atr * 2.0))
-                        max_loss_price = price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "buy" else price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
-                        
-                        if side == "buy":
-                            sl_price = max(atr_sl_price, max_loss_price)
-                        else:
-                            sl_price = min(atr_sl_price, max_loss_price)
-
+                        # Fırsat işlemleri için esnek ATR tabanlı dinamik stop (Sabit %7 zarar kes kaldırıldı)
+                        sl_price = (price - (atr * 3.0)) if side == "buy" else (price + (atr * 3.0))
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                 except Exception as e:
                     logging.error(f"SL/TP emir hatası: {e}")
@@ -376,7 +372,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE %12 ROI SONRASI HACİM/TREND KONTROLÜ
+# POZİSYON MONİTÖRÜ VE ETKİN TREND/HACİM KONTROLÜ
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -409,17 +405,6 @@ def pozisyonlari_yonet(exchange, positions):
             p_type = pozisyon_tipini_cozumle(p)
             api_percentage = p.get("percentage")
             roi = float(api_percentage) if api_percentage is not None else 0.0
-
-            if roi <= -MAX_ALLOWABLE_LOSS_ROI:
-                logging.warning(f"[ACİL ZARAR KES (%7 ROI LİMİTİ)] {symbol} ({p_type.upper()}) Güncel ROI: %{roi:.2f} -> Pozisyon piyasa emriyle kapatılıyor!")
-                close_side = "sell" if side == "long" else "buy"
-                try:
-                    exchange.cancel_all_orders(symbol)
-                    time.sleep(0.3)
-                    exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
-                except Exception as ex:
-                    logging.error(f"Acil zarar kes kapatma hatası {symbol}: {ex}")
-                continue
             
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max:
@@ -428,9 +413,9 @@ def pozisyonlari_yonet(exchange, positions):
                 logging.info(f"[ZİRVE KAR GÜNCELLENDİ] {symbol} ({p_type.upper()}) Yeni Max Zirve ROI: %{roi:.2f}")
 
             # ========================================================
-            # FIRSAT İŞLEMLERDE %12 ROI AŞILDIKTAN SONRA HACİM VE TREND KONTROLÜ
+            # FIRSAT İŞLEMLERDE SIKLAŞTIRILMIŞ TREND VE HACİM KONTROLÜ
             # ========================================================
-            if p_type == "opportunity" and roi >= 12.0:
+            if p_type == "opportunity":
                 try:
                     df_live = ohlcv_getir(exchange, symbol, '1h', limit=30)
                     if df_live is not None and len(df_live) >= 5:
@@ -438,21 +423,33 @@ def pozisyonlari_yonet(exchange, positions):
                         ortalama_hacim = float(df_live['volume'].rolling(10).mean().iloc[-1])
                         son_ema9 = float(df_live['ema9'].iloc[-1])
                         son_ema21 = float(df_live['ema21'].iloc[-1])
+                        son_rsi = float(df_live['rsi'].iloc[-1])
                         
-                        hacim_dusuyor = son_hacim < (ortalama_hacim * 0.75)
-                        momentum_zayifliyor = (side == "long" and son_ema9 < son_ema21) or (side == "short" and son_ema9 > son_ema21)
+                        # Trend dönüş ve hacim kuruma tespiti
+                        hacim_kuruyor = son_hacim < (ortalama_hacim * 0.50)
+                        trend_tersine_dondu = (side == "long" and (son_ema9 < son_ema21 or son_rsi < 42)) or \
+                                              (side == "short" and (son_ema9 > son_ema21 or son_rsi > 58))
                         
-                        if hacim_dusuyor or momentum_zayifliyor:
-                            logging.info(f"[GARANTİ KAR KORUMA] {symbol} Fırsat işleminde ROI %12'yi geçti ancak hacim düştü / momentum zayıfladı. Mutlak maksimum kazanç için %10 kar al ile pozisyon kapatılıyor!")
+                        if roi < 0 and (hacim_kuruyor or trend_tersine_dondu):
+                            logging.warning(f"[ACİL KORUMA - TREND/HACİM TERSİNE DÖNDÜ] {symbol} Fırsat işleminde zarar büyümeden piyasa emriyle kapatılıyor! (ROI: %{roi:.2f})")
+                            close_side = "sell" if side == "long" else "buy"
+                            exchange.cancel_all_orders(symbol)
+                            time.sleep(0.3)
+                            exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
+                            continue
+                        
+                        # Karlı işlemlerde %12 ROI aşılınca karı sabitleme kontrolü
+                        if roi >= 12.0 and (hacim_kuruyor or trend_tersine_dondu):
+                            logging.info(f"[GARANTİ KAR KORUMA] {symbol} Fırsat işleminde ROI %12'yi geçti ancak trend/hacim zayıfladı. Pozisyon güvenli kar al ile kapatılıyor!")
                             close_side = "sell" if side == "long" else "buy"
                             exchange.cancel_all_orders(symbol)
                             time.sleep(0.3)
                             exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
                             continue
                 except Exception as ex:
-                    logging.error(f"%12 ROI Sonrası Hacim/Trend Kontrol Hatası {symbol}: {ex}")
+                    logging.error(f"Fırsat Trend/Hacim Kontrol Hatası {symbol}: {ex}")
 
-            if p_type == "opportunity":
+                # Fırsat Trailing Stop Yönetimi
                 yeni_sl = None
                 if current_max >= 15.0:
                     hedef_roi_koruma = current_max - 3.0
@@ -469,10 +466,6 @@ def pozisyonlari_yonet(exchange, positions):
 
                 if yeni_sl is not None:
                     try:
-                        max_allowable_sl = entry_price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "long" else entry_price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
-                        if side == "long" and yeni_sl < max_allowable_sl: yeni_sl = max_allowable_sl
-                        elif side == "short" and yeni_sl > max_allowable_sl: yeni_sl = max_allowable_sl
-
                         if side == "long" and yeni_sl >= mark_price: yeni_sl = mark_price * 0.998 
                         elif side == "short" and yeni_sl <= mark_price: yeni_sl = mark_price * 1.002
 
@@ -612,9 +605,9 @@ def ana_tarama_dongusu():
                 logging.info(msg)
                 aciklama_loglari.append(msg)
 
-            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (%90+ HEDEF VE GELİŞMİŞ TEYİT)
+            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (0.50 USDT HEDEF & YÜKSEK KALİTE TEYİT)
             if not aktif_scalp_var:
-                msg = "Scalp pozisyonu eksik, Scalp pazarı (%90+ yüksek teyitli tarama) başlatılıyor..."
+                msg = "Scalp pozisyonu eksik, Scalp pazarı (0.50 USDT TP Hedefli Yüksek Kalite Tarama) başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
@@ -645,7 +638,7 @@ def ana_tarama_dongusu():
 
                             if pullback_ok and reg_ok:
                                 analiz_detayi = f"Skor: {candidate['score']}, Pullback: {pullback_ok}, {reg_mesaj}"
-                                basari_mesaji = f"[SCALP ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, hızlı TP ile işlem açılıyor... | Gerekçe: {analiz_detayi}"
+                                basari_mesaji = f"[SCALP ONAYLANDI (0.50 USDT TP)] {sym} tüm teyitlerden geçti, işlem açılıyor... | Gerekçe: {analiz_detayi}"
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
