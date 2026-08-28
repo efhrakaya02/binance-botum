@@ -396,7 +396,6 @@ def pozisyonlari_yonet(exchange, positions):
                 current_max = roi
 
             # KRİTİK KURAL: Trailing Stop ve Kademeli Güncelleme SADECE "Opportunity" (Fırsat) Moduna Uygulanır!
-            # Scalp modunda sabit TP/SL kullanıldığı için monitör bu pozisyona müdahale etmez.
             if p_type == "opportunity":
                 yeni_sl = None
                 
@@ -536,7 +535,7 @@ def ana_tarama_dongusu():
         time.sleep(120)
 
 # ============================================================
-# FLASK WEB ENDPOINTLERİ (CRON JOB GEREKTİRMEZ - ÖZERK YAPI)
+# FLASK WEB ENDPOINTLERİ (404 HATASI ENGELLEME VE ÖZERK YAPI)
 # ============================================================
 @app.route("/")
 def index():
@@ -573,6 +572,11 @@ def durum():
         return jsonify({"success": True, "aktif_islem_sayisi": len(detaylar), "islemler": detaylar})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
+
+@app.route("/otomatik-analiz")
+def otomatik_analiz():
+    # 404 hatasını ortadan kaldırmak için eklendi; bot zaten özerk döngüde çalışmaktadır.
+    return jsonify({"success": True, "message": "Endpoint aktif. Bot arka planda özerk olarak çalışmaktadır."})
 
 if __name__ == "__main__":
     t = threading.Thread(target=ana_tarama_dongusu, daemon=True)
