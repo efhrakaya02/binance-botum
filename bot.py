@@ -426,18 +426,17 @@ def pozisyonlari_yonet(exchange, positions):
                 yeni_sl = None
                 log_aciklama = ""
                 
-                # KURAL 1: Kritik Eşik %15 ve Üzeri -> Zirveden %3 Geri Çekilme (Trailing)
+                # KURAL 1: Kritik Eşik %15 ve Üzeri -> Zirveden %3 Geri Çekilme (Kârı Kilitle)
                 if current_max >= 15.0:
                     hedef_roi_koruma = current_max - 3.0
                     fiyat_degisim_orani = (hedef_roi_koruma / 100.0) / leverage
                     
                     if side == "long":
                         yeni_sl = entry_price * (1 + fiyat_degisim_orani)
-                        if yeni_sl < entry_price: yeni_sl = entry_price
                     else:
                         yeni_sl = entry_price * (1 - fiyat_degisim_orani)
-                        if yeni_sl > entry_price: yeni_sl = entry_price
-                    log_aciklama = f"KRİTİK ZİRVE (%15+) | Zirve ROI: %{current_max:.2f} | Koruma ROI: %{hedef_roi_koruma:.2f}"
+                        
+                    log_aciklama = f"KRİTİK ZİRVE (%15+) | Zirve ROI: %{current_max:.2f} | Korunan Hedef ROI: %{hedef_roi_koruma:.2f}"
 
                 # KURAL 2: %5 ile %15 Arası -> Kademeli Yükseltme ve Giriş Üstüne Taşıma
                 elif current_max >= 5.0:
@@ -456,15 +455,14 @@ def pozisyonlari_yonet(exchange, positions):
                 if yeni_sl is not None:
                     try:
                         # ========================================================
-                        # GÜVENLİK FİLTRESİ: "Order would immediately trigger" Koruması
+                        # GÜVENLİK FİLTRESİ: Binance emir kabul kuralları denetimi
                         # ========================================================
-                        guvenli_marj = mark_price * 0.001  # %0.1 güvenlik payı
                         if side == "long" and yeni_sl >= mark_price:
-                            logging.warning(f"[STOP GÜNCELLEME ATLANDI] {symbol} | Long stop fiyatı ({yeni_sl}) anlık fiyata ({mark_price}) eşit veya büyük. Hemen tetikleneceği için iptal edildi.")
-                            continue
+                            # Eğer hesaplanan stop anlık fiyatın üzerindeyse, anlık fiyatın hemen altında güvenli noktaya çek
+                            yeni_sl = mark_price * 0.998 
                         elif side == "short" and yeni_sl <= mark_price:
-                            logging.warning(f"[STOP GÜNCELLEME ATLANDI] {symbol} | Short stop fiyatı ({yeni_sl}) anlık fiyata ({mark_price}) eşit veya küçük. Hemen tetikleneceği için iptal edildi.")
-                            continue
+                            # Eğer hesaplanan stop anlık fiyatın altındaysa, anlık fiyatın hemen üstünde güvenli noktaya çek
+                            yeni_sl = mark_price * 1.002
                         # ========================================================
 
                         exchange.cancel_all_orders(symbol)
