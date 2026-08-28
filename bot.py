@@ -49,6 +49,7 @@ son_detayli_analiz_raporu = {
     "zaman": "Henüz tarama yapılmadı",
     "scalp_takip_listesi": [],
     "firsat_takip_listesi": [],
+    "aktif_pozisyonlar_roi_durumu": [],
     "yapilan_islemler": [],
     "aciklamalar": []
 }
@@ -454,6 +455,7 @@ def ana_tarama_dongusu():
             anlik_islem_loglari = []
             scalp_takip = []
             firsat_takip = []
+            aktif_pozisyonlar_roi_listesi = []
             aciklama_loglari = []
 
             positions = exchange.fetch_positions()
@@ -462,11 +464,31 @@ def ana_tarama_dongusu():
             aktif_scalp_var = False
             aktif_firsat_var = False
             for p in active_pos:
+                sym = sembol_duzelt(p.get("symbol"))
                 turu = pozisyon_tipini_cozumle(p)
+                api_percentage = p.get("percentage")
+                anlik_roi = float(api_percentage) if api_percentage is not None else 0.0
+                max_zirve_roi = pozisyon_en_yuksek_kar.get(sym, 0.0)
+
+                aktif_pozisyonlar_roi_listesi.append({
+                    "symbol": sym,
+                    "mod": turu.upper(),
+                    "binance_gercek_roi_yuzde": round(anlik_roi, 2),
+                    "max_gorulen_zirve_kar_yuzde": round(max_zirve_roi, 2)
+                })
+
                 if turu == "scalp":
                     aktif_scalp_var = True
                 else:
                     aktif_firsat_var = True
+
+            # Aktif pozisyonların ROI ve Zirve durumlarını logla
+            if aktif_pozisyonlar_roi_listesi:
+                logging.info("[AKTİF POZİSYONLAR ROI DURUMU]")
+                for pos_info in aktif_pozisyonlar_roi_listesi:
+                    log_line = f"   -> {pos_info['symbol']} ({pos_info['mod']}): Gerçek ROI: %{pos_info['binance_gercek_roi_yuzde']} | Max Zirve ROI: %{pos_info['max_gorulen_zirve_kar_yuzde']}"
+                    logging.info(log_line)
+                    aciklama_loglari.append(log_line)
 
             # 1. FIRSAT KONTROLÜ VE PUANLAMA LİSTESİ
             if not aktif_firsat_var:
@@ -486,7 +508,6 @@ def ana_tarama_dongusu():
                     logging.info(f"   {i}. Fırsat Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']}")
 
                 if firsat_listesi:
-                    # En yüksek puandan başlayarak (sırayla) teyit süzgecinden geçirilir
                     for candidate in firsat_listesi:
                         sym = candidate['symbol']
                         dir_val = candidate['direction']
@@ -534,7 +555,6 @@ def ana_tarama_dongusu():
                     logging.info(f"   {i}. Scalp Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']}")
 
                 if scalp_listesi:
-                    # En yüksek puandan başlayarak (sırayla) teyit süzgecinden geçirilir
                     for candidate in scalp_listesi:
                         sym = candidate['symbol']
                         dir_val = candidate['direction']
@@ -568,6 +588,7 @@ def ana_tarama_dongusu():
                 "zaman": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "scalp_takip_listesi": scalp_takip,
                 "firsat_takip_listesi": firsat_takip,
+                "aktif_pozisyonlar_roi_durumu": aktif_pozisyonlar_roi_listesi,
                 "yapilan_islemler": anlik_islem_loglari,
                 "aciklamalar": aciklama_loglari
             }
