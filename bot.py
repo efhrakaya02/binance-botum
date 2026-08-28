@@ -277,7 +277,7 @@ def scan_opportunity_market(exchange):
         return []
 
 # ============================================================
-# İŞLEM YÖNETİMİ VE LİMİT KONTROLLÜ EMİR GÖNDERİMİ
+# İŞLEM YÖNETİMİ VE LİMİT KONTROLLÜ EMİR GÖNDERİMİ (GÜNCELLENDİ)
 # ============================================================
 def pozisyon_ac(exchange, symbol, direction, score, p_type):
     if not TRADING_ENABLED: return False
@@ -295,6 +295,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 if sembol_duzelt(p.get("symbol")) == symbol: 
                     return False
 
+            # Aktif pozisyonların tiplerini belirle (Bellek + Binance Eşlemesi)
             gercek_aktif_tipler = []
             for p in active_positions:
                 p_sym = sembol_duzelt(p.get("symbol"))
@@ -304,6 +305,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             aktif_scalp_sayisi = sum(1 for t in gercek_aktif_tipler if t == "scalp")
             aktif_firsat_sayisi = sum(1 for t in gercek_aktif_tipler if t == "opportunity")
 
+            # KESİN KURALLAR: Scalp için 1, Fırsat için 1 sınırının kontrolü
             if p_type == "scalp" and aktif_scalp_sayisi >= MAX_SCALP_POSITIONS:
                 logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Scalp pozisyonu var. Yeni Scalp açılmadı.")
                 return False
@@ -372,7 +374,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (GÜNCELLENDİ)
+# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -404,7 +406,6 @@ def pozisyonlari_yonet(exchange, positions):
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # 1. Binance net ROI hesabını doğrudan API'den veya formülden al
             api_percentage = p.get("percentage")
             if api_percentage is not None:
                 roi = float(api_percentage)
@@ -413,7 +414,6 @@ def pozisyonlari_yonet(exchange, positions):
                 unrealized_pnl = float(p.get("unrealizedPnl") or 0.0)
                 roi = (unrealized_pnl / initial_margin) * 100 if initial_margin > 0 else 0.0
             
-            # 2. Zirve ROI hesabını her döngüde kontrol et ve güncelle
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max:
                 pozisyon_en_yuksek_kar[symbol] = roi
@@ -421,12 +421,10 @@ def pozisyonlari_yonet(exchange, positions):
 
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Binance Net ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
-            # Fırsat Modu İçin Kademeli ve Zirveden Geri Çekilmeli Trailing Stop Mantığı
             if p_type == "opportunity" or p_type == "bilinmiyor":
                 yeni_sl = None
                 log_aciklama = ""
                 
-                # KURAL 1: Kritik Eşik %15 ve Üzeri -> Zirveden %3 Geri Çekilme (Kârı Kilitle)
                 if current_max >= 15.0:
                     hedef_roi_koruma = current_max - 3.0
                     fiyat_degisim_orani = (hedef_roi_koruma / 100.0) / leverage
@@ -438,7 +436,6 @@ def pozisyonlari_yonet(exchange, positions):
                         
                     log_aciklama = f"KRİTİK ZİRVE (%15+) | Zirve ROI: %{current_max:.2f} | Korunan Hedef ROI: %{hedef_roi_koruma:.2f}"
 
-                # KURAL 2: %5 ile %15 Arası -> Kademeli Yükseltme ve Giriş Üstüne Taşıma
                 elif current_max >= 5.0:
                     oran = (current_max - 5.0) / 10.0
                     
@@ -451,19 +448,12 @@ def pozisyonlari_yonet(exchange, positions):
                         
                     log_aciklama = f"KADEMELİ GEÇİŞ (%5-%15) | Zirve ROI: %{current_max:.2f} | Oran: %{oran*100:.1f}"
 
-                # Yeni bir SL seviyesi hesaplandıysa emri güvenli şekilde güncelle
                 if yeni_sl is not None:
                     try:
-                        # ========================================================
-                        # GÜVENLİK FİLTRESİ: Binance emir kabul kuralları denetimi
-                        # ========================================================
                         if side == "long" and yeni_sl >= mark_price:
-                            # Eğer hesaplanan stop anlık fiyatın üzerindeyse, anlık fiyatın hemen altında güvenli noktaya çek
                             yeni_sl = mark_price * 0.998 
                         elif side == "short" and yeni_sl <= mark_price:
-                            # Eğer hesaplanan stop anlık fiyatın altındaysa, anlık fiyatın hemen üstünde güvenli noktaya çek
                             yeni_sl = mark_price * 1.002
-                        # ========================================================
 
                         exchange.cancel_all_orders(symbol)
                         time.sleep(0.5)
@@ -559,6 +549,7 @@ def ana_tarama_dongusu():
             aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
             aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
             
+            # Fırsat pozisyonu yoksa ve fırsat listesi doluysa yeni fırsat açmayı dene
             if not aktif_firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
@@ -587,6 +578,7 @@ def ana_tarama_dongusu():
                         else:
                             logging.info(f"[FIRSAT BEKLEMEDE] {sym} takip listesinde, tüm teyitler henüz eşik değerde değil.")
 
+            # Scalp pozisyonu yoksa ve scalp listesi doluysa yeni scalp açmayı dene
             if not aktif_scalp_var and scalp_listesi:
                 for candidate in scalp_listesi:
                     sym = candidate['symbol']
