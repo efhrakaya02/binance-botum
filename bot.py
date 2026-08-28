@@ -372,7 +372,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (YENİLENEN MANTIK)
+# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (GÜNCELLENDİ)
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -402,9 +402,10 @@ def pozisyonlari_yonet(exchange, positions):
             leverage = float(p.get("leverage") or 1)
             if entry_price == 0 or mark_price == 0: continue
 
+            # Bot yeniden başlarsa state kaybında "bilinmiyor" olabilir, fırlatmayalım.
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
             
-            # Binance'in doğrudan API üzerinden döndürdüğü kaldıraçlı net ROI değeri
+            # 1. Binance net ROI hesabını doğrudan API'den veya formülden al
             api_percentage = p.get("percentage")
             if api_percentage is not None:
                 roi = float(api_percentage)
@@ -413,6 +414,7 @@ def pozisyonlari_yonet(exchange, positions):
                 unrealized_pnl = float(p.get("unrealizedPnl") or 0.0)
                 roi = (unrealized_pnl / initial_margin) * 100 if initial_margin > 0 else 0.0
             
+            # 2. Zirve ROI hesabını her döngüde kontrol et ve güncelle
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
             if roi > current_max:
                 pozisyon_en_yuksek_kar[symbol] = roi
@@ -421,7 +423,9 @@ def pozisyonlari_yonet(exchange, positions):
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Binance Net ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
             # Fırsat Modu İçin Kademeli ve Zirveden Geri Çekilmeli Trailing Stop Mantığı
-            if p_type == "opportunity":
+            # Bot yeniden başlatıldığında pozisyon türü bilinmiyorsa fırsat modu kuralları uygulansın diye default kabul edilebilir 
+            # Ancak biz mevcut state yapısını bozmuyoruz.
+            if p_type == "opportunity" or p_type == "bilinmiyor":
                 yeni_sl = None
                 log_aciklama = ""
                 
