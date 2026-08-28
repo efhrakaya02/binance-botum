@@ -332,19 +332,29 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 time.sleep(1.5)
                 try:
                     close_side = "sell" if side == "buy" else "buy"
-                    df_temp = ohlcv_getir(exchange, symbol, "30m", 20)
+                    df_temp = ohlcv_getir(exchange, symbol, "30m" if p_type == "scalp" else "1h", 20)
                     atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
                     del df_temp
                     
                     if p_type == "scalp":
                         fiyat_farki = SCALP_TARGET_USDT / amount
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
-                        sl_price = (price - (atr * 2.0)) if side == "buy" else (price + (atr * 2.0))
+                        # Scalp için kesin %7 zarar kes fiyatı hesaplama (Kaldıraç hesaba katılarak)
+                        sl_price = price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "buy" else price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
                         
                         exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                     else:
-                        sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5))
+                        # Fırsat işlem için ATR bazlı başlangıç stop loss
+                        atr_sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5))
+                        # Ancak %7'yi aşmaması kuralı: ATR stopu %7'den daha uzaksa (fazla risk veriyorsa) %7 sınırına sabitlenir
+                        max_loss_price = price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "buy" else price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
+                        
+                        if side == "buy":
+                            sl_price = max(atr_sl_price, max_loss_price)
+                        else:
+                            sl_price = min(atr_sl_price, max_loss_price)
+
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                 except Exception as e:
                     logging.error(f"SL/TP emir hatası: {e}")
@@ -406,6 +416,7 @@ def pozisyonlari_yonet(exchange, positions):
                 current_max = roi
                 logging.info(f"[ZİRVE KAR GÜNCELLENDİ] {symbol} ({p_type.upper()}) Yeni Max Zirve ROI: %{roi:.2f}")
 
+            # Sadece fırsat (opportunity) işlemler için ATR bazlı dinamik stop loss / trailing yönetimi
             if p_type == "opportunity":
                 yeni_sl = None
                 if current_max >= 15.0:
@@ -423,6 +434,11 @@ def pozisyonlari_yonet(exchange, positions):
 
                 if yeni_sl is not None:
                     try:
+                        # Fırsat işlem stop fiyatı hiçbir koşulda %7 zararı aşamaz (emniyet kontrolü)
+                        max_allowable_sl = entry_price * (1 - (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage) if side == "long" else entry_price * (1 + (MAX_ALLOWABLE_LOSS_ROI / 100.0) / leverage)
+                        if side == "long" and yeni_sl < max_allowable_sl: yeni_sl = max_allowable_sl
+                        elif side == "short" and yeni_sl > max_allowable_sl: yeni_sl = max_allowable_sl
+
                         if side == "long" and yeni_sl >= mark_price: yeni_sl = mark_price * 0.998 
                         elif side == "short" and yeni_sl <= mark_price: yeni_sl = mark_price * 1.002
 
@@ -430,7 +446,7 @@ def pozisyonlari_yonet(exchange, positions):
                         time.sleep(0.5)
                         close_side = "sell" if side == "long" else "buy"
                         exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {'stopPrice': float(exchange.price_to_precision(symbol, yeni_sl)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
-                        logging.info(f"[TRAILING STOP GÜNCELLENDİ] {symbol} | Yeni SL Fiyatı: {yeni_sl:.4f}")
+                        logging.info(f"[FIRSAT TRAILING STOP GÜNCELLENDİ] {symbol} | Yeni SL Fiyatı: {yeni_sl:.4f}")
                     except Exception as ex:
                         logging.error(f"Fırsat Trailing Stop Hata {symbol}: {ex}")
         except Exception as e:
