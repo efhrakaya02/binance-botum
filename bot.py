@@ -169,7 +169,7 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
     regresyon_orta = intercept + slope * (periyot - 1)
     analiz_ozeti = f"Eğim: {slope:.4f} | R² (Güvenilirlik): {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
     
-    min_r_squared = 0.58  # Scalp ve Fırsat kalitesini artırmak için güvenilirlik eşiği optimize edildi
+    min_r_squared = 0.58  # Scalp and Fırsat kalitesini artırmak için güvenilirlik eşiği optimize edildi
 
     if direction == "buy":
         if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.998):
@@ -205,15 +205,13 @@ def check_pullback_and_confirmation(df, direction):
 def scan_scalp_market(exchange):
     try:
         tickers = exchange.fetch_tickers()
-        sorted_tickers = sorted(
-            [t for t in tickers.values() if gecerli_kripto_mu(t['symbol'])], 
-            key=lambda x: float(x.get('quoteVolume', 0) or 0), 
-            reverse=True
-        )
-        top_symbols = [t['symbol'] for t in sorted_tickers[:35]]
+        usdt_tickers = [t for t in tickers.values() if gecerli_kripto_mu(t['symbol']) and t.get('percentage') is not None]
+        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:30]
+        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:20]
+        target_pool = list(set([t['symbol'] for t in gainers + losers]))
         
         candidates = []
-        for symbol in top_symbols:
+        for symbol in target_pool:
             df = ohlcv_getir(exchange, symbol, timeframe='15m', limit=60)
             if df is None: continue
             last_row = df.iloc[-1]
@@ -710,7 +708,7 @@ def durum():
                 "max_gorulen_zirve_kar_yuzde": round(pozisyon_en_yuksek_kar.get(sym, 0.0), 2)
             })
         return jsonify({"success": True, "aktif_islem_sayisi": len(detaylar), "islemler": detaylar})
-    except Exception as e:
+    end except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
 @app.route("/otomatik-analiz")
