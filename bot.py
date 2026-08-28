@@ -103,7 +103,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=50):
         
         high_low = df["high"] - df["low"]
         high_close = abs(df["high"] - df["close"].shift())
-        low_close = abs(df["low"] - df["close"].shift())
+        low_close = abs(df["low"] - df["low"].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
         
@@ -115,20 +115,13 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=50):
 # GELİŞMİŞ REGRESYON VE R-KARE (KANAL GÜCÜ) ANALİZİ
 # ============================================================
 def gelismis_regresyon_teyidi(df, direction, periyot=15):
-    """
-    Lineer Regresyon eğimi (slope) ile birlikte R-Kare (R²) korelasyon 
-    katsayısını hesaplayarak trendin ne kadar istikrarlı ve güçlü olduğunu teyit eder.
-    """
     if df is None or len(df) < periyot:
         return False, 0.0, 0.0, "Yetersiz veri uzunluğu nedeniyle regresyon hesaplanamadı."
 
     closes = df["close"].iloc[-periyot:].values
     x = np.arange(periyot)
     
-    # Lineer Regresyon Katsayıları
     slope, intercept = np.polyfit(x, closes, 1)
-    
-    # R-Kare (R²) Hesaplama (Kanal İstikrarı / Gürültü Filtresi)
     y_pred = intercept + slope * x
     corr_matrix = np.corrcoef(closes, y_pred)
     r_squared = corr_matrix[0, 1] ** 2 if not np.isnan(corr_matrix[0, 1]) else 0.0
@@ -141,18 +134,17 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
         f"Fiyat: {anlik_fiyat:.4f} | Kanal Değeri: {regresyon_orta:.4f}"
     )
 
-    # İstikrar eşiği: R² en az 0.35 olmalı ki fiyat rastgele zikzak çizmesin, düzgün bir kanal oluştursun.
     min_r_squared = 0.30
 
     if direction == "buy":
         if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.995):
-            return True, slope, r_squared, f"OYNAYLANDI (BUY) -> {analiz_ozeti} | Yükseliş trendi güçlü ve istikrarlı."
+            return True, slope, r_squared, f"ONAYLANDI (BUY) -> {analiz_ozeti} | Yükseliş trendi güçlü ve istikrarlı."
         else:
             return False, slope, r_squared, f"REDDEDİLDİ (BUY) -> {analiz_ozeti} | Eğim pozitif değil veya kanal istikrarsız (R² düşük)."
             
     elif direction == "sell":
         if slope < 0 and r_squared >= min_r_squared and anlik_fiyat <= (regresyon_orta * 1.005):
-            return True, slope, r_squared, f" ONAYLANDI (SELL) -> {analiz_ozeti} | Düşüş trendi güçlü ve istikrarlı."
+            return True, slope, r_squared, f"ONAYLANDI (SELL) -> {analiz_ozeti} | Düşüş trendi güçlü ve istikrarlı."
         else:
             return False, slope, r_squared, f"REDDEDİLDİ (SELL) -> {analiz_ozeti} | Eğim negatif değil veya kanal istikrarsız (R² düşük)."
 
@@ -175,13 +167,13 @@ def check_pullback_and_confirmation(df, direction):
 
     if direction == "buy":
         is_above_ema = last_close > ema50
-        momentum_ok = ema9 > ema21 # Hızlı ivme kontrolü
+        momentum_ok = ema9 > ema21
         has_pulled_back = prev_low <= df["ema50"].iloc[-2] or prev_close < df["open"].iloc[-2] or last_close > prev_close
         return is_above_ema and momentum_ok and has_pulled_back
     
     elif direction == "sell":
         is_below_ema = last_close < ema50
-        momentum_ok = ema9 < ema21 # Hızlı ivme kontrolü
+        momentum_ok = ema9 < ema21
         has_pulled_back = prev_high >= df["ema50"].iloc[-2] or prev_close > df["open"].iloc[-2] or last_close < prev_close
         return is_below_ema and momentum_ok and has_pulled_back
 
@@ -245,7 +237,6 @@ def scan_opportunity_market(exchange):
         tickers = exchange.fetch_tickers()
         usdt_tickers = [t for t in tickers.values() if gecerli_kripto_mu(t['symbol']) and t.get('percentage') is not None]
         
-        # En çok yükselen (%50+ dahil) ve düşen fırsat coinleri havuzu
         gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:15]
         losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:10]
         target_pool = list(set([t['symbol'] for t in gainers + losers]))
@@ -257,7 +248,6 @@ def scan_opportunity_market(exchange):
             
             last_row = df.iloc[-1]
             vol_mean = df['volume'].rolling(20).mean().iloc[-1]
-            # Hacim patlaması eşiği fırsatlar için 2.0 kata çıkarıldı (%50+ hareketleri yakalamak için)
             volume_spike = float(last_row['volume']) > (vol_mean * 2.0) if vol_mean > 0 else False
             rsi = float(last_row['rsi'])
             
@@ -380,7 +370,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE DETAYLI TAKİP LİSTESİ
+# POZİSYON MONİTÖRÜ VE ZİRVE TAKİPLİ TRAILING STOP SİSTEMİ
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -404,13 +394,15 @@ def pozisyonlari_yonet(exchange, positions):
         try:
             contracts = float(p.get("contracts") or 0)
             if contracts <= 0: continue
-            side = p.get("side")
+            side = p.get("side") # "long" veya "short"
             entry_price = float(p.get("entryPrice") or 0)
             mark_price = float(p.get("markPrice") or 0)
             leverage = float(p.get("leverage") or 1)
             if entry_price == 0 or mark_price == 0: continue
 
             p_type = pozisyon_tipleri.get(symbol, "bilinmiyor")
+            
+            # Anlık ROI Hesaplama
             roi = ((mark_price - entry_price) / entry_price) * 100 * leverage if side == "long" else ((entry_price - mark_price) / entry_price) * 100 * leverage
             
             current_max = pozisyon_en_yuksek_kar.get(symbol, 0.0)
@@ -418,25 +410,44 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
 
-            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Max Kar: %{current_max:.2f}")
+            logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | ROI: %{roi:.2f} | Zirve Kar: %{current_max:.2f}")
 
+            # Fırsat Modu İçin Zirve Takipli Trailing Stop Mekanizması
             if p_type == "opportunity":
                 yeni_sl = None
+                
+                # Kar %10 ve üzerine çıktıysa: Zirveden %3 geri çekilme toleransıyla kar kilitleme
                 if current_max >= 10.0:
-                    yeni_sl = mark_price * (1 - 0.02 / leverage) if side == "long" else mark_price * (1 + 0.02 / leverage)
+                    # Zirve ROI değerine karşılık gelen hedef fiyatı hesapla
+                    # Örn: Long için giriş * (1 + (zirve_roi - %3) / (100 * kaldıraç))
+                    hedef_roi_koruma = current_max - 3.0
+                    if side == "long":
+                        yeni_sl = entry_price * (1 + (hedef_roi_koruma / (100.0 * leverage)))
+                        # Güvenlik: Zirveden geri çekilme stopu asla giriş fiyatının altına düşemez
+                        if yeni_sl < entry_price:
+                            yeni_sl = entry_price
+                    else: # short
+                        yeni_sl = entry_price * (1 - (hedef_roi_koruma / (100.0 * leverage)))
+                        if yeni_sl > entry_price:
+                            yeni_sl = entry_price
+                            
+                # Kar %5 ile %10 arasındaysa: Başa baş (Breakeven) noktasına sabitle
                 elif current_max >= 5.0:
-                    yeni_sl = entry_price if side == "long" else entry_price
+                    yeni_sl = entry_price
 
+                # Eğer yeni bir SL seviyesi hesaplandıysa borsadaki emri güncelle
                 if yeni_sl is not None:
                     try:
                         exchange.cancel_all_orders(symbol)
                         close_side = "sell" if side == "long" else "buy"
-                        exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {'stopPrice': float(exchange.price_to_precision(symbol, yeni_sl)), 'reduceOnly': True})
-                        logging.info(f"[TRAILING STOP GÜNCELLENDİ] {symbol} yeni SL seviyesi: {yeni_sl}")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                        precision_sl = float(exchange.price_to_precision(symbol, yeni_sl))
+                        exchange.create_order(symbol, 'stop_market', close_side, contracts, None, {'stopPrice': precision_sl, 'reduceOnly': True})
+                        logging.info(f"[ZİRVE TRAILING STOP GÜNCELLENDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Yeni Borsaya Yazılan SL: {precision_sl}")
+                    except Exception as ex:
+                        logging.error(f"[TRAILING STOP HATA] {symbol} emir güncellenemedi: {ex}")
+
+        except Exception as e:
+            logging.error(f"Pozisyon yönetimi hata {symbol}: {e}")
 
 def pozisyon_monitor_loop():
     global monitor_basladi
@@ -565,7 +576,6 @@ def ana_tarama_dongusu():
                         else:
                             logging.info(f"[SCALP BEKLEMEDE] {sym} için anlık ivme ve trend teyidi bekleniyor.")
 
-            # Bellek Temizliği (Garbage Collection & DataFrame Freeing)
             for item in scalp_listesi:
                 if 'df' in item and item['df'] is not None: 
                     del item['df']
