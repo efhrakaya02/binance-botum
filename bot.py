@@ -74,7 +74,6 @@ def gecerli_kripto_mu(symbol):
     yasakli = ["UP/", "DOWN/", "BEAR/", "BULL/", "_", "BID", "ASK"]
     if not symbol.endswith("/USDT") and not "/USDT:" in symbol:
         return False
-    # BTC ve XAU türevlerini/kontratlarını analiz dışı bırak
     if "BTC" in symbol or "XAU" in symbol:
         return False
     for yasak in yasakli:
@@ -373,7 +372,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE KALDIRACA GÖRE ÖLÇEKLENMİŞ TRAILING STOP
+# POZİSYON MONİTÖRÜ VE KADEMELİ TRAILING STOP (YENİLENEN MANTIK)
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -421,32 +420,41 @@ def pozisyonlari_yonet(exchange, positions):
 
             logging.info(f"[TAKİP] {p_type.upper()} | {symbol} | Yön: {side.upper()} | Giriş: {entry_price} | Anlık: {mark_price} | Binance Net ROI: %{roi:.2f} | Zirve ROI: %{current_max:.2f}")
 
-            # Fırsat Modu İçin Zirveden Geri Çekilme (Kaldıraca Bölünmüş Fiyat Ölçeği)
+            # Fırsat Modu İçin Kademeli ve Zirveden Geri Çekilmeli Trailing Stop Mantığı
             if p_type == "opportunity":
                 yeni_sl = None
-                hedef_roi_koruma = 0.0
+                log_aciklama = ""
                 
-                # ROI zirvesi %10 ve üzerine çıktıysa: Zirve ROI'den %3 geriye esneme
-                if current_max >= 10.0:
+                # KURAL 1: Kritik Eşik %15 ve Üzeri -> Zirveden %3 Geri Çekilme (Trailing)
+                if current_max >= 15.0:
                     hedef_roi_koruma = current_max - 3.0
-                    
-                    # Kaldıraca bölünmüş fiyat değişim oranı
                     fiyat_degisim_orani = (hedef_roi_koruma / 100.0) / leverage
                     
                     if side == "long":
                         yeni_sl = entry_price * (1 + fiyat_degisim_orani)
-                        if yeni_sl < entry_price:
-                            yeni_sl = entry_price
-                    else: # short
+                        if yeni_sl < entry_price: yeni_sl = entry_price
+                    else:
                         yeni_sl = entry_price * (1 - fiyat_degisim_orani)
-                        if yeni_sl > entry_price:
-                            yeni_sl = entry_price
-                            
-                # ROI %5 ile %10 arasındaysa: Başa baş (Breakeven) noktasına sabitle
-                elif current_max >= 5.0:
-                    yeni_sl = entry_price
+                        if yeni_sl > entry_price: yeni_sl = entry_price
+                    log_aciklama = f"KRİTİK ZİRVE (%15+) | Zirve ROI: %{current_max:.2f} | Koruma ROI: %{hedef_roi_koruma:.2f}"
 
-                # Eğer yeni bir SL seviyesi hesaplandıysa borsadaki emri güncelle
+                # KURAL 2: %5 ile %15 Arası -> Kademeli Yükseltme ve Giriş Üstüne Taşıma
+                elif current_max >= 5.0:
+                    # %5 ile %15 arasındaki ilerlemeye göre stobu oransal olarak girişe ve üstüne çekiyoruz
+                    # İlerleme oranı: (%5 ile current_max arasındaki mesafe / 10) -> %5'te 0, %15'te 1.0 (Tam koruma/giriş üstü)
+                    oran = (current_max - 5.0) / 10.0
+                    
+                    if side == "long":
+                        # Giriş fiyatı ile anlık fiyat arasındaki mesafenin oranına göre ara kademe stop
+                        yeni_sl = entry_price + ((mark_price - entry_price) * oran * 0.5)
+                        if yeni_sl < entry_price: yeni_sl = entry_price # En azından başa başa sabitle
+                    else:
+                        yeni_sl = entry_price - ((entry_price - mark_price) * oran * 0.5)
+                        if yeni_sl > entry_price: yeni_sl = entry_price
+                        
+                    log_aciklama = f"KADEMELİ GEÇİŞ (%5-%15) | Zirve ROI: %{current_max:.2f} | Oran: %{oran*100:.1f}"
+
+                # Yeni bir SL seviyesi hesaplandıysa emri güncelle
                 if yeni_sl is not None:
                     try:
                         exchange.cancel_all_orders(symbol)
@@ -467,7 +475,7 @@ def pozisyonlari_yonet(exchange, positions):
                                 'workingType': 'MARK_PRICE'
                             }
                         )
-                        logging.info(f"[ROI ZİRVE TRAILING GÜNCELLENDİ] {symbol} | Zirve ROI: %{current_max:.2f} | Hedef Koruma ROI: %{hedef_roi_koruma:.2f} | Kaldıraç: {leverage}x | Yeni SL Fiyatı: {precision_sl}")
+                        logging.info(f"[KADEMELİ STOP GÜNCELLENDİ] {symbol} | {log_aciklama} | Kaldıraç: {leverage}x | Yeni SL Fiyatı: {precision_sl}")
                     except Exception as ex:
                         logging.error(f"[TRAILING STOP HATA] {symbol} emir güncellenemedi: {ex}")
 
@@ -543,7 +551,6 @@ def ana_tarama_dongusu():
             aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
             aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
             
-            # A) FIRSAT MODU: Detaylı Analiz, Regresyon ve Şeffaf Log Açıklaması
             if not aktif_firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
@@ -572,7 +579,6 @@ def ana_tarama_dongusu():
                         else:
                             logging.info(f"[FIRSAT BEKLEMEDE] {sym} takip listesinde, tüm teyitler henüz eşik değerde değil.")
 
-            # B) SCALP MODU: Detaylı Analiz, Hızlı İvme ve Şeffaf Log Açıklaması
             if not aktif_scalp_var and scalp_listesi:
                 for candidate in scalp_listesi:
                     sym = candidate['symbol']
@@ -642,7 +648,6 @@ def durum():
             lev = float(p.get("leverage", 1))
             side = p.get("side")
             
-            # Doğrudan Binance'in hesapladığı net yüzdeyi (ROI) al
             api_percentage = p.get("percentage")
             roi = float(api_percentage) if api_percentage is not None else 0.0
             max_kar = pozisyon_en_yuksek_kar.get(sym, 0.0)
