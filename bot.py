@@ -80,9 +80,9 @@ def gecerli_kripto_mu(symbol):
     return True
 
 # ============================================================
-# VERİ ÇEKME VE BELLEK DOSTU İNDİKATÖRLER
+# VERİ ÇEKME VE BELLEK DOSTU İNDİKATÖRLER (RAM Optimizasyonlu)
 # ============================================================
-def ohlcv_getir(exchange, symbol, timeframe, limit=60):
+def ohlcv_getir(exchange, symbol, timeframe, limit=50):
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not data or len(data) < 25:
@@ -139,7 +139,7 @@ def check_pullback_and_confirmation(df, direction):
     return False
 
 # ============================================================
-# SCALP MODU TARAMASI
+# SCALP MODU TARAMASI (Optimize Havuz: 20 Sembol)
 # ============================================================
 def scan_scalp_market(exchange):
     try:
@@ -149,7 +149,7 @@ def scan_scalp_market(exchange):
             key=lambda x: float(x.get('quoteVolume', 0) or 0), 
             reverse=True
         )
-        top_symbols = [t['symbol'] for t in sorted_tickers[:25]]
+        top_symbols = [t['symbol'] for t in sorted_tickers[:20]]
         
         candidates = []
         for symbol in top_symbols:
@@ -188,15 +188,15 @@ def scan_scalp_market(exchange):
         return []
 
 # ============================================================
-# FIRSAT MODU TARAMASI
+# FIRSAT MODU TARAMASI (Optimize Havuz: 12'şer Gainers/Losers, Max 70 Limit)
 # ============================================================
 def scan_opportunity_market(exchange):
     try:
         tickers = exchange.fetch_tickers()
         usdt_tickers = [t for t in tickers.values() if gecerli_kripto_mu(t['symbol']) and t.get('percentage') is not None]
         
-        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:15]
-        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:15]
+        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:12]
+        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:12]
         target_pool = list(set([t['symbol'] for t in gainers + losers]))
         
         candidates = []
@@ -243,17 +243,14 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             positions = exchange.fetch_positions()
             active_positions = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
-            # 1. Toplam Pozisyon Limiti Kontrolü (Max 2)
             if len(active_positions) >= MAX_TOTAL_POSITIONS: 
                 logging.warning(f"[SINIR AŞILDI] Toplam maksimum pozisyon sınırına ({MAX_TOTAL_POSITIONS}) ulaşıldı.")
                 return False
                 
-            # Aynı sembolde zaten pozisyon var mı kontrolü
             for p in active_positions:
                 if sembol_duzelt(p.get("symbol")) == symbol: 
                     return False
 
-            # Binance'teki gerçek açık pozisyonların sembollerini ve türlerini hesapla
             gercek_aktif_tipler = []
             for p in active_positions:
                 p_sym = sembol_duzelt(p.get("symbol"))
@@ -271,7 +268,6 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                 logging.info(f"[LİMİT KORUMA] Binance'te zaten aktif 1 Fırsat pozisyonu var. Yeni Fırsat açılmadı.")
                 return False
 
-            # Kaldıraç ve Marj Uygulaması
             leverage = LEVERAGE
             try:
                 exchange.set_margin_mode("isolated", symbol)
@@ -282,18 +278,16 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
             ticker = exchange.fetch_ticker(symbol)
             price = float(ticker["last"])
             
-            # Marj Kuralları: Scalp = 10 USDT, Fırsat = 15 USDT
             margin = OPPORTUNITY_MARGIN if p_type == "opportunity" else SCALP_MARGIN
             notional = margin * leverage
             raw_amount = notional / price
 
-            # --- Borsa Minimum Miktar ve Bakiye / Limit Kontrolü ---
             market = exchange.market(symbol)
             min_amount = market['limits']['amount']['min']
             
             if raw_amount < min_amount:
-                logging.warning(f"[BAKİYE/LİMİT YETERSİZ] {symbol} için hesaplanan miktar ({raw_amount}), borsanın minimum sınırından ({min_amount}) küçük. İşlem pas geçiliyor, sonraki adaya geçilecek.")
-                return False  # False döndürerek üst döngünün diğer adaylara geçmesini sağlıyoruz
+                logging.warning(f"[BAKİYE/LİMİT YETERSİZ] {symbol} minimum miktar sınırına ({min_amount}) takıldı. Pas geçiliyor.")
+                return False
 
             amount = float(exchange.amount_to_precision(symbol, raw_amount))
             gercek_notional = amount * price
@@ -314,6 +308,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type):
                     close_side = "sell" if side == "buy" else "buy"
                     df_temp = ohlcv_getir(exchange, symbol, "30m", 20)
                     atr = float(df_temp.iloc[-1]["atr"]) if df_temp is not None else (price * 0.01)
+                    del df_temp
                     
                     if p_type == "scalp":
                         fiyat_farki = SCALP_TARGET_USDT / amount
@@ -429,7 +424,6 @@ def ana_tarama_dongusu():
             
             logging.info("Hibrit Piyasa Taraması Başlatılıyor...")
             
-            # 1. Ayrı Listeler Halinde Taramalar
             scalp_listesi = scan_scalp_market(exchange)
             firsat_listesi = scan_opportunity_market(exchange)
             
@@ -449,7 +443,6 @@ def ana_tarama_dongusu():
                 logging.info("Fırsat kriterlerine uyan aday bulunamadı.")
             logging.info("========================================")
 
-            # Binance'den güncel açık pozisyonları doğrudan çek ve kontrol et
             positions = exchange.fetch_positions()
             active_pos = [p for p in positions if float(p.get("contracts") or 0) > 0]
             
@@ -462,7 +455,6 @@ def ana_tarama_dongusu():
             aktif_scalp_var = any(t == "scalp" for t in aktif_gercek_tipler)
             aktif_firsat_var = any(t == "opportunity" for t in aktif_gercek_tipler)
             
-            # A) FIRSAT MODU: Listeyi sırayla tarar, limiti/bakiyesi yetmeyeni atlar, uygun olanla işleme girer (Kotası: 1 Fırsat)
             if not aktif_firsat_var and firsat_listesi:
                 for candidate in firsat_listesi:
                     sym = candidate['symbol']
@@ -473,14 +465,13 @@ def ana_tarama_dongusu():
                         logging.info(f"[FIRSAT TEYİT ALINDI] {sym} için pullback onayı sağlandı, işleme giriliyor...")
                         basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity")
                         if basarili:
-                            break  # İşlem başarıyla açıldıysa döngüden çık
+                            break
                         else:
-                            logging.info(f"[FIRSAT ATLANDI] {sym} bakiye/limit kuralına takıldı, listedeki sonraki adaya geçiliyor...")
+                            logging.info(f"[FIRSAT ATLANDI] {sym} sınıra takıldı, sonraki adaya geçiliyor...")
                             continue
                     else:
-                        logging.info(f"[FIRSAT TAKİPTE] {sym} izleniyor, henüz teyit/pullback oluşmadı.")
+                        logging.info(f"[FIRSAT TAKİPTE] {sym} izleniyor, henüz teyit oluşmadı.")
 
-            # B) SCALP MODU: Adayları sırayla dener, limiti yetmeyeni atlayıp sonrakine geçer (Kotası: 1 Scalp)
             if not aktif_scalp_var and scalp_listesi:
                 for candidate in scalp_listesi:
                     sym = candidate['symbol']
@@ -491,18 +482,23 @@ def ana_tarama_dongusu():
                         logging.info(f"[SCALP TEYİT ALINDI] {sym} işleme alınıyor...")
                         basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp")
                         if basarili:
-                            break  # İşlem başarıyla açıldıysa döngüden çık
+                            break
                         else:
-                            logging.info(f"[SCALP ATLANDI] {sym} bakiye/limit kuralına takıldı, listedeki sonraki adaya geçiliyor...")
+                            logging.info(f"[SCALP ATLANDI] {sym} sınıra takıldı, sonraki adaya geçiliyor...")
                             continue
                     else:
                         logging.info(f"[SCALP BEKLİYOR] {sym} için teyit bekleniyor.")
 
-            # Temizlik
+            # Bellek Temizliği (Garbage Collection & DataFrame Freeing)
             for item in scalp_listesi:
-                if 'df' in item and item['df'] is not None: del item['df']
+                if 'df' in item and item['df'] is not None: 
+                    del item['df']
             for item in firsat_listesi:
-                if 'df' in item and item['df'] is not None: del item['df']
+                if 'df' in item and item['df'] is not None: 
+                    del item['df']
+            scalp_listesi.clear()
+            firsat_listesi.clear()
+            active_pos.clear()
 
         except Exception as e:
             logging.error(f"Ana döngü hatası: {e}")
