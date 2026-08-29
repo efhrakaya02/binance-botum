@@ -10,6 +10,7 @@ from flask import Flask, jsonify
 
 # ============================================================
 # RAILWAY & BINANCE OPTİMİZE HİBRİT BOT (SCALP & FIRSAT)
+# + MOMENTUM & ENTRY TIMING ENGINE ENTEGRASYONU
 # ============================================================
 
 app = Flask(__name__)
@@ -23,7 +24,7 @@ if not API_KEY or not SECRET_KEY:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ============================================================
-# ÇALIŞMA MODLARI VE KİLİTLİ LİMİTLER
+# ÇALIŞMA MODLARI VE KİLİTLİ LİMİTLER (CONFIG)
 # ============================================================
 TRADING_ENABLED = True
 POSITION_MONITOR_ENABLED = True
@@ -36,8 +37,19 @@ MAX_OPPORTUNITY_POSITIONS = 1# Maksimum 1 Fırsat pozisyonu (Kesin kural)
 MAX_TOTAL_POSITIONS = 2      # Toplamda maksimum 2 pozisyon (1 Scalp + 1 Fırsat)
 LEVERAGE = 5                 # KALDIRAÇ KESİN OLARAK 5X (Değiştirilemez)
 
-MIN_SCORE_THRESHOLD = 90     # Başarı oranını artırmak için minimum skor sınırı %90'a çıkarıldı
+MIN_SCORE_THRESHOLD = 90     # Başarı oranını artırmak için minimum skor sınırı %90
 SCALP_TARGET_USDT = 0.35     # Scalp modunda güncellenmiş minimum net kar hedefi (%3.5 ROI için 0.35 USDT)
+
+# --- YENİ MOMENTUM & ENTRY TIMING ENGINE CONFIG ---
+MOMENTUM_ENGINE_ENABLED = True
+MOMENTUM_MIN_SCORE = 65
+ACCELERATION_MIN_SCORE = 70
+ENTRY_MIN_SCORE = 75
+EXHAUSTION_MAX_ENTRY = 55
+BREAKOUT_MAX_ATR_DISTANCE = 1.5
+SCALP_EARLY_PROFIT_PROTECTION_ENABLED = True
+SCALP_EARLY_PROFIT_MIN_PNL = 0.20
+OPPORTUNITY_MOMENTUM_EXIT_ENABLED = True
 
 # Runtime State
 pozisyon_en_yuksek_kar = {}
@@ -116,7 +128,7 @@ def pozisyon_tipini_cozumle(p):
 # ============================================================
 # VERİ ÇEKME VE GELİŞMİŞ İNDİKATÖRLER
 # ============================================================
-def ohlcv_getir(exchange, symbol, timeframe, limit=80):
+def ohlcv_getir(exchange, symbol, timeframe, limit=100):
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not data or len(data) < 40:
@@ -126,12 +138,14 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=80):
         df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
         df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
         df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        df["ema200"] = df["close"].ewm(span=200, adjust=False).mean() if len(df) >= 200 else df["ema50"]
         
-        # MACD Hesaplama (Zamanlama Teyidi İçin)
+        # MACD Hesaplama
         exp12 = df["close"].ewm(span=12, adjust=False).mean()
         exp26 = df["close"].ewm(span=26, adjust=False).mean()
         df["macd"] = exp12 - exp26
         df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = df["macd"] - df["macd_signal"]
         
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0.0)
@@ -146,13 +160,36 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=80):
         low_close = abs(df["low"] - df["low"].shift())
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+        # ADX Hesaplama (Basitleştirilmiş True Range & Directional Movement)
+        plus_dm = df["high"].diff()
+        minus_dm = df["low"].diff() * -1
+        plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+        minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+        df["plus_di"] = 100 * pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / df["atr"].replace(0, np.nan)
+        df["minus_di"] = 100 * pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / df["atr"].replace(0, np.nan)
+        dx = 100 * abs(df["plus_di"] - df["minus_di"]) / (df["plus_di"] + df["minus_di"]).replace(0, np.nan)
+        df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(20)
+
+        # ROC (Rate of Change)
+        df["roc"] = df["close"].pct_change(periods=9) * 100
+
+        # Bollinger Bands
+        sma20 = df["close"].rolling(20).mean()
+        std20 = df["close"].rolling(20).std()
+        df["bb_upper"] = sma20 + (std20 * 2)
+        df["bb_lower"] = sma20 - (std20 * 2)
+        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / sma20.replace(0, np.nan)
+
+        # OBV (On-Balance Volume)
+        df["obv"] = (np.sign(df["close"].diff()) * df["volume"]).fillna(0).cumsum()
         
         return df
     except Exception:
         return None
 
 # ============================================================
-# GELİŞMİŞ REGRESYON VE TREND TEYİDİ (%90+ BAŞARI İÇİN)
+# GELİŞMİŞ REGRESYON VE TREND TEYİDİ
 # ============================================================
 def gelismis_regresyon_teyidi(df, direction, periyot=15):
     if df is None or len(df) < periyot:
@@ -167,9 +204,9 @@ def gelismis_regresyon_teyidi(df, direction, periyot=15):
     
     anlik_fiyat = closes[-1]
     regresyon_orta = intercept + slope * (periyot - 1)
-    analiz_ozeti = f"Eğim: {slope:.4f} | R² (Güvenilirlik): {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
+    analiz_ozeti = f"Eğim: {slope:.4f} | R²: {r_squared:.2f} | Fiyat: {anlik_fiyat:.4f}"
     
-    min_r_squared = 0.58  # Scalp and Fırsat kalitesini artırmak için güvenilirlik eşiği optimize edildi
+    min_r_squared = 0.58
 
     if direction == "buy":
         if slope > 0 and r_squared >= min_r_squared and anlik_fiyat >= (regresyon_orta * 0.998):
@@ -200,14 +237,123 @@ def check_pullback_and_confirmation(df, direction):
     return False
 
 # ============================================================
+# YENİ MOMENTUM & ENTRY TIMING ENGINE
+# ============================================================
+def calculate_momentum_engine(df, direction):
+    """
+    BUILDING -> ACCELERATING -> STRONG -> EXHAUSTING -> REVERSING aşamalarını
+    hesaplar ve detaylı skorlar üretir.
+    """
+    if df is None or len(df) < 20:
+        return {
+            "momentum_score": 50, "acceleration_score": 50, "exhaustion_score": 0,
+            "entry_score": 50, "state": "WAIT", "breakout_distance_atr": 0.0
+        }
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # 1. Momentum & Slope Hesaplamaları
+    adx_vals = df["adx"].iloc[-4:].values
+    adx_slope = adx_vals[-1] - adx_vals[0]
+    
+    macd_hist_vals = df["macd_hist"].iloc[-4:].values
+    macd_slope = macd_hist_vals[-1] - macd_hist_vals[0]
+    
+    ema9_vals = df["ema9"].iloc[-4:].values
+    ema21_vals = df["ema21"].iloc[-4:].values
+    spread = (ema9_vals - ema21_vals) / ema21_vals * 100
+    spread_slope = spread[-1] - spread[0]
+
+    vol_vals = df["volume"].iloc[-4:].values
+    vol_ma = df["volume"].rolling(10).mean().iloc[-1]
+    vol_ratio = last["volume"] / vol_ma if vol_ma > 0 else 1.0
+    vol_slope = vol_vals[-1] - vol_vals[0]
+
+    # 2. Breakout ve ATR Uzaklığı
+    recent_high = df["high"].iloc[-20:-1].max()
+    recent_low = df["low"].iloc[-20:-1].min()
+    atr = last["atr"] if last["atr"] > 0 else (last["close"] * 0.01)
+
+    if direction == "buy":
+        breakout_dist = (last["close"] - recent_high) / atr if last["close"] > recent_high else 0.0
+    else:
+        breakout_dist = (recent_low - last["close"]) / atr if last["close"] < recent_low else 0.0
+
+    # 3. Exhaustion (Tükenme) Skoru Hesaplama
+    exhaustion_factors = 0
+    if direction == "buy":
+        if last["rsi"] > 75: exhaustion_factors += 30
+        if breakout_dist > 1.5: exhaustion_factors += 35
+        if macd_slope < 0: exhaustion_factors += 20
+        if adx_slope < 0 and last["adx"] > 35: exhaustion_factors += 15
+    else:
+        if last["rsi"] < 25: exhaustion_factors += 30
+        if breakout_dist > 1.5: exhaustion_factors += 35
+        if macd_slope > 0: exhaustion_factors += 20
+        if adx_slope < 0 and last["adx"] > 35: exhaustion_factors += 15
+
+    exhaustion_score = min(max(exhaustion_factors, 0), 100)
+
+    # 4. Momentum & Acceleration Skorları
+    mom_score = 70
+    acc_score = 70
+
+    if direction == "buy":
+        if last["ema9"] > last["ema21"] > last["ema50"]: mom_score += 15
+        if last["macd_hist"] > 0: mom_score += 15
+        if adx_slope > 0: acc_score += 15
+        if spread_slope > 0: acc_score += 15
+        if vol_slope > 0: acc_score += 10
+    else:
+        if last["ema9"] < last["ema21"] < last["ema50"]: mom_score += 15
+        if last["macd_hist"] < 0: mom_score += 15
+        if adx_slope > 0: acc_score += 15
+        if spread_slope < 0: acc_score += 15
+        if vol_slope > 0: acc_score += 10
+
+    mom_score = min(max(mom_score, 0), 100)
+    acc_score = min(max(acc_score, 0), 100)
+
+    # 5. State Tespiti
+    if exhaustion_score >= 70:
+        state = "EXHAUSTING"
+    elif acc_score >= 75 and mom_score >= 75:
+        state = "ACCELERATING"
+    elif mom_score >= 70:
+        state = "STRONG"
+    elif mom_score >= 50:
+        state = "BUILDING"
+    else:
+        state = "REVERSING"
+
+    # 6. Entry Quality Score (Ağırlıklı)
+    entry_score = (
+        (mom_score * 0.25) +
+        (acc_score * 0.35) +
+        (min(vol_ratio * 30, 100) * 0.20) +
+        ((100 - exhaustion_score) * 0.20)
+    )
+
+    return {
+        "momentum_score": round(mom_score, 2),
+        "acceleration_score": round(acc_score, 2),
+        "exhaustion_score": round(exhaustion_score, 2),
+        "entry_score": round(entry_score, 2),
+        "state": state,
+        "breakout_distance_atr": round(breakout_dist, 2),
+        "volume_ratio": round(vol_ratio, 2)
+    }
+
+# ============================================================
 # OPTİMİZE EDİLMİŞ TARAMA VE PUANLAMA LİSTESİ OLUŞTURMA
 # ============================================================
 def scan_scalp_market(exchange):
     try:
         tickers = exchange.fetch_tickers()
         usdt_tickers = [t for t in tickers.values() if gecerli_kripto_mu(t['symbol']) and t.get('percentage') is not None]
-        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:30]
-        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:20]
+        gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:25]
+        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:25]
         target_pool = list(set([t['symbol'] for t in gainers + losers]))
         
         candidates = []
@@ -223,7 +369,6 @@ def scan_scalp_market(exchange):
             score = 75
             direction = None
             
-            # Scalp için daha kaliteli ve hızlı sürede TP yapacak hacim destekli koşullar
             if close > ema50 and ema9 > ema21:
                 if 53 < rsi < 65 and volume_spike:
                     direction = "buy"
@@ -234,7 +379,14 @@ def scan_scalp_market(exchange):
                     score += 20
                 
             if direction and score >= MIN_SCORE_THRESHOLD:
-                candidates.append({"symbol": symbol, "score": score, "direction": direction, "mode": "scalp", "df": df})
+                # Momentum Engine Değerlendirmesi
+                mom_data = calculate_momentum_engine(df, direction) if MOMENTUM_ENGINE_ENABLED else {"entry_score": 80, "state": "ACCELERATING", "exhaustion_score": 10, "breakout_distance_atr": 0.4}
+                
+                candidates.append({
+                    "symbol": symbol, "score": score, "direction": direction, "mode": "scalp", "df": df,
+                    "entry_score": mom_data["entry_score"], "momentum_state": mom_data["state"],
+                    "exhaustion_score": mom_data["exhaustion_score"], "breakout_dist": mom_data["breakout_distance_atr"]
+                })
             else:
                 del df
         candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -248,7 +400,7 @@ def scan_opportunity_market(exchange):
         tickers = exchange.fetch_tickers()
         usdt_tickers = [t for t in tickers.values() if gecerli_kripto_mu(t['symbol']) and t.get('percentage') is not None]
         gainers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=True)[:25]
-        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:15]
+        losers = sorted(usdt_tickers, key=lambda x: float(x['percentage']), reverse=False)[:25]
         target_pool = list(set([t['symbol'] for t in gainers + losers]))
         
         candidates = []
@@ -269,7 +421,13 @@ def scan_opportunity_market(exchange):
             if 45 < rsi < 60: score += 15
             
             if score >= MIN_SCORE_THRESHOLD:
-                candidates.append({"symbol": symbol, "score": score, "direction": direction, "mode": "opportunity", "df": df})
+                mom_data = calculate_momentum_engine(df, direction) if MOMENTUM_ENGINE_ENABLED else {"entry_score": 80, "state": "ACCELERATING", "exhaustion_score": 10, "breakout_distance_atr": 0.4}
+                
+                candidates.append({
+                    "symbol": symbol, "score": score, "direction": direction, "mode": "opportunity", "df": df,
+                    "entry_score": mom_data["entry_score"], "momentum_state": mom_data["state"],
+                    "exhaustion_score": mom_data["exhaustion_score"], "breakout_dist": mom_data["breakout_distance_atr"]
+                })
             else:
                 del df
         candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -337,10 +495,8 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
                 aciklama = (
-                    f"Selam! Yaptığım EMA, RSI, MACD, hacim ve gelişmiş regresyon trendi analizleri sonucunda "
-                    f"**{symbol}** coininin sinyal skoru **{score}** olarak belirlendi. Teyit için pullback ve regresyon "
-                    f"doğrulamalarını başarıyla tamamladım ve **%90+** başarılı bir işlem olacağı kanaatine vardığımdan "
-                    f"işlemi açmaya karar verdim. (Mod: {p_type.upper()} | Yön: {side.upper()} | Giriş: {price} | Marj: ~{gercek_margin:.2f} USDT | {analiz_detay})"
+                    f"Selam! Momentum & Entry Engine ve teknik analizler sonucunda **{symbol}** coininin sinyal skoru **{score}** "
+                    f"ve Entry Score yeterli bulunarak işlem açıldı. (Mod: {p_type.upper()} | Yön: {side.upper()} | Giriş: {price} | Marj: ~{gercek_margin:.2f} USDT | {analiz_detay})"
                 )
                 logging.info(aciklama)
                 
@@ -352,14 +508,13 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                     del df_temp
                     
                     if p_type == "scalp":
-                        fiyat_farki = SCALP_TARGET_USDT / amount  # 0.35 USDT (%3.5 ROI) hedefi için fiyat farkı
+                        fiyat_farki = SCALP_TARGET_USDT / amount
                         tp_price = (price + fiyat_farki) if side == "buy" else (price - fiyat_farki)
-                        sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5)) # Scalp için dengeli ATR stop
+                        sl_price = (price - (atr * 2.5)) if side == "buy" else (price + (atr * 2.5))
                         
                         exchange.create_order(symbol, 'take_profit_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, tp_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                     else:
-                        # Fırsat işlemleri için esnek ATR tabanlı dinamik stop (Sabit %7 zarar kes kaldırıldı)
                         sl_price = (price - (atr * 3.0)) if side == "buy" else (price + (atr * 3.0))
                         exchange.create_order(symbol, 'stop_market', close_side, amount, None, {'stopPrice': float(exchange.price_to_precision(symbol, sl_price)), 'reduceOnly': True, 'workingType': 'MARK_PRICE'})
                 except Exception as e:
@@ -370,7 +525,7 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
         return False
 
 # ============================================================
-# POZİSYON MONİTÖRÜ VE ETKİN TREND/HACİM KONTROLÜ
+# POZİSYON MONİTÖRÜ VE MOMENTUM AWARE PROFIT PROTECTION
 # ============================================================
 def pozisyonlari_yonet(exchange, positions):
     global onceki_aktif_pozisyonlar
@@ -410,42 +565,37 @@ def pozisyonlari_yonet(exchange, positions):
                 current_max = roi
                 logging.info(f"[ZİRVE KAR GÜNCELLENDİ] {symbol} ({p_type.upper()}) Yeni Max Zirve ROI: %{roi:.2f}")
 
-            # ========================================================
-            # FIRSAT İŞLEMLERDE SIKLAŞTIRILMIŞ TREND VE HACİM KONTROLÜ
-            # ========================================================
-            if p_type == "opportunity":
+            # --- SCALP ERKEN KAR KORUMA (MOMENTUM AWARE) ---
+            if p_type == "scalp" and SCALP_EARLY_PROFIT_PROTECTION_ENABLED:
                 try:
-                    df_live = ohlcv_getir(exchange, symbol, '1h', limit=30)
-                    if df_live is not None and len(df_live) >= 5:
-                        son_hacim = float(df_live['volume'].iloc[-1])
-                        ortalama_hacim = float(df_live['volume'].rolling(10).mean().iloc[-1])
-                        son_ema9 = float(df_live['ema9'].iloc[-1])
-                        son_ema21 = float(df_live['ema21'].iloc[-1])
-                        son_rsi = float(df_live['rsi'].iloc[-1])
-                        
-                        # Trend dönüş ve hacim kuruma tespiti
-                        hacim_kuruyor = son_hacim < (ortalama_hacim * 0.50)
-                        trend_tersine_dondu = (side == "long" and (son_ema9 < son_ema21 or son_rsi < 42)) or \
-                                              (side == "short" and (son_ema9 > son_ema21 or son_rsi > 58))
-                        
-                        if roi < 0 and (hacim_kuruyor or trend_tersine_dondu):
-                            logging.warning(f"[ACİL KORUMA - TREND/HACİM TERSİNE DÖNDÜ] {symbol} Fırsat işleminde zarar büyümeden piyasa emriyle kapatılıyor! (ROI: %{roi:.2f})")
-                            close_side = "sell" if side == "long" else "buy"
-                            exchange.cancel_all_orders(symbol)
-                            time.sleep(0.3)
-                            exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
-                            continue
-                        
-                        # Karlı işlemlerde %12 ROI aşılınca karı sabitleme kontrolü
-                        if roi >= 12.0 and (hacim_kuruyor or trend_tersine_dondu):
-                            logging.info(f"[GARANTİ KAR KORUMA] {symbol} Fırsat işleminde ROI %12'yi geçti ancak trend/hacim zayıfladı. Pozisyon güvenli kar al ile kapatılıyor!")
+                    df_live = ohlcv_getir(exchange, symbol, '15m', limit=20)
+                    if df_live is not None:
+                        mom_check = calculate_momentum_engine(df_live, "buy" if side=="long" else "sell")
+                        if roi >= SCALP_EARLY_PROFIT_MIN_PNL and (mom_check["exhaustion_score"] > 70 or mom_check["state"] == "EXHAUSTING"):
+                            logging.warning(f"[SCALP ERKEN KAR KORUMA] {symbol} kar seviyesi %{roi:.2f} iken momentum tükenmesi tespit edildi. Pozisyon kapatılıyor!")
                             close_side = "sell" if side == "long" else "buy"
                             exchange.cancel_all_orders(symbol)
                             time.sleep(0.3)
                             exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
                             continue
                 except Exception as ex:
-                    logging.error(f"Fırsat Trend/Hacim Kontrol Hatası {symbol}: {ex}")
+                    logging.error(f"Scalp Erken Kar Koruma Hatası {symbol}: {ex}")
+
+            # --- FIRSAT TREND / HACİM KONTROLÜ ---
+            if p_type == "opportunity":
+                try:
+                    df_live = ohlcv_getir(exchange, symbol, '1h', limit=30)
+                    if df_live is not None and len(df_live) >= 5:
+                        mom_check = calculate_momentum_engine(df_live, "buy" if side=="long" else "sell")
+                        if roi < 0 and mom_check["state"] == "EXHAUSTING":
+                            logging.warning(f"[ACİL KORUMA] {symbol} Fırsat işleminde exhaustion tetiklendi, pozisyon kapatılıyor! (ROI: %{roi:.2f})")
+                            close_side = "sell" if side == "long" else "buy"
+                            exchange.cancel_all_orders(symbol)
+                            time.sleep(0.3)
+                            exchange.create_order(symbol, "market", close_side, contracts, None, {"reduceOnly": True})
+                            continue
+                except Exception as ex:
+                    logging.error(f"Fırsat Momentum Kontrol Hatası {symbol}: {ex}")
 
                 # Fırsat Trailing Stop Yönetimi
                 yeni_sl = None
@@ -503,7 +653,7 @@ def monitor_baslat():
         threading.Thread(target=pozisyon_monitor_loop, daemon=True, name="PositionMonitor").start()
 
 # ============================================================
-# ANA HİBRİT ÇALIŞMA DÖNGÜSÜ VE SIRALI PUANLAMA/TEYİT
+# ANA HİBRİT ÇALIŞMA DÖNGÜSÜ
 # ============================================================
 def ana_tarama_dongusu():
     global son_detayli_analiz_raporu
@@ -555,9 +705,9 @@ def ana_tarama_dongusu():
                     logging.info(log_line)
                     aciklama_loglari.append(log_line)
 
-            # 1. FIRSAT KONTROLÜ VE PUANLAMA LİSTESİ (%90+ HEDEF)
+            # 1. FIRSAT KONTROLÜ VE PUANLAMA LİSTESİ
             if not aktif_firsat_var:
-                msg = "Fırsat pozisyonu eksik, Fırsat pazarı (%90+ yüksek teyitli tarama) başlatılıyor..."
+                msg = "Fırsat pozisyonu eksik, Fırsat pazarı taraması başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
@@ -568,9 +718,11 @@ def ana_tarama_dongusu():
                     firsat_takip.append({
                         "symbol": cand['symbol'],
                         "skor": cand['score'],
-                        "yon": cand['direction']
+                        "yon": cand['direction'],
+                        "entry_score": cand['entry_score'],
+                        "state": cand['momentum_state']
                     })
-                    logging.info(f"   {i}. Fırsat Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']}")
+                    logging.info(f"   {i}. Fırsat Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']} | EntryScore: {cand['entry_score']} | State: {cand['momentum_state']}")
 
                 if firsat_listesi:
                     for candidate in firsat_listesi:
@@ -582,20 +734,29 @@ def ana_tarama_dongusu():
                             pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
                             reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=20)
 
-                            detay_str = f"Fırsat Teyit Süzgeci [{sym}] (Puan: {candidate['score']}) -> Pullback: {pullback_ok} | {reg_mesaj}"
+                            # Momentum & Entry Timing Engine Kararı
+                            entry_score_ok = candidate['entry_score'] >= ENTRY_MIN_SCORE
+                            exhaustion_ok = candidate['exhaustion_score'] <= EXHAUSTION_MAX_ENTRY
+                            state_ok = candidate['momentum_state'] in ["BUILDING", "ACCELERATING", "STRONG"]
+
+                            detay_str = f"Fırsat Teyit Süzgeci [{sym}] -> Pullback: {pullback_ok} | EntryScore: {candidate['entry_score']} | State: {candidate['momentum_state']} | Exhaustion: {candidate['exhaustion_score']}"
                             logging.info(f"   {detay_str}")
                             aciklama_loglari.append(detay_str)
 
-                            if pullback_ok and reg_ok:
-                                analiz_detayi = f"Skor: {candidate['score']}, Pullback: {pullback_ok}, {reg_mesaj}"
-                                basari_mesaji = f"[FIRSAT ONAYLANDI (%90+)] {sym} tüm teyitlerden geçti, işlem açılıyor... | Gerekçe: {analiz_detayi}"
+                            if pullback_ok and reg_ok and entry_score_ok and exhaustion_ok and state_ok:
+                                analiz_detayi = f"Skor: {candidate['score']}, EntryScore: {candidate['entry_score']}, State: {candidate['momentum_state']}"
+                                basari_mesaji = f"[FIRSAT ONAYLANDI] {sym} tüm Momentum & Teyit süzgeçlerinden geçti, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
                                 basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "opportunity", analiz_detayi)
                                 if basarili:
-                                    anlik_islem_loglari.append(f"Fırsat Modu: {sym} ({dir_val.upper()}) açıldı. | Analiz Verileri: {analiz_detayi}")
+                                    anlik_islem_loglari.append(f"Fırsat Modu: {sym} ({dir_val.upper()}) açıldı. | {analiz_detayi}")
                                     break
+                            else:
+                                reject_msg = f"[REJECT/WAIT] {sym} -> EntryScore/Exhaustion/State kısıtına takıldı (State: {candidate['momentum_state']}, Exhaustion: {candidate['exhaustion_score']})"
+                                logging.info(reject_msg)
+                                aciklama_loglari.append(reject_msg)
                 for item in firsat_listesi:
                     if 'df' in item and item['df'] is not None: del item['df']
             else:
@@ -603,9 +764,9 @@ def ana_tarama_dongusu():
                 logging.info(msg)
                 aciklama_loglari.append(msg)
 
-            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ (0.35 USDT (%3.5 ROI) HEDEF & YÜKSEK KALİTE TEYİT)
+            # 2. SCALP KONTROLÜ VE PUANLAMA LİSTESİ
             if not aktif_scalp_var:
-                msg = "Scalp pozisyonu eksik, Scalp pazarı (0.35 USDT / %3.5 ROI TP Hedefli Yüksek Kalite Tarama) başlatılıyor..."
+                msg = "Scalp pozisyonu eksik, Scalp pazarı taraması başlatılıyor..."
                 logging.info(msg)
                 aciklama_loglari.append(msg)
                 
@@ -616,9 +777,11 @@ def ana_tarama_dongusu():
                     scalp_takip.append({
                         "symbol": cand['symbol'],
                         "skor": cand['score'],
-                        "yon": cand['direction']
+                        "yon": cand['direction'],
+                        "entry_score": cand['entry_score'],
+                        "state": cand['momentum_state']
                     })
-                    logging.info(f"   {i}. Scalp Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']}")
+                    logging.info(f"   {i}. Scalp Adayı -> Sembol: {cand['symbol']} | Yön: {cand['direction'].upper()} | Puan: {cand['score']} | EntryScore: {cand['entry_score']} | State: {cand['momentum_state']}")
 
                 if scalp_listesi:
                     for candidate in scalp_listesi:
@@ -630,20 +793,28 @@ def ana_tarama_dongusu():
                             pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
                             reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=12)
 
-                            detay_str = f"Scalp Teyit Süzgeci [{sym}] (Puan: {candidate['score']}) -> Pullback: {pullback_ok} | {reg_mesaj}"
+                            entry_score_ok = candidate['entry_score'] >= ENTRY_MIN_SCORE
+                            exhaustion_ok = candidate['exhaustion_score'] <= EXHAUSTION_MAX_ENTRY
+                            state_ok = candidate['momentum_state'] in ["BUILDING", "ACCELERATING", "STRONG"]
+
+                            detay_str = f"Scalp Teyit Süzgeci [{sym}] -> Pullback: {pullback_ok} | EntryScore: {candidate['entry_score']} | State: {candidate['momentum_state']} | Exhaustion: {candidate['exhaustion_score']}"
                             logging.info(f"   {detay_str}")
                             aciklama_loglari.append(detay_str)
 
-                            if pullback_ok and reg_ok:
-                                analiz_detayi = f"Skor: {candidate['score']}, Pullback: {pullback_ok}, {reg_mesaj}"
-                                basari_mesaji = f"[SCALP ONAYLANDI (%3.5 ROI TP)] {sym} tüm teyitlerden geçti, işlem açılıyor... | Gerekçe: {analiz_detayi}"
+                            if pullback_ok and reg_ok and entry_score_ok and exhaustion_ok and state_ok:
+                                analiz_detayi = f"Skor: {candidate['score']}, EntryScore: {candidate['entry_score']}, State: {candidate['momentum_state']}"
+                                basari_mesaji = f"[SCALP ONAYLANDI] {sym} tüm momentum teyitlerinden geçti, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
                                 
                                 basarili = pozisyon_ac(exchange, sym, dir_val, candidate['score'], "scalp", analiz_detayi)
                                 if basarili:
-                                    anlik_islem_loglari.append(f"Scalp Modu: {sym} ({dir_val.upper()}) açıldı. | Analiz Verileri: {analiz_detayi}")
+                                    anlik_islem_loglari.append(f"Scalp Modu: {sym} ({dir_val.upper()}) açıldı. | {analiz_detayi}")
                                     break
+                            else:
+                                reject_msg = f"[REJECT/WAIT] {sym} -> Scalp Entry kısıtına takıldı (State: {candidate['momentum_state']}, Exhaustion: {candidate['exhaustion_score']})"
+                                logging.info(reject_msg)
+                                aciklama_loglari.append(reject_msg)
                 for item in scalp_listesi:
                     if 'df' in item and item['df'] is not None: del item['df']
             else:
@@ -677,7 +848,7 @@ def ana_tarama_dongusu():
 # ============================================================
 @app.route("/")
 def index():
-    return jsonify({"status": "Bot Aktif ve Özerk Çalışıyor", "acik_pozisyonlar": list(pozisyon_tipleri.keys())})
+    return jsonify({"status": "Bot Aktif, Özerk ve Momentum Engine Entegre Çalışıyor", "acik_pozisyonlar": list(pozisyon_tipleri.keys())})
 
 @app.route("/durum")
 def durum():
@@ -715,7 +886,7 @@ def durum():
 def otomatik_analiz():
     return jsonify({
         "success": True,
-        "mesaj": "Detaylı tarama ve analiz raporu başarıyla getirildi.",
+        "mesaj": "Detaylı Momentum & Tarama Raporu Başarıyla Getirildi.",
         "analiz_raporu": son_detayli_analiz_raporu
     })
 
