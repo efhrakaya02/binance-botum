@@ -3379,8 +3379,8 @@ def pozisyon_monitor_loop():
 
             exchange = None
 
-        # Pozisyon yönetimi analiz cronundan bağımsızdır.
-        time.sleep(5.0)
+        # Süre 15 saniyeye güncellendi
+        time.sleep(15.0)
 
 
 # ============================================================
@@ -3957,10 +3957,11 @@ def ana_tarama_dongusu():
 
         logging.info(
             ">>> ANALİZ TAMAMLANDI - "
-            "120 SANİYE BEKLENİYOR <<<"
+            "300 SANİYE BEKLENİYOR <<<"
         )
 
-        time.sleep(120)
+        # Süre 300 saniyeye güncellendi
+        time.sleep(300)
 
 
 # ============================================================
