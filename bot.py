@@ -4081,7 +4081,8 @@ def durum():
 def otomatik_analiz():
 
     return jsonify({
-        "success": True,
+        "success":
+            True,
         "mesaj":
             "Momentum & Entry Timing analiz raporu",
         "analiz_raporu":
