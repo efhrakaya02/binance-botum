@@ -240,10 +240,6 @@ def check_pullback_and_confirmation(df, direction):
 # YENİ MOMENTUM & ENTRY TIMING ENGINE
 # ============================================================
 def calculate_momentum_engine(df, direction):
-    """
-    BUILDING -> ACCELERATING -> STRONG -> EXHAUSTING -> REVERSING aşamalarını
-    hesaplar ve detaylı skorlar üretir.
-    """
     if df is None or len(df) < 20:
         return {
             "momentum_score": 50, "acceleration_score": 50, "exhaustion_score": 0,
@@ -251,9 +247,7 @@ def calculate_momentum_engine(df, direction):
         }
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
     
-    # 1. Momentum & Slope Hesaplamaları
     adx_vals = df["adx"].iloc[-4:].values
     adx_slope = adx_vals[-1] - adx_vals[0]
     
@@ -270,7 +264,6 @@ def calculate_momentum_engine(df, direction):
     vol_ratio = last["volume"] / vol_ma if vol_ma > 0 else 1.0
     vol_slope = vol_vals[-1] - vol_vals[0]
 
-    # 2. Breakout ve ATR Uzaklığı
     recent_high = df["high"].iloc[-20:-1].max()
     recent_low = df["low"].iloc[-20:-1].min()
     atr = last["atr"] if last["atr"] > 0 else (last["close"] * 0.01)
@@ -280,7 +273,6 @@ def calculate_momentum_engine(df, direction):
     else:
         breakout_dist = (recent_low - last["close"]) / atr if last["close"] < recent_low else 0.0
 
-    # 3. Exhaustion (Tükenme) Skoru Hesaplama
     exhaustion_factors = 0
     if direction == "buy":
         if last["rsi"] > 75: exhaustion_factors += 30
@@ -295,7 +287,6 @@ def calculate_momentum_engine(df, direction):
 
     exhaustion_score = min(max(exhaustion_factors, 0), 100)
 
-    # 4. Momentum & Acceleration Skorları
     mom_score = 70
     acc_score = 70
 
@@ -315,7 +306,6 @@ def calculate_momentum_engine(df, direction):
     mom_score = min(max(mom_score, 0), 100)
     acc_score = min(max(acc_score, 0), 100)
 
-    # 5. State Tespiti
     if exhaustion_score >= 70:
         state = "EXHAUSTING"
     elif acc_score >= 75 and mom_score >= 75:
@@ -327,7 +317,6 @@ def calculate_momentum_engine(df, direction):
     else:
         state = "REVERSING"
 
-    # 6. Entry Quality Score (Ağırlıklı)
     entry_score = (
         (mom_score * 0.25) +
         (acc_score * 0.35) +
@@ -379,7 +368,6 @@ def scan_scalp_market(exchange):
                     score += 20
                 
             if direction and score >= MIN_SCORE_THRESHOLD:
-                # Momentum Engine Değerlendirmesi
                 mom_data = calculate_momentum_engine(df, direction) if MOMENTUM_ENGINE_ENABLED else {"entry_score": 80, "state": "ACCELERATING", "exhaustion_score": 10, "breakout_distance_atr": 0.4}
                 
                 candidates.append({
@@ -486,6 +474,16 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                 gercek_margin = gercek_notional / leverage
 
             side = "buy" if direction == "buy" else "sell"
+            
+            # --- DETAYLI İŞLEM GEREKÇESİ VE KRİTER LOGU ---
+            logging.info("============================================================")
+            logging.info(f"[İŞLEM AÇILIYOR] Sembol: {symbol} | Tür: {p_type.upper()} | Yön: {side.upper()}")
+            logging.info(f"   -> Teknik Kriter Açıklaması:")
+            logging.info(f"      1. Sinyal Skoru: {score} (Eşik: >= {MIN_SCORE_THRESHOLD})")
+            logging.info(f"      2. Momentum & Entry Timing Detayları: {analiz_detay}")
+            logging.info(f"      3. Giriş Fiyatı: {price} | Marj: ~{gercek_margin:.2f} USDT | Kaldıraç: {leverage}X")
+            logging.info("============================================================")
+
             order = exchange.create_order(symbol, "market", side, amount, None, {"leverage": leverage})
             
             if order:
@@ -495,8 +493,8 @@ def pozisyon_ac(exchange, symbol, direction, score, p_type, analiz_detay=""):
                 pozisyon_en_yuksek_kar[symbol] = 0.0
                 
                 aciklama = (
-                    f"Selam! Momentum & Entry Engine ve teknik analizler sonucunda **{symbol}** coininin sinyal skoru **{score}** "
-                    f"ve Entry Score yeterli bulunarak işlem açıldı. (Mod: {p_type.upper()} | Yön: {side.upper()} | Giriş: {price} | Marj: ~{gercek_margin:.2f} USDT | {analiz_detay})"
+                    f"Başarılı! **{symbol}** coini için Momentum & Entry Engine ve teknik kurallar onaylandı "
+                    f"ve işlem açıldı. (Mod: {p_type.upper()} | Yön: {side.upper()} | Giriş: {price} | Marj: ~{gercek_margin:.2f} USDT)"
                 )
                 logging.info(aciklama)
                 
@@ -544,6 +542,10 @@ def pozisyonlari_yonet(exchange, positions):
 
     onceki_aktif_pozisyonlar = aktif_semboller.copy()
 
+    # Eğer aktif pozisyon varsa, sık takip logu üret
+    if positions:
+        logging.info("--- [AKTİF POZİSYON ANLIK TAKİP RAPORU] ---")
+
     for p in positions:
         symbol = sembol_duzelt(p.get("symbol"))
         try:
@@ -564,6 +566,9 @@ def pozisyonlari_yonet(exchange, positions):
                 pozisyon_en_yuksek_kar[symbol] = roi
                 current_max = roi
                 logging.info(f"[ZİRVE KAR GÜNCELLENDİ] {symbol} ({p_type.upper()}) Yeni Max Zirve ROI: %{roi:.2f}")
+
+            # Sık Pozisyon Takip Bilgisi Logu
+            logging.info(f"   > Pozisyon Takip [{symbol} | {p_type.upper()} | {side.upper()}] -> Anlık ROI: %{roi:.2f} | Max Zirve: %{current_max:.2f} | Giriş: {entry_price} | Anlık Fiyat: {mark_price}")
 
             # --- SCALP ERKEN KAR KORUMA (MOMENTUM AWARE) ---
             if p_type == "scalp" and SCALP_EARLY_PROFIT_PROTECTION_ENABLED:
@@ -646,7 +651,7 @@ def pozisyon_monitor_loop():
                     pozisyon_monitor_lock.release()
         except Exception:
             exchange = None
-        time.sleep(5.0)
+        time.sleep(5.0) # Her 5 saniyede bir sık takip ve loglama
 
 def monitor_baslat():
     if POSITION_MONITOR_ENABLED:
@@ -734,7 +739,6 @@ def ana_tarama_dongusu():
                             pullback_ok = check_pullback_and_confirmation(df_check, dir_val)
                             reg_ok, slope_val, r2_val, reg_mesaj = gelismis_regresyon_teyidi(df_check, dir_val, periyot=20)
 
-                            # Momentum & Entry Timing Engine Kararı
                             entry_score_ok = candidate['entry_score'] >= ENTRY_MIN_SCORE
                             exhaustion_ok = candidate['exhaustion_score'] <= EXHAUSTION_MAX_ENTRY
                             state_ok = candidate['momentum_state'] in ["BUILDING", "ACCELERATING", "STRONG"]
@@ -744,7 +748,7 @@ def ana_tarama_dongusu():
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok and entry_score_ok and exhaustion_ok and state_ok:
-                                analiz_detayi = f"Skor: {candidate['score']}, EntryScore: {candidate['entry_score']}, State: {candidate['momentum_state']}"
+                                analiz_detayi = f"Skor: {candidate['score']}, EntryScore: {candidate['entry_score']}, State: {candidate['momentum_state']}, Pullback: {pullback_ok}, RegR2: {r2_val:.2f}"
                                 basari_mesaji = f"[FIRSAT ONAYLANDI] {sym} tüm Momentum & Teyit süzgeçlerinden geçti, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
@@ -802,7 +806,7 @@ def ana_tarama_dongusu():
                             aciklama_loglari.append(detay_str)
 
                             if pullback_ok and reg_ok and entry_score_ok and exhaustion_ok and state_ok:
-                                analiz_detayi = f"Skor: {candidate['score']}, EntryScore: {candidate['entry_score']}, State: {candidate['momentum_state']}"
+                                analiz_detayi = f"Skor: {candidate['score']}, EntryScore: {candidate['entry_score']}, State: {candidate['momentum_state']}, Pullback: {pullback_ok}, RegR2: {r2_val:.2f}"
                                 basari_mesaji = f"[SCALP ONAYLANDI] {sym} tüm momentum teyitlerinden geçti, işlem açılıyor..."
                                 logging.info(basari_mesaji)
                                 aciklama_loglari.append(basari_mesaji)
