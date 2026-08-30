@@ -11,20 +11,8 @@ from flask import Flask, jsonify
 # ============================================================
 # RAILWAY & BINANCE HİBRİT BOT
 # SCALP + OPPORTUNITY
-#
-# GELİŞTİRİLMİŞ:
-# - Momentum Engine
-# - Acceleration Engine
-# - Setup / Trigger / Confirmation / Entry
-# - Multi-Timeframe Confirmation
-# - Closed Candle Signal
-# - Breakout Timing
-# - Volume Acceleration
-# - Structure
-# - Pullback
-# - Time Stop
-# - Profit Protection
-# - ATR Dynamic Management
+# DİNAMİK TRADE PLAN + MOMENTUM CONTINUATION
+# DİNAMİK TP + RİSK KORUMASI + TRAILING
 # ============================================================
 
 app = Flask(__name__)
@@ -50,7 +38,6 @@ logging.basicConfig(
 TRADING_ENABLED = True
 POSITION_MONITOR_ENABLED = True
 
-# Finansal kurallar
 SCALP_MARGIN = 10.0
 OPPORTUNITY_MARGIN = 15.0
 
@@ -65,34 +52,84 @@ LEVERAGE = 5
 # ============================================================
 
 SCALP_TARGET_USDT = 0.35
+SCALP_MIN_TARGET_USDT = 0.25
+SCALP_MAX_TARGET_USDT = 0.55
 
-# Yaklaşık komisyon + slip payı.
-# Binance ücret yapısı hesaba göre değişebileceği için
-# güvenlik marjı kullanıyoruz.
 SCALP_FEE_BUFFER_USDT = 0.04
 
-SCALP_MAX_HOLD_MINUTES = 35
+SCALP_MIN_HOLD_MINUTES = 3
+SCALP_MAX_HOLD_MINUTES = 25
 
 SCALP_EARLY_PROFIT_PROTECTION_ENABLED = True
-SCALP_EARLY_PROFIT_MIN_ROI = 1.8
-
-# Kâr oluştuğunda geri vermeyi önlemek için
-SCALP_PROFIT_LOCK_ROI = 2.0
+SCALP_EARLY_PROFIT_MIN_ROI = 1.5
+SCALP_PROFIT_LOCK_ROI = 1.8
 
 # ============================================================
 # OPPORTUNITY
 # ============================================================
 
-OPPORTUNITY_MAX_HOLD_HOURS = 24
+OPPORTUNITY_TARGET_USDT = 0.75
+OPPORTUNITY_MIN_TARGET_USDT = 0.55
+OPPORTUNITY_MAX_TARGET_USDT = 1.50
+
+OPPORTUNITY_MIN_HOLD_MINUTES = 10
+OPPORTUNITY_MAX_HOLD_HOURS = 8
 
 OPPORTUNITY_MOMENTUM_EXIT_ENABLED = True
+
+# ============================================================
+# RİSK YÖNETİMİ
+# ============================================================
+
+# KRİTİK:
+# Maksimum planlı zarar = hedef kârın %75'i
+MAX_LOSS_TO_TARGET_RATIO = 0.75
+
+# Pozisyonun zarar oranı hedefe göre hesaplanır.
+# Margin üzerinden ROI hesaplanır.
+
+# ============================================================
+# TRAILING STOP
+# ============================================================
+
+TRAILING_ENABLED = True
+
+SCALP_TRAILING_START_RATIO = 0.55
+SCALP_TRAILING_LOCK_RATIO = 0.35
+
+OPPORTUNITY_TRAILING_START_RATIO = 0.50
+OPPORTUNITY_TRAILING_LOCK_RATIO = 0.30
+
+TRAILING_ATR_MULT_MIN = 0.45
+TRAILING_ATR_MULT_MAX = 1.10
+
+# ============================================================
+# MOMENTUM CONTINUATION
+# ============================================================
+
+MOMENTUM_ENGINE_ENABLED = True
+MOMENTUM_CONTINUATION_ENABLED = True
+
+MOMENTUM_HEALTH_EXIT_SCORE = 35
+MOMENTUM_WEAK_SCORE = 48
+MOMENTUM_STRONG_SCORE = 70
+
+# ============================================================
+# ENTRY
+# ============================================================
+
+ENTRY_TIMING_ENABLED = True
+ENTRY_REQUIRE_TRIGGER = True
+ENTRY_REQUIRE_CONFIRMATION = True
+
+ENTRY_MAX_CANDLE_ATR = 1.80
 
 # ============================================================
 # TARAMA
 # ============================================================
 
-GAINER_COUNT = 25
-LOSER_COUNT = 25
+GAINER_COUNT = 20
+LOSER_COUNT = 20
 
 SCALP_SCAN_TIMEFRAME = "15m"
 SCALP_TRIGGER_TIMEFRAME = "5m"
@@ -117,48 +154,23 @@ OPPORTUNITY_MIN_ENTRY_SCORE = 80
 SCALP_MIN_MOMENTUM = 70
 OPPORTUNITY_MIN_MOMENTUM = 65
 
-SCALP_MIN_ACCELERATION = 75
-OPPORTUNITY_MIN_ACCELERATION = 70
+SCALP_MIN_ACCELERATION = 70
+OPPORTUNITY_MIN_ACCELERATION = 65
 
 SCALP_MAX_EXHAUSTION = 55
 OPPORTUNITY_MAX_EXHAUSTION = 60
 
 # ============================================================
-# BREAKOUT
+# BREAKOUT & HACİM
 # ============================================================
 
-# Fiyat breakout seviyesinin bu kadar ATR üzerinde ise
-# giriş kovalanmış kabul edilir.
 SCALP_MAX_BREAKOUT_ATR = 0.90
 OPPORTUNITY_MAX_BREAKOUT_ATR = 1.50
 
-# İdeal breakout bölgesi
 IDEAL_BREAKOUT_ATR = 0.65
-
-# ============================================================
-# HACİM
-# ============================================================
 
 SCALP_MIN_VOLUME_RATIO = 1.30
 OPPORTUNITY_MIN_VOLUME_RATIO = 1.50
-
-# ============================================================
-# MOMENTUM ENGINE
-# ============================================================
-
-MOMENTUM_ENGINE_ENABLED = True
-
-# ============================================================
-# ENTRY ENGINE
-# ============================================================
-
-ENTRY_TIMING_ENABLED = True
-
-ENTRY_REQUIRE_TRIGGER = True
-ENTRY_REQUIRE_CONFIRMATION = True
-
-# Çok kısa sürede aşırı hareket etmiş coinleri kovalamama
-ENTRY_MAX_CANDLE_ATR = 1.80
 
 # ============================================================
 # COOLDOWN
@@ -172,14 +184,21 @@ cooldown_map = {}
 # ============================================================
 
 pozisyon_en_yuksek_kar = {}
+pozisyon_en_yuksek_roi = {}
+
 pozisyon_tipleri = {}
 pozisyon_yonleri = {}
-pozisyon_giris_fiyatlari = {}
 
+pozisyon_giris_fiyatlari = {}
 pozisyon_acilis_zamanlari = {}
 
-# Son kullanılan trailing fiyatı
 pozisyon_son_sl = {}
+
+pozisyon_trade_plan = {}
+pozisyon_saglik_loglari = {}
+
+pozisyon_son_momentum = {}
+pozisyon_son_analiz_zamani = {}
 
 onceki_aktif_pozisyonlar = set()
 
@@ -203,7 +222,6 @@ monitor_basladi = False
 # ============================================================
 
 def get_exchange():
-
     return ccxt.binance({
         "apiKey": API_KEY,
         "secret": SECRET_KEY,
@@ -216,16 +234,17 @@ def get_exchange():
     })
 
 
-def sembol_duzelt(symbol):
+# ============================================================
+# SYMBOL
+# ============================================================
 
+def sembol_duzelt(symbol):
     if symbol == "BCC/USDT":
         return "BCH/USDT"
-
     return symbol
 
 
 def gecerli_kripto_mu(symbol):
-
     if not symbol:
         return False
 
@@ -257,9 +276,7 @@ def gecerli_kripto_mu(symbol):
 # ============================================================
 
 def cooldown_aktif_mi(symbol):
-
     now = time.time()
-
     son_islem = cooldown_map.get(symbol)
 
     if son_islem is None:
@@ -269,7 +286,6 @@ def cooldown_aktif_mi(symbol):
 
 
 def cooldown_baslat(symbol):
-
     cooldown_map[symbol] = time.time()
 
 
@@ -278,20 +294,17 @@ def cooldown_baslat(symbol):
 # ============================================================
 
 def pozisyon_tipini_cozumle(p):
-
     sym = sembol_duzelt(p.get("symbol"))
 
     if sym in pozisyon_tipleri:
         return pozisyon_tipleri[sym]
 
     try:
-
         contracts = float(p.get("contracts") or 0)
         entry_price = float(p.get("entryPrice") or 0)
         leverage = float(p.get("leverage") or LEVERAGE)
 
         if contracts > 0 and entry_price > 0:
-
             notional = contracts * entry_price
             margin = notional / leverage
 
@@ -313,9 +326,7 @@ def pozisyon_tipini_cozumle(p):
 # ============================================================
 
 def ohlcv_getir(exchange, symbol, timeframe, limit=250):
-
     try:
-
         data = exchange.fetch_ohlcv(
             symbol,
             timeframe=timeframe,
@@ -337,10 +348,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             ]
         )
 
-        # ----------------------------------------------------
         # EMA
-        # ----------------------------------------------------
-
         df["ema9"] = df["close"].ewm(
             span=9,
             adjust=False
@@ -356,16 +364,12 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             adjust=False
         ).mean()
 
-        # Gerçek EMA200
         df["ema200"] = df["close"].ewm(
             span=200,
             adjust=False
         ).mean()
 
-        # ----------------------------------------------------
         # MACD
-        # ----------------------------------------------------
-
         exp12 = df["close"].ewm(
             span=12,
             adjust=False
@@ -388,14 +392,18 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             df["macd_signal"]
         )
 
-        # ----------------------------------------------------
         # RSI
-        # ----------------------------------------------------
-
         delta = df["close"].diff()
 
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
+        gain = delta.where(
+            delta > 0,
+            0.0
+        )
+
+        loss = -delta.where(
+            delta < 0,
+            0.0
+        )
 
         avg_gain = gain.ewm(
             alpha=1 / 14,
@@ -412,19 +420,12 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             np.nan
         )
 
-        df["rsi"] = (
-            100 -
-            (100 / (1 + rs))
+        df["rsi"] = 100 - (
+            100 / (1 + rs)
         )
 
-        # ----------------------------------------------------
-        # ATR - DÜZELTİLDİ
-        # ----------------------------------------------------
-
-        high_low = (
-            df["high"] -
-            df["low"]
-        )
+        # ATR
+        high_low = df["high"] - df["low"]
 
         high_close = abs(
             df["high"] -
@@ -452,10 +453,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             adjust=False
         ).mean()
 
-        # ----------------------------------------------------
-        # ADX / DI
-        # ----------------------------------------------------
-
+        # ADX
         up_move = df["high"].diff()
         down_move = -df["low"].diff()
 
@@ -525,18 +523,12 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             adjust=False
         ).mean()
 
-        # ----------------------------------------------------
         # ROC
-        # ----------------------------------------------------
-
         df["roc"] = (
             df["close"].pct_change(9) * 100
         )
 
-        # ----------------------------------------------------
         # Bollinger
-        # ----------------------------------------------------
-
         sma20 = df["close"].rolling(20).mean()
         std20 = df["close"].rolling(20).std()
 
@@ -544,36 +536,33 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
 
         df["bb_upper"] = (
             sma20 +
-            (std20 * 2)
+            std20 * 2
         )
 
         df["bb_lower"] = (
             sma20 -
-            (std20 * 2)
+            std20 * 2
         )
 
         df["bb_width"] = (
-            (df["bb_upper"] - df["bb_lower"]) /
+            (
+                df["bb_upper"] -
+                df["bb_lower"]
+            ) /
             sma20.replace(0, np.nan)
         )
 
-        # ----------------------------------------------------
         # OBV
-        # ----------------------------------------------------
-
-        direction = np.sign(
+        direction_sign = np.sign(
             df["close"].diff()
         )
 
         df["obv"] = (
-            direction *
+            direction_sign *
             df["volume"]
         ).fillna(0).cumsum()
 
-        # ----------------------------------------------------
         # VWAP
-        # ----------------------------------------------------
-
         typical_price = (
             df["high"] +
             df["low"] +
@@ -597,10 +586,7 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             )
         )
 
-        # ----------------------------------------------------
-        # Candle structure
-        # ----------------------------------------------------
-
+        # Candle
         df["body"] = abs(
             df["close"] -
             df["open"]
@@ -629,16 +615,9 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
             df["low"]
         )
 
-        # ----------------------------------------------------
         # Volume
-        # ----------------------------------------------------
-
         df["volume_ma20"] = (
             df["volume"].rolling(20).mean()
-        )
-
-        df["volume_ma10"] = (
-            df["volume"].rolling(10).mean()
         )
 
         df["volume_ratio"] = (
@@ -648,24 +627,6 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
                 np.nan
             )
         )
-
-        # ----------------------------------------------------
-        # Price distance from EMA
-        # ----------------------------------------------------
-
-        df["ema21_distance_atr"] = (
-            (df["close"] - df["ema21"]) /
-            df["atr"].replace(0, np.nan)
-        )
-
-        df["ema50_distance_atr"] = (
-            (df["close"] - df["ema50"]) /
-            df["atr"].replace(0, np.nan)
-        )
-
-        # ----------------------------------------------------
-        # Cleanup
-        # ----------------------------------------------------
 
         df.replace(
             [np.inf, -np.inf],
@@ -679,7 +640,6 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
         return df
 
     except Exception as e:
-
         logging.error(
             f"OHLCV hata {symbol} {timeframe}: {e}"
         )
@@ -687,18 +647,67 @@ def ohlcv_getir(exchange, symbol, timeframe, limit=250):
         return None
 
 
-# ============================================================
-# CLOSED CANDLE
-# ============================================================
-
 def son_kapanmis_mum(df):
-
     if df is None or len(df) < 3:
         return None
 
-    # Binance son mum çoğu durumda halen açık olabilir.
-    # Sinyal için son kapanmış mumu kullanıyoruz.
     return df.iloc[-2]
+
+
+# ============================================================
+# TREND SCORE
+# ============================================================
+
+def trend_score_hesapla(df, direction):
+    if df is None or len(df) < 30:
+        return 50.0
+
+    d = df.iloc[:-1]
+    last = d.iloc[-1]
+
+    score = 50.0
+
+    if direction == "buy":
+
+        if last["close"] > last["ema21"]:
+            score += 10
+
+        if last["ema9"] > last["ema21"]:
+            score += 10
+
+        if last["ema21"] > last["ema50"]:
+            score += 10
+
+        if last["ema50"] > last["ema200"]:
+            score += 10
+
+        if last["plus_di"] > last["minus_di"]:
+            score += 5
+
+        if last["adx"] > 20:
+            score += 5
+
+    else:
+
+        if last["close"] < last["ema21"]:
+            score += 10
+
+        if last["ema9"] < last["ema21"]:
+            score += 10
+
+        if last["ema21"] < last["ema50"]:
+            score += 10
+
+        if last["ema50"] < last["ema200"]:
+            score += 10
+
+        if last["minus_di"] > last["plus_di"]:
+            score += 5
+
+        if last["adx"] > 20:
+            score += 5
+
+    return min(max(score, 0), 100)
 
 
 # ============================================================
@@ -710,16 +719,14 @@ def gelismis_regresyon_teyidi(
     direction,
     periyot=20
 ):
-
     if df is None or len(df) < periyot + 2:
         return False, 0.0, 0.0, "Yetersiz veri."
 
-    # Son kapanmış mum dahil
-    closes = (
-        df["close"]
-        .iloc[-periyot-1:-1]
-        .values
-    )
+    closes = df[
+        "close"
+    ].iloc[
+        -periyot - 1:-1
+    ].values
 
     x = np.arange(len(closes))
 
@@ -752,7 +759,8 @@ def gelismis_regresyon_teyidi(
 
     regression_mid = (
         intercept +
-        slope * (len(closes) - 1)
+        slope *
+        (len(closes) - 1)
     )
 
     atr = float(
@@ -762,15 +770,9 @@ def gelismis_regresyon_teyidi(
     if atr <= 0:
         atr = price * 0.01
 
-    slope_atr = (
-        slope /
-        atr
-    )
-
     min_r2 = 0.55
 
     if direction == "buy":
-
         ok = (
             slope > 0 and
             r_squared >= min_r2 and
@@ -778,7 +780,6 @@ def gelismis_regresyon_teyidi(
         )
 
     else:
-
         ok = (
             slope < 0 and
             r_squared >= min_r2 and
@@ -787,7 +788,6 @@ def gelismis_regresyon_teyidi(
 
     mesaj = (
         f"Eğim={slope:.6f} | "
-        f"SlopeATR={slope_atr:.3f} | "
         f"R²={r_squared:.2f}"
     )
 
@@ -800,11 +800,10 @@ def gelismis_regresyon_teyidi(
 
 
 # ============================================================
-# STRUCTURE ENGINE
+# STRUCTURE
 # ============================================================
 
 def structure_score(df, direction):
-
     if df is None or len(df) < 30:
         return 50
 
@@ -815,8 +814,13 @@ def structure_score(df, direction):
 
     score = 50
 
-    recent_high = d["high"].iloc[-20:-1].max()
-    recent_low = d["low"].iloc[-20:-1].min()
+    recent_high = d[
+        "high"
+    ].iloc[-20:-1].max()
+
+    recent_low = d[
+        "low"
+    ].iloc[-20:-1].min()
 
     if direction == "buy":
 
@@ -827,9 +831,6 @@ def structure_score(df, direction):
             score += 10
 
         if last["close"] > prev["close"]:
-            score += 5
-
-        if last["low"] >= prev["low"]:
             score += 5
 
         if last["close"] >= recent_high:
@@ -846,9 +847,6 @@ def structure_score(df, direction):
         if last["close"] < prev["close"]:
             score += 5
 
-        if last["high"] <= prev["high"]:
-            score += 5
-
         if last["close"] <= recent_low:
             score += 15
 
@@ -856,11 +854,10 @@ def structure_score(df, direction):
 
 
 # ============================================================
-# PULLBACK ENGINE
+# PULLBACK
 # ============================================================
 
 def pullback_score(df, direction):
-
     if df is None or len(df) < 10:
         return 0
 
@@ -879,9 +876,6 @@ def pullback_score(df, direction):
         if last["close"] > last["ema21"]:
             score += 15
 
-        if last["close"] > prev["close"]:
-            score += 10
-
         if last["rsi"] >= 50:
             score += 5
 
@@ -893,9 +887,6 @@ def pullback_score(df, direction):
         if last["close"] < last["ema21"]:
             score += 15
 
-        if last["close"] < prev["close"]:
-            score += 10
-
         if last["rsi"] <= 50:
             score += 5
 
@@ -903,11 +894,10 @@ def pullback_score(df, direction):
 
 
 # ============================================================
-# BREAKOUT ENGINE
+# BREAKOUT
 # ============================================================
 
 def breakout_analysis(df, direction):
-
     if df is None or len(df) < 25:
         return {
             "breakout": False,
@@ -930,8 +920,13 @@ def breakout_analysis(df, direction):
             "quality": 0
         }
 
-    previous_high = d["high"].iloc[-21:-1].max()
-    previous_low = d["low"].iloc[-21:-1].min()
+    previous_high = d[
+        "high"
+    ].iloc[-21:-1].max()
+
+    previous_low = d[
+        "low"
+    ].iloc[-21:-1].min()
 
     if direction == "buy":
 
@@ -957,46 +952,25 @@ def breakout_analysis(df, direction):
             previous_low
         )
 
-    distance = max(distance, 0)
+    distance = max(
+        distance,
+        0
+    )
 
-    # Breakout'un yeni olması
-    prior_breakout = False
-
-    if direction == "buy":
-
-        prior_breakout = (
-            d["close"].iloc[-2] >
-            d["high"].iloc[-21:-2].max()
-        )
-
-    else:
-
-        prior_breakout = (
-            d["close"].iloc[-2] <
-            d["low"].iloc[-21:-2].min()
-        )
-
-    fresh = breakout and not prior_breakout
-
-    quality = 50
-
-    if breakout:
-        quality += 20
-
-    if fresh:
-        quality += 15
-
-    if 0 <= distance <= IDEAL_BREAKOUT_ATR:
-        quality += 15
-
-    if distance > 1.5:
-        quality -= 30
+    quality = (
+        70
+        if breakout
+        else 30
+    )
 
     return {
         "breakout": bool(breakout),
-        "distance_atr": round(float(distance), 3),
-        "fresh": bool(fresh),
-        "quality": min(max(quality, 0), 100)
+        "distance_atr": round(
+            float(distance),
+            3
+        ),
+        "fresh": True,
+        "quality": quality
     }
 
 
@@ -1005,11 +979,11 @@ def breakout_analysis(df, direction):
 # ============================================================
 
 def candle_quality(df, direction):
-
     if df is None or len(df) < 5:
         return 50
 
     d = df.iloc[:-1]
+
     last = d.iloc[-1]
 
     rng = float(last["range"])
@@ -1017,35 +991,23 @@ def candle_quality(df, direction):
     if rng <= 0:
         return 50
 
-    body_ratio = float(last["body_ratio"])
-
     score = 50
 
     if direction == "buy":
 
         if last["close"] > last["open"]:
-            score += 20
+            score += 25
 
-        if body_ratio >= 0.60:
+        if last["body_ratio"] >= 0.55:
             score += 15
-
-        if (
-            last["upper_wick"] / rng
-        ) < 0.25:
-            score += 10
 
     else:
 
         if last["close"] < last["open"]:
-            score += 20
+            score += 25
 
-        if body_ratio >= 0.60:
+        if last["body_ratio"] >= 0.55:
             score += 15
-
-        if (
-            last["lower_wick"] / rng
-        ) < 0.25:
-            score += 10
 
     return min(max(score, 0), 100)
 
@@ -1058,7 +1020,6 @@ def calculate_momentum_engine(
     df,
     direction
 ):
-
     if df is None or len(df) < 30:
 
         return {
@@ -1079,6 +1040,7 @@ def calculate_momentum_engine(
     d = df.iloc[:-1]
 
     last = d.iloc[-1]
+    prev = d.iloc[-2]
 
     # --------------------------------------------------------
     # MOMENTUM
@@ -1091,13 +1053,13 @@ def calculate_momentum_engine(
         if last["ema9"] > last["ema21"]:
             momentum += 15
 
-        if last["ema21"] > last["ema50"]:
+        if last["macd_hist"] > 0:
             momentum += 15
 
-        if last["macd_hist"] > 0:
+        if last["rsi"] > 50:
             momentum += 10
 
-        if last["rsi"] > 50:
+        if last["close"] > prev["close"]:
             momentum += 10
 
     else:
@@ -1105,71 +1067,49 @@ def calculate_momentum_engine(
         if last["ema9"] < last["ema21"]:
             momentum += 15
 
-        if last["ema21"] < last["ema50"]:
-            momentum += 15
-
         if last["macd_hist"] < 0:
-            momentum += 10
+            momentum += 15
 
         if last["rsi"] < 50:
             momentum += 10
 
-    momentum = min(max(momentum, 0), 100)
+        if last["close"] < prev["close"]:
+            momentum += 10
+
+    momentum = min(
+        max(momentum, 0),
+        100
+    )
 
     # --------------------------------------------------------
     # ACCELERATION
     # --------------------------------------------------------
 
     adx_now = float(last["adx"])
-    adx_prev = float(d["adx"].iloc[-4])
-
-    macd_now = float(last["macd_hist"])
-    macd_prev = float(d["macd_hist"].iloc[-4])
-
-    ema_spread_now = (
-        (last["ema9"] - last["ema21"]) /
-        last["ema21"] *
-        100
-    )
-
-    ema_spread_prev = (
-        (d["ema9"].iloc[-4] -
-         d["ema21"].iloc[-4]) /
-        d["ema21"].iloc[-4] *
-        100
-    )
+    adx_prev = float(prev["adx"])
 
     acceleration = 50
 
+    if adx_now > 20:
+        acceleration += 10
+
+    if adx_now > 25:
+        acceleration += 10
+
+    if adx_now > adx_prev:
+        acceleration += 15
+
     if direction == "buy":
-
-        if adx_now > adx_prev:
+        if last["macd_hist"] > prev["macd_hist"]:
             acceleration += 15
-
-        if macd_now > macd_prev:
-            acceleration += 15
-
-        if ema_spread_now > ema_spread_prev:
-            acceleration += 15
-
-        if last["roc"] > d["roc"].iloc[-4]:
-            acceleration += 5
-
     else:
-
-        if adx_now > adx_prev:
+        if last["macd_hist"] < prev["macd_hist"]:
             acceleration += 15
 
-        if macd_now < macd_prev:
-            acceleration += 15
-
-        if ema_spread_now < ema_spread_prev:
-            acceleration += 15
-
-        if last["roc"] < d["roc"].iloc[-4]:
-            acceleration += 5
-
-    acceleration = min(max(acceleration, 0), 100)
+    acceleration = min(
+        max(acceleration, 0),
+        100
+    )
 
     # --------------------------------------------------------
     # VOLUME
@@ -1181,11 +1121,12 @@ def calculate_momentum_engine(
 
     volume_score = min(
         100,
-        50 + (volume_ratio - 1) * 35
+        50 +
+        (volume_ratio - 1) * 35
     )
 
     # --------------------------------------------------------
-    # BREAKOUT
+    # STRUCTURE
     # --------------------------------------------------------
 
     breakout = breakout_analysis(
@@ -1193,62 +1134,25 @@ def calculate_momentum_engine(
         direction
     )
 
-    # --------------------------------------------------------
-    # STRUCTURE
-    # --------------------------------------------------------
-
     structure = structure_score(
         df,
         direction
     )
-
-    # --------------------------------------------------------
-    # PULLBACK
-    # --------------------------------------------------------
 
     pullback = pullback_score(
         df,
         direction
     )
 
-    # --------------------------------------------------------
-    # CANDLE
-    # --------------------------------------------------------
-
     candle = candle_quality(
         df,
         direction
     )
 
-    # --------------------------------------------------------
-    # TREND
-    # --------------------------------------------------------
-
-    trend = 50
-
-    if direction == "buy":
-
-        if last["close"] > last["ema50"]:
-            trend += 15
-
-        if last["ema50"] > last["ema200"]:
-            trend += 20
-
-        if last["ema21"] > last["ema50"]:
-            trend += 15
-
-    else:
-
-        if last["close"] < last["ema50"]:
-            trend += 15
-
-        if last["ema50"] < last["ema200"]:
-            trend += 20
-
-        if last["ema21"] < last["ema50"]:
-            trend += 15
-
-    trend = min(max(trend, 0), 100)
+    trend = trend_score_hesapla(
+        df,
+        direction
+    )
 
     # --------------------------------------------------------
     # EXHAUSTION
@@ -1258,46 +1162,28 @@ def calculate_momentum_engine(
 
     if direction == "buy":
 
-        if last["rsi"] > 72:
-            exhaustion += 30
+        if last["rsi"] > 70:
+            exhaustion += 20
 
         if last["rsi"] > 78:
-            exhaustion += 20
+            exhaustion += 25
 
-        if breakout["distance_atr"] > 1.0:
-            exhaustion += 20
-
-        if macd_now < macd_prev:
-            exhaustion += 15
-
-        if adx_now > 35 and adx_now < adx_prev:
-            exhaustion += 15
-
-        if last["close"] > last["ema21"] + last["atr"] * 1.5:
+        if breakout["distance_atr"] > 0.8:
             exhaustion += 15
 
     else:
 
-        if last["rsi"] < 28:
-            exhaustion += 30
+        if last["rsi"] < 30:
+            exhaustion += 20
 
         if last["rsi"] < 22:
-            exhaustion += 20
+            exhaustion += 25
 
-        if breakout["distance_atr"] > 1.0:
-            exhaustion += 20
-
-        if macd_now > macd_prev:
-            exhaustion += 15
-
-        if adx_now > 35 and adx_now < adx_prev:
-            exhaustion += 15
-
-        if last["close"] < last["ema21"] - last["atr"] * 1.5:
+        if breakout["distance_atr"] > 0.8:
             exhaustion += 15
 
     exhaustion = min(
-        max(exhaustion, 0),
+        exhaustion,
         100
     )
 
@@ -1310,36 +1196,24 @@ def calculate_momentum_engine(
     if direction == "buy":
 
         if last["close"] > last["open"]:
-            trigger += 10
+            trigger += 15
 
-        if last["close"] > last["ema9"]:
-            trigger += 10
+        if last["close"] > prev["close"]:
+            trigger += 15
 
-        if last["macd_hist"] > 0:
-            trigger += 10
-
-        if last["plus_di"] > last["minus_di"]:
-            trigger += 10
-
-        if acceleration >= 75:
-            trigger += 10
+        if last["macd_hist"] > prev["macd_hist"]:
+            trigger += 20
 
     else:
 
         if last["close"] < last["open"]:
-            trigger += 10
+            trigger += 15
 
-        if last["close"] < last["ema9"]:
-            trigger += 10
+        if last["close"] < prev["close"]:
+            trigger += 15
 
-        if last["macd_hist"] < 0:
-            trigger += 10
-
-        if last["minus_di"] > last["plus_di"]:
-            trigger += 10
-
-        if acceleration >= 75:
-            trigger += 10
+        if last["macd_hist"] < prev["macd_hist"]:
+            trigger += 20
 
     trigger = min(
         max(trigger, 0),
@@ -1347,72 +1221,70 @@ def calculate_momentum_engine(
     )
 
     # --------------------------------------------------------
-    # STATE
-    # --------------------------------------------------------
-
-    if exhaustion >= 70:
-
-        state = "EXHAUSTING"
-
-    elif (
-        acceleration >= 80 and
-        momentum >= 75
-    ):
-
-        state = "ACCELERATING"
-
-    elif momentum >= 75:
-
-        state = "STRONG"
-
-    elif momentum >= 60:
-
-        state = "BUILDING"
-
-    else:
-
-        state = "WEAK"
-
-    # --------------------------------------------------------
     # ENTRY SCORE
-    #
-    # Kısa vadeli işlemlerde trendden daha çok:
-    # momentum + acceleration + trigger + volume
     # --------------------------------------------------------
 
     entry_score = (
-        momentum * 0.20 +
-        acceleration * 0.25 +
-        trigger * 0.20 +
+        momentum * 0.25 +
+        acceleration * 0.20 +
         volume_score * 0.15 +
-        structure * 0.10 +
-        candle * 0.05 +
-        pullback * 0.05
+        structure * 0.15 +
+        pullback * 0.10 +
+        trend * 0.10 +
+        trigger * 0.05
     )
-
-    # Exhaustion penalty
-    if exhaustion > 50:
-        entry_score -= (
-            exhaustion - 50
-        ) * 0.35
 
     entry_score = min(
         max(entry_score, 0),
         100
     )
 
+    # --------------------------------------------------------
+    # STATE
+    # --------------------------------------------------------
+
+    if (
+        momentum >= 80 and
+        acceleration >= 75
+    ):
+        state = "ACCELERATING"
+
+    elif momentum >= 70:
+        state = "BUILDING"
+
+    elif momentum >= 55:
+        state = "WEAKENING"
+
+    else:
+        state = "FADING"
+
     return {
-        "momentum_score": round(momentum, 2),
-        "acceleration_score": round(acceleration, 2),
-        "exhaustion_score": round(exhaustion, 2),
-        "entry_score": round(entry_score, 2),
-        "state": state,
-        "breakout_distance_atr": round(
-            breakout["distance_atr"],
-            3
+        "momentum_score": round(
+            momentum,
+            2
         ),
-        "breakout_quality": breakout["quality"],
-        "breakout_fresh": breakout["fresh"],
+        "acceleration_score": round(
+            acceleration,
+            2
+        ),
+        "exhaustion_score": round(
+            exhaustion,
+            2
+        ),
+        "entry_score": round(
+            entry_score,
+            2
+        ),
+        "state": state,
+        "breakout_distance_atr": breakout[
+            "distance_atr"
+        ],
+        "breakout_quality": breakout[
+            "quality"
+        ],
+        "breakout_fresh": breakout[
+            "fresh"
+        ],
         "volume_ratio": round(
             volume_ratio,
             2
@@ -1445,7 +1317,7 @@ def calculate_momentum_engine(
 
 
 # ============================================================
-# MULTI TIMEFRAME TREND
+# HIGHER TIMEFRAME CONFIRMATION
 # ============================================================
 
 def higher_timeframe_confirmation(
@@ -1458,65 +1330,67 @@ def higher_timeframe_confirmation(
         exchange,
         symbol,
         HIGHER_TIMEFRAME,
-        250
+        100
     )
 
     if df4 is None:
         return {
             "ok": False,
-            "score": 50,
-            "trend": "UNKNOWN"
+            "score": 0,
+            "trend": "NO_DATA"
         }
 
     d = df4.iloc[:-1]
 
     last = d.iloc[-1]
 
+    trend_score = trend_score_hesapla(
+        df4,
+        direction
+    )
+
     if direction == "buy":
 
-        score = 50
+        ok = (
+            last["close"] >
+            last["ema50"] and
+            last["ema21"] >
+            last["ema50"]
+        )
 
-        if last["close"] > last["ema50"]:
-            score += 20
-
-        if last["ema50"] > last["ema200"]:
-            score += 20
-
-        if last["ema9"] > last["ema21"]:
-            score += 10
-
-        ok = score >= 65
-
-        trend = "BULLISH" if score >= 65 else "NEUTRAL"
+        trend = (
+            "BULLISH"
+            if ok
+            else "BEARISH"
+        )
 
     else:
 
-        score = 50
+        ok = (
+            last["close"] <
+            last["ema50"] and
+            last["ema21"] <
+            last["ema50"]
+        )
 
-        if last["close"] < last["ema50"]:
-            score += 20
-
-        if last["ema50"] < last["ema200"]:
-            score += 20
-
-        if last["ema9"] < last["ema21"]:
-            score += 10
-
-        ok = score >= 65
-
-        trend = "BEARISH" if score >= 65 else "NEUTRAL"
-
-    del df4
+        trend = (
+            "BEARISH"
+            if ok
+            else "BULLISH"
+        )
 
     return {
-        "ok": ok,
-        "score": min(max(score, 0), 100),
+        "ok": bool(ok),
+        "score": round(
+            trend_score,
+            2
+        ),
         "trend": trend
     }
 
 
 # ============================================================
-# TRIGGER TIMEFRAME
+# TRIGGER CONFIRMATION
 # ============================================================
 
 def trigger_confirmation(
@@ -1530,7 +1404,7 @@ def trigger_confirmation(
         exchange,
         symbol,
         timeframe,
-        100
+        80
     )
 
     if df is None:
@@ -1545,54 +1419,44 @@ def trigger_confirmation(
         direction
     )
 
-    d = df.iloc[:-1]
+    score = 0
 
-    last = d.iloc[-1]
+    if mom["momentum_score"] >= 65:
+        score += 25
 
-    trigger_score = mom["trigger_score"]
+    if mom["acceleration_score"] >= 65:
+        score += 25
 
-    if direction == "buy":
+    if mom["trigger_score"] >= 65:
+        score += 25
 
-        if last["close"] > last["ema9"]:
-            trigger_score += 5
+    if mom["volume_ratio"] >= 1.15:
+        score += 15
 
-        if last["plus_di"] > last["minus_di"]:
-            trigger_score += 5
+    if mom["exhaustion_score"] <= 50:
+        score += 10
 
-    else:
-
-        if last["close"] < last["ema9"]:
-            trigger_score += 5
-
-        if last["minus_di"] > last["plus_di"]:
-            trigger_score += 5
-
-    trigger_score = min(
-        trigger_score,
+    score = min(
+        score,
         100
     )
 
     ok = (
-        trigger_score >= 65 and
-        mom["exhaustion_score"] <= 65
+        score >= 70 and
+        mom["momentum_score"] >= 60 and
+        mom["acceleration_score"] >= 55
     )
 
-    result = {
-        "ok": ok,
-        "score": round(trigger_score, 2),
+    return {
+        "ok": bool(ok),
+        "score": round(score, 2),
         "state": mom["state"],
-        "momentum": mom["momentum_score"],
-        "acceleration": mom["acceleration_score"],
-        "exhaustion": mom["exhaustion_score"]
+        "momentum": mom
     }
-
-    del df
-
-    return result
 
 
 # ============================================================
-# FINAL ENTRY ENGINE
+# ENTRY EVALUATION
 # ============================================================
 
 def evaluate_entry(
@@ -1614,142 +1478,111 @@ def evaluate_entry(
         direction
     )
 
+    # --------------------------------------------------------
+    # MODE CONFIG
+    # --------------------------------------------------------
+
     if mode == "scalp":
 
+        min_final = SCALP_MIN_FINAL_SCORE
         min_entry = SCALP_MIN_ENTRY_SCORE
         min_momentum = SCALP_MIN_MOMENTUM
         min_acceleration = SCALP_MIN_ACCELERATION
         max_exhaustion = SCALP_MAX_EXHAUSTION
         max_breakout = SCALP_MAX_BREAKOUT_ATR
+        min_volume = SCALP_MIN_VOLUME_RATIO
+        trigger_tf = SCALP_TRIGGER_TIMEFRAME
 
     else:
 
+        min_final = OPPORTUNITY_MIN_FINAL_SCORE
         min_entry = OPPORTUNITY_MIN_ENTRY_SCORE
         min_momentum = OPPORTUNITY_MIN_MOMENTUM
         min_acceleration = OPPORTUNITY_MIN_ACCELERATION
         max_exhaustion = OPPORTUNITY_MAX_EXHAUSTION
         max_breakout = OPPORTUNITY_MAX_BREAKOUT_ATR
+        min_volume = OPPORTUNITY_MIN_VOLUME_RATIO
+        trigger_tf = OPPORTUNITY_TRIGGER_TIMEFRAME
 
     # --------------------------------------------------------
-    # 1. ENTRY SCORE
-    # --------------------------------------------------------
-
-    if mom["entry_score"] < min_entry:
-
-        return {
-            "approved": False,
-            "reason": "ENTRY_SCORE",
-            "momentum": mom
-        }
-
-    # --------------------------------------------------------
-    # 2. MOMENTUM
+    # BASIC FILTERS
     # --------------------------------------------------------
 
     if mom["momentum_score"] < min_momentum:
-
         return {
             "approved": False,
-            "reason": "MOMENTUM",
+            "reason": "LOW_MOMENTUM",
             "momentum": mom
         }
-
-    # --------------------------------------------------------
-    # 3. ACCELERATION
-    # --------------------------------------------------------
 
     if mom["acceleration_score"] < min_acceleration:
-
         return {
             "approved": False,
-            "reason": "ACCELERATION",
+            "reason": "LOW_ACCELERATION",
             "momentum": mom
         }
 
-    # --------------------------------------------------------
-    # 4. EXHAUSTION
-    # --------------------------------------------------------
-
     if mom["exhaustion_score"] > max_exhaustion:
-
         return {
             "approved": False,
             "reason": "EXHAUSTION",
             "momentum": mom
         }
 
-    # --------------------------------------------------------
-    # 5. BREAKOUT DISTANCE
-    # --------------------------------------------------------
-
-    if (
-        mom["breakout_distance_atr"] >
-        max_breakout
-    ):
-
-        return {
-            "approved": False,
-            "reason": "BREAKOUT_TOO_FAR",
-            "momentum": mom
-        }
-
-    # --------------------------------------------------------
-    # 6. VOLUME
-    # --------------------------------------------------------
-
-    min_volume = (
-        SCALP_MIN_VOLUME_RATIO
-        if mode == "scalp"
-        else OPPORTUNITY_MIN_VOLUME_RATIO
-    )
-
     if mom["volume_ratio"] < min_volume:
-
         return {
             "approved": False,
-            "reason": "VOLUME",
+            "reason": "LOW_VOLUME",
+            "momentum": mom
+        }
+
+    if mom["breakout_distance_atr"] > max_breakout:
+        return {
+            "approved": False,
+            "reason": "LATE_ENTRY",
             "momentum": mom
         }
 
     # --------------------------------------------------------
-    # 7. STATE
+    # REGRESSION
     # --------------------------------------------------------
 
-    allowed_states = [
-        "ACCELERATING",
-        "STRONG",
-        "BUILDING"
-    ]
-
-    if mom["state"] not in allowed_states:
-
-        return {
-            "approved": False,
-            "reason": "STATE",
-            "momentum": mom
-        }
-
-    # --------------------------------------------------------
-    # 8. CANDLE
-    # --------------------------------------------------------
-
-    if mom["candle_quality"] < 55:
-
-        return {
-            "approved": False,
-            "reason": "CANDLE",
-            "momentum": mom
-        }
-
-    # --------------------------------------------------------
-    # 9. TRIGGER TIMEFRAME
-    # --------------------------------------------------------
-
-    trigger_tf = (
-        SCALP_TRIGGER_TIMEFRAME
-        if mode == "scalp"
-        else OPPORTUNITY_TRIGGER_TIMEFRAME
+    reg_ok, reg_slope, reg_r2, reg_msg = (
+        gelismis_regresyon_teyidi(
+            df,
+            direction
+        )
     )
+
+    if not reg_ok:
+        return {
+            "approved": False,
+            "reason": "REGRESSION_FAIL",
+            "momentum": mom,
+            "regression_r2": reg_r2
+        }
+
+    # --------------------------------------------------------
+    # HIGHER TIMEFRAME
+    # --------------------------------------------------------
+
+    htf = higher_timeframe_confirmation(
+        exchange,
+        symbol,
+        direction
+    )
+
+    if not htf["ok"]:
+        return {
+            "approved": False,
+            "reason": "HTF_FAIL",
+            "momentum": mom,
+            "higher_timeframe": htf
+        }
+
+    # --------------------------------------------------------
+    # TRIGGER
+    # --------------------------------------------------------
 
     trigger = trigger_confirmation(
         exchange,
@@ -1758,517 +1591,732 @@ def evaluate_entry(
         trigger_tf
     )
 
-    if ENTRY_REQUIRE_TRIGGER and not trigger["ok"]:
-
+    if not trigger["ok"]:
         return {
             "approved": False,
-            "reason": "TRIGGER",
+            "reason": "TRIGGER_FAIL",
             "momentum": mom,
+            "higher_timeframe": htf,
             "trigger": trigger
         }
 
     # --------------------------------------------------------
-    # 10. HIGHER TIMEFRAME
+    # FINAL SCORE
     # --------------------------------------------------------
 
-    if mode == "opportunity":
-
-        htf = higher_timeframe_confirmation(
-            exchange,
-            symbol,
-            direction
-        )
-
-        if not htf["ok"]:
-
-            return {
-                "approved": False,
-                "reason": "HTF",
-                "momentum": mom,
-                "trigger": trigger,
-                "htf": htf
-            }
-
-    else:
-
-        htf = {
-            "ok": True,
-            "score": 50,
-            "trend": "SCALP"
-        }
-
-    # --------------------------------------------------------
-    # 11. REGRESSION
-    # --------------------------------------------------------
-
-    period = (
-        12
-        if mode == "scalp"
-        else 20
+    final_score = (
+        mom["entry_score"] * 0.45 +
+        mom["momentum_score"] * 0.20 +
+        mom["trend_score"] * 0.10 +
+        trigger["score"] * 0.15 +
+        htf["score"] * 0.10
     )
-
-    reg_ok, slope, r2, reg_msg = (
-        gelismis_regresyon_teyidi(
-            df,
-            direction,
-            period
-        )
-    )
-
-    if not reg_ok:
-
-        return {
-            "approved": False,
-            "reason": "REGRESSION",
-            "momentum": mom,
-            "trigger": trigger,
-            "htf": htf,
-            "r2": r2
-        }
-
-    # --------------------------------------------------------
-    # 12. PULLBACK / STRUCTURE
-    # --------------------------------------------------------
-
-    pullback = mom["pullback_score"]
-    structure = mom["structure_score"]
-
-    if pullback < 55:
-
-        return {
-            "approved": False,
-            "reason": "PULLBACK",
-            "momentum": mom
-        }
-
-    if structure < 60:
-
-        return {
-            "approved": False,
-            "reason": "STRUCTURE",
-            "momentum": mom
-        }
-
-    # --------------------------------------------------------
-    # FINAL TIMING SCORE
-    # --------------------------------------------------------
-
-    if mode == "scalp":
-
-        final_score = (
-            mom["momentum_score"] * 0.18 +
-            mom["acceleration_score"] * 0.22 +
-            mom["entry_score"] * 0.20 +
-            mom["structure_score"] * 0.12 +
-            mom["pullback_score"] * 0.08 +
-            mom["trigger_score"] * 0.10 +
-            mom["volume_score"] * 0.05 +
-            mom["trend_score"] * 0.05
-        )
-
-    else:
-
-        final_score = (
-            mom["momentum_score"] * 0.16 +
-            mom["acceleration_score"] * 0.18 +
-            mom["entry_score"] * 0.16 +
-            mom["structure_score"] * 0.12 +
-            mom["pullback_score"] * 0.06 +
-            mom["trigger_score"] * 0.08 +
-            mom["volume_score"] * 0.08 +
-            mom["trend_score"] * 0.16
-        )
-
-    # Trend düşük ama kısa vadeli momentum çok güçlü ise
-    # Scalp'in gereksiz yere elenmesini önle.
-    if mode == "scalp":
-
-        if (
-            mom["acceleration_score"] >= 90 and
-            mom["entry_score"] >= 88 and
-            mom["volume_ratio"] >= 2.0 and
-            mom["breakout_distance_atr"] <= 0.7 and
-            mom["exhaustion_score"] <= 45
-        ):
-
-            final_score += 5
 
     final_score = min(
         max(final_score, 0),
         100
     )
 
-    min_final = (
-        SCALP_MIN_FINAL_SCORE
-        if mode == "scalp"
-        else OPPORTUNITY_MIN_FINAL_SCORE
-    )
-
     approved = (
-        final_score >= min_final
+        final_score >= min_final and
+        mom["entry_score"] >= min_entry
     )
 
     return {
-        "approved": approved,
+        "approved": bool(approved),
         "reason": (
             "APPROVED"
             if approved
-            else "FINAL_SCORE"
+            else "LOW_FINAL_SCORE"
         ),
         "final_score": round(
             final_score,
             2
         ),
         "momentum": mom,
+        "higher_timeframe": htf,
         "trigger": trigger,
-        "htf": htf,
         "regression_r2": round(
-            r2,
+            reg_r2,
             2
         ),
-        "regression_slope": slope,
+        "regression_slope": reg_slope,
         "regression_message": reg_msg
     }
 
 
 # ============================================================
-# SCALP MARKET SCAN
+# DYNAMIC TARGET ENGINE
 # ============================================================
 
-def scan_scalp_market(exchange):
-
-    try:
-
-        tickers = exchange.fetch_tickers()
-
-        usdt_tickers = [
-            t
-            for t in tickers.values()
-            if gecerli_kripto_mu(t.get("symbol"))
-            and t.get("percentage") is not None
-        ]
-
-        gainers = sorted(
-            usdt_tickers,
-            key=lambda x: float(x["percentage"]),
-            reverse=True
-        )[:GAINER_COUNT]
-
-        losers = sorted(
-            usdt_tickers,
-            key=lambda x: float(x["percentage"])
-        )[:LOSER_COUNT]
-
-        target_pool = list(
-            set(
-                [
-                    t["symbol"]
-                    for t in gainers + losers
-                ]
-            )
-        )
-
-        candidates = []
-
-        for symbol in target_pool:
-
-            if cooldown_aktif_mi(symbol):
-                continue
-
-            df = ohlcv_getir(
-                exchange,
-                symbol,
-                SCALP_SCAN_TIMEFRAME,
-                250
-            )
-
-            if df is None:
-                continue
-
-            d = df.iloc[:-1]
-
-            last = d.iloc[-1]
-
-            # ----------------------------------------------
-            # YÖN
-            # ----------------------------------------------
-
-            long_score = 0
-            short_score = 0
-
-            if last["close"] > last["ema50"]:
-                long_score += 25
-
-            if last["ema9"] > last["ema21"]:
-                long_score += 25
-
-            if last["macd_hist"] > 0:
-                long_score += 20
-
-            if last["plus_di"] > last["minus_di"]:
-                long_score += 15
-
-            if last["close"] > last["vwap"]:
-                long_score += 15
-
-            if last["close"] < last["ema50"]:
-                short_score += 25
-
-            if last["ema9"] < last["ema21"]:
-                short_score += 25
-
-            if last["macd_hist"] < 0:
-                short_score += 20
-
-            if last["minus_di"] > last["plus_di"]:
-                short_score += 15
-
-            if last["close"] < last["vwap"]:
-                short_score += 15
-
-            if long_score >= short_score:
-                direction = "buy"
-                base_score = long_score
-            else:
-                direction = "sell"
-                base_score = short_score
-
-            # ----------------------------------------------
-            # MOMENTUM
-            # ----------------------------------------------
-
-            mom = calculate_momentum_engine(
-                df,
-                direction
-            )
-
-            # İlk aday filtresi
-            if (
-                mom["momentum_score"] < 60 or
-                mom["volume_ratio"] < 1.1
-            ):
-                del df
-                continue
-
-            candidates.append({
-                "symbol": symbol,
-                "direction": direction,
-                "base_score": base_score,
-                "momentum": mom,
-                "df": df
-            })
-
-        # Önce momentum kalitesi
-        candidates.sort(
-            key=lambda x: (
-                x["momentum"]["entry_score"],
-                x["momentum"]["acceleration_score"],
-                x["momentum"]["volume_ratio"]
-            ),
-            reverse=True
-        )
-
-        # İlk 8'e düşür
-        return candidates[:8]
-
-    except Exception as e:
-
-        logging.error(
-            f"Scalp tarama hatası: {e}"
-        )
-
-        return []
-
-
-# ============================================================
-# OPPORTUNITY MARKET SCAN
-# ============================================================
-
-def scan_opportunity_market(exchange):
-
-    try:
-
-        tickers = exchange.fetch_tickers()
-
-        usdt_tickers = [
-            t
-            for t in tickers.values()
-            if gecerli_kripto_mu(t.get("symbol"))
-            and t.get("percentage") is not None
-        ]
-
-        gainers = sorted(
-            usdt_tickers,
-            key=lambda x: float(x["percentage"]),
-            reverse=True
-        )[:GAINER_COUNT]
-
-        losers = sorted(
-            usdt_tickers,
-            key=lambda x: float(x["percentage"])
-        )[:LOSER_COUNT]
-
-        target_pool = list(
-            set(
-                [
-                    t["symbol"]
-                    for t in gainers + losers
-                ]
-            )
-        )
-
-        candidates = []
-
-        for symbol in target_pool:
-
-            if cooldown_aktif_mi(symbol):
-                continue
-
-            df = ohlcv_getir(
-                exchange,
-                symbol,
-                OPPORTUNITY_SCAN_TIMEFRAME,
-                250
-            )
-
-            if df is None:
-                continue
-
-            d = df.iloc[:-1]
-            last = d.iloc[-1]
-
-            # ----------------------------------------------
-            # YÖN ARTIK SADECE EMA50'E GÖRE BELİRLENMİYOR
-            # ----------------------------------------------
-
-            long_score = 0
-            short_score = 0
-
-            if last["close"] > last["ema50"]:
-                long_score += 20
-
-            if last["ema50"] > last["ema200"]:
-                long_score += 20
-
-            if last["ema9"] > last["ema21"]:
-                long_score += 15
-
-            if last["macd_hist"] > 0:
-                long_score += 15
-
-            if last["plus_di"] > last["minus_di"]:
-                long_score += 15
-
-            if last["close"] > last["vwap"]:
-                long_score += 15
-
-            if last["close"] < last["ema50"]:
-                short_score += 20
-
-            if last["ema50"] < last["ema200"]:
-                short_score += 20
-
-            if last["ema9"] < last["ema21"]:
-                short_score += 15
-
-            if last["macd_hist"] < 0:
-                short_score += 15
-
-            if last["minus_di"] > last["plus_di"]:
-                short_score += 15
-
-            if last["close"] < last["vwap"]:
-                short_score += 15
-
-            if long_score >= short_score:
-                direction = "buy"
-                base_score = long_score
-            else:
-                direction = "sell"
-                base_score = short_score
-
-            mom = calculate_momentum_engine(
-                df,
-                direction
-            )
-
-            if (
-                mom["momentum_score"] < 55 or
-                mom["volume_ratio"] < 1.2
-            ):
-                del df
-                continue
-
-            candidates.append({
-                "symbol": symbol,
-                "direction": direction,
-                "base_score": base_score,
-                "momentum": mom,
-                "df": df
-            })
-
-        candidates.sort(
-            key=lambda x: (
-                x["momentum"]["entry_score"],
-                x["momentum"]["momentum_score"],
-                x["momentum"]["volume_ratio"]
-            ),
-            reverse=True
-        )
-
-        return candidates[:8]
-
-    except Exception as e:
-
-        logging.error(
-            f"Opportunity tarama hatası: {e}"
-        )
-
-        return []
-
-
-# ============================================================
-# SCALP TP HESABI
-# ============================================================
-
-def scalp_tp_price(
-    exchange,
-    symbol,
-    side,
-    amount,
-    entry_price
+def hesapla_dinamik_hedef(
+    mode,
+    margin,
+    momentum_data,
+    final_score
 ):
 
-    # Hedef net kar
-    target_net = (
-        SCALP_TARGET_USDT +
-        SCALP_FEE_BUFFER_USDT
+    momentum = momentum_data[
+        "momentum_score"
+    ]
+
+    acceleration = momentum_data[
+        "acceleration_score"
+    ]
+
+    volume = momentum_data[
+        "volume_ratio"
+    ]
+
+    trend = momentum_data[
+        "trend_score"
+    ]
+
+    exhaustion = momentum_data[
+        "exhaustion_score"
+    ]
+
+    quality = (
+        final_score * 0.35 +
+        momentum * 0.20 +
+        acceleration * 0.15 +
+        trend * 0.15 +
+        min(volume * 40, 100) * 0.10 +
+        (100 - exhaustion) * 0.05
     )
 
-    price_difference = (
-        target_net /
-        amount
-    )
+    if mode == "scalp":
 
-    if side == "buy":
+        base = SCALP_TARGET_USDT
 
-        tp = (
-            entry_price +
-            price_difference
+        if quality >= 90:
+            target = base * 1.35
+
+        elif quality >= 85:
+            target = base * 1.20
+
+        elif quality >= 80:
+            target = base * 1.05
+
+        else:
+            target = base * 0.90
+
+        target = min(
+            max(
+                target,
+                SCALP_MIN_TARGET_USDT
+            ),
+            SCALP_MAX_TARGET_USDT
         )
 
     else:
 
-        tp = (
+        base = OPPORTUNITY_TARGET_USDT
+
+        if quality >= 92:
+            target = base * 1.60
+
+        elif quality >= 87:
+            target = base * 1.35
+
+        elif quality >= 82:
+            target = base * 1.10
+
+        else:
+            target = base * 0.90
+
+        target = min(
+            max(
+                target,
+                OPPORTUNITY_MIN_TARGET_USDT
+            ),
+            OPPORTUNITY_MAX_TARGET_USDT
+        )
+
+    target_roi = (
+        target /
+        margin
+    ) * 100
+
+    max_loss_usdt = (
+        target *
+        MAX_LOSS_TO_TARGET_RATIO
+    )
+
+    max_loss_roi = (
+        max_loss_usdt /
+        margin
+    ) * 100
+
+    return {
+        "target_usdt": round(
+            target,
+            4
+        ),
+        "target_roi": round(
+            target_roi,
+            3
+        ),
+        "max_loss_usdt": round(
+            max_loss_usdt,
+            4
+        ),
+        "max_loss_roi": round(
+            max_loss_roi,
+            3
+        ),
+        "quality_score": round(
+            quality,
+            2
+        )
+    }
+
+
+# ============================================================
+# DYNAMIC HOLD TIME
+# ============================================================
+
+def hesapla_dinamik_sure(
+    mode,
+    momentum_data,
+    final_score
+):
+
+    momentum = momentum_data[
+        "momentum_score"
+    ]
+
+    acceleration = momentum_data[
+        "acceleration_score"
+    ]
+
+    volume = momentum_data[
+        "volume_ratio"
+    ]
+
+    exhaustion = momentum_data[
+        "exhaustion_score"
+    ]
+
+    quality = (
+        final_score * 0.40 +
+        momentum * 0.25 +
+        acceleration * 0.20 +
+        min(volume * 40, 100) * 0.10 +
+        (100 - exhaustion) * 0.05
+    )
+
+    if mode == "scalp":
+
+        if quality >= 90:
+            minutes = 8
+
+        elif quality >= 85:
+            minutes = 12
+
+        elif quality >= 80:
+            minutes = 16
+
+        else:
+            minutes = 20
+
+        minutes = min(
+            max(
+                minutes,
+                SCALP_MIN_HOLD_MINUTES
+            ),
+            SCALP_MAX_HOLD_MINUTES
+        )
+
+    else:
+
+        if quality >= 92:
+            minutes = 45
+
+        elif quality >= 87:
+            minutes = 75
+
+        elif quality >= 82:
+            minutes = 120
+
+        else:
+            minutes = 180
+
+        minutes = min(
+            max(
+                minutes,
+                OPPORTUNITY_MIN_HOLD_MINUTES
+            ),
+            OPPORTUNITY_MAX_HOLD_HOURS * 60
+        )
+
+    return int(minutes)
+
+
+# ============================================================
+# PRICE FROM ROI
+# ============================================================
+
+def roi_to_price(
+    entry_price,
+    roi_percent,
+    side,
+    leverage
+):
+
+    price_change = (
+        roi_percent /
+        leverage /
+        100
+    )
+
+    if side == "buy":
+        return entry_price * (
+            1 + price_change
+        )
+
+    return entry_price * (
+        1 - price_change
+    )
+
+
+# ============================================================
+# DYNAMIC TRADE PLAN
+# ============================================================
+
+def hesapla_dinamik_trade_plan(
+    entry_price,
+    side,
+    atr,
+    p_type,
+    leverage,
+    margin,
+    momentum_data,
+    final_score
+):
+
+    target = hesapla_dinamik_hedef(
+        p_type,
+        margin,
+        momentum_data,
+        final_score
+    )
+
+    hold_minutes = hesapla_dinamik_sure(
+        p_type,
+        momentum_data,
+        final_score
+    )
+
+    target_roi = target[
+        "target_roi"
+    ]
+
+    max_loss_roi = target[
+        "max_loss_roi"
+    ]
+
+    # --------------------------------------------------------
+    # TP PRICE
+    # --------------------------------------------------------
+
+    tp_price = roi_to_price(
+        entry_price,
+        target_roi,
+        side,
+        leverage
+    )
+
+    # --------------------------------------------------------
+    # HARD RISK PRICE
+    # --------------------------------------------------------
+
+    hard_sl_price = roi_to_price(
+        entry_price,
+        -max_loss_roi,
+        side,
+        leverage
+    )
+
+    # --------------------------------------------------------
+    # ATR INFORMATION
+    # --------------------------------------------------------
+
+    if atr <= 0:
+        atr = entry_price * 0.01
+
+    if p_type == "scalp":
+
+        atr_sl_price = (
             entry_price -
-            price_difference
+            atr * 1.2
+            if side == "buy"
+            else
+            entry_price +
+            atr * 1.2
+        )
+
+    else:
+
+        atr_sl_price = (
+            entry_price -
+            atr * 1.8
+            if side == "buy"
+            else
+            entry_price +
+            atr * 1.8
+        )
+
+    # HER ZAMAN daha korumacı olan stop kullanılır.
+    if side == "buy":
+        sl_price = max(
+            hard_sl_price,
+            atr_sl_price
+        )
+    else:
+        sl_price = min(
+            hard_sl_price,
+            atr_sl_price
+        )
+
+    # Risk fiyatı hiçbir koşulda
+    # hedefe göre izin verilen zararı aşamaz.
+
+    return {
+        "sl_price": float(sl_price),
+        "tp_price": float(tp_price),
+
+        "target_usdt": target[
+            "target_usdt"
+        ],
+
+        "target_roi": target[
+            "target_roi"
+        ],
+
+        "max_loss_usdt": target[
+            "max_loss_usdt"
+        ],
+
+        "max_loss_roi": target[
+            "max_loss_roi"
+        ],
+
+        "hold_minutes": hold_minutes,
+
+        "atr_kullanilan": float(atr),
+
+        "quality_score": target[
+            "quality_score"
+        ],
+
+        "trailing_enabled": TRAILING_ENABLED,
+
+        "trailing_started": False,
+
+        "highest_roi": 0.0,
+
+        "highest_pnl": 0.0
+    }
+
+
+# ============================================================
+# MOMENTUM CONTINUATION
+# ============================================================
+
+def momentum_continuation_analizi(
+    exchange,
+    symbol,
+    side,
+    p_type
+):
+
+    timeframe = (
+        SCALP_TRIGGER_TIMEFRAME
+        if p_type == "scalp"
+        else OPPORTUNITY_TRIGGER_TIMEFRAME
+    )
+
+    df = ohlcv_getir(
+        exchange,
+        symbol,
+        timeframe,
+        80
+    )
+
+    if df is None:
+        return {
+            "score": 0,
+            "state": "NO_DATA",
+            "continue": False
+        }
+
+    direction = (
+        "buy"
+        if side == "long"
+        else "sell"
+    )
+
+    mom = calculate_momentum_engine(
+        df,
+        direction
+    )
+
+    score = 0
+
+    # Momentum
+    score += (
+        mom["momentum_score"] *
+        0.30
+    )
+
+    # Acceleration
+    score += (
+        mom["acceleration_score"] *
+        0.25
+    )
+
+    # Trend
+    score += (
+        mom["trend_score"] *
+        0.20
+    )
+
+    # Volume
+    volume_component = min(
+        mom["volume_ratio"] * 40,
+        100
+    )
+
+    score += (
+        volume_component *
+        0.10
+    )
+
+    # Trigger
+    score += (
+        mom["trigger_score"] *
+        0.10
+    )
+
+    # Exhaustion
+    score += (
+        (100 - mom["exhaustion_score"]) *
+        0.05
+    )
+
+    score = min(
+        max(score, 0),
+        100
+    )
+
+    # --------------------------------------------------------
+    # CONTINUATION
+    # --------------------------------------------------------
+
+    continuation = (
+        score >= MOMENTUM_WEAK_SCORE and
+        mom["exhaustion_score"] < 70
+    )
+
+    if score >= 75:
+        state = "STRONG_CONTINUATION"
+
+    elif score >= 60:
+        state = "CONTINUING"
+
+    elif score >= 48:
+        state = "WEAKENING"
+
+    else:
+        state = "REVERSING"
+
+    return {
+        "score": round(
+            score,
+            2
+        ),
+        "state": state,
+        "continue": bool(
+            continuation
+        ),
+        "momentum": mom
+    }
+
+
+# ============================================================
+# TRADE HEALTH
+# ============================================================
+
+def trade_health_analizi(
+    df,
+    side,
+    current_roi,
+    momentum_data
+):
+
+    score = 100
+
+    last = df.iloc[-2]
+
+    if side == "long":
+
+        if last["close"] < last["ema21"]:
+            score -= 25
+
+        if last["ema9"] < last["ema21"]:
+            score -= 15
+
+        if last["macd_hist"] < 0:
+            score -= 20
+
+        if last["minus_di"] > last["plus_di"]:
+            score -= 15
+
+    else:
+
+        if last["close"] > last["ema21"]:
+            score -= 25
+
+        if last["ema9"] > last["ema21"]:
+            score -= 15
+
+        if last["macd_hist"] > 0:
+            score -= 20
+
+        if last["plus_di"] > last["minus_di"]:
+            score -= 15
+
+    if momentum_data.get(
+        "exhaustion_score",
+        0
+    ) > 60:
+        score -= 15
+
+    if current_roi < 0:
+        score -= min(
+            abs(current_roi) * 2,
+            25
+        )
+
+    return max(
+        0,
+        min(
+            100,
+            score
+        )
+    )
+
+
+# ============================================================
+# TRAILING STOP
+# ============================================================
+
+def dinamik_trailing_hesapla(
+    entry_price,
+    mark_price,
+    side,
+    p_type,
+    roi,
+    highest_roi,
+    atr,
+    target_roi
+):
+
+    if not TRAILING_ENABLED:
+        return None
+
+    if p_type == "scalp":
+
+        start_ratio = (
+            SCALP_TRAILING_START_RATIO
+        )
+
+        lock_ratio = (
+            SCALP_TRAILING_LOCK_RATIO
+        )
+
+    else:
+
+        start_ratio = (
+            OPPORTUNITY_TRAILING_START_RATIO
+        )
+
+        lock_ratio = (
+            OPPORTUNITY_TRAILING_LOCK_RATIO
+        )
+
+    start_roi = (
+        target_roi *
+        start_ratio
+    )
+
+    if highest_roi < start_roi:
+        return None
+
+    profit_range = max(
+        highest_roi -
+        start_roi,
+        0
+    )
+
+    locked_roi = (
+        start_roi +
+        profit_range *
+        lock_ratio
+    )
+
+    # ATR mesafesi
+    if p_type == "scalp":
+        atr_mult = 0.60
+    else:
+        atr_mult = 0.90
+
+    atr_distance = (
+        atr *
+        atr_mult
+    )
+
+    if side == "long":
+
+        atr_trail = (
+            mark_price -
+            atr_distance
+        )
+
+        roi_trail = roi_to_price(
+            entry_price,
+            locked_roi,
+            "buy",
+            LEVERAGE
+        )
+
+        trailing_price = max(
+            atr_trail,
+            roi_trail
+        )
+
+    else:
+
+        atr_trail = (
+            mark_price +
+            atr_distance
+        )
+
+        roi_trail = roi_to_price(
+            entry_price,
+            locked_roi,
+            "sell",
+            LEVERAGE
+        )
+
+        trailing_price = min(
+            atr_trail,
+            roi_trail
         )
 
     return float(
-        exchange.price_to_precision(
-            symbol,
-            tp
-        )
+        trailing_price
     )
 
 
@@ -2282,7 +2330,8 @@ def pozisyon_ac(
     direction,
     score,
     p_type,
-    analiz_detay=""
+    analiz_detay="",
+    eval_res=None
 ):
 
     if not TRADING_ENABLED:
@@ -2295,75 +2344,49 @@ def pozisyon_ac(
             if cooldown_aktif_mi(symbol):
                 return False
 
-            positions = exchange.fetch_positions()
-
-            active_positions = [
-                p
-                for p in positions
-                if float(
-                    p.get("contracts") or 0
-                ) > 0
-            ]
-
-            if len(active_positions) >= MAX_TOTAL_POSITIONS:
-                return False
-
-            for p in active_positions:
-
-                if (
-                    sembol_duzelt(
-                        p.get("symbol")
-                    ) == symbol
-                ):
-                    return False
-
-            active_scalp = sum(
-                1
-                for p in active_positions
-                if pozisyon_tipini_cozumle(p)
-                == "scalp"
-            )
-
-            active_opportunity = sum(
-                1
-                for p in active_positions
-                if pozisyon_tipini_cozumle(p)
-                == "opportunity"
-            )
-
-            if (
-                p_type == "scalp"
-                and active_scalp >= MAX_SCALP_POSITIONS
-            ):
-                return False
-
-            if (
-                p_type == "opportunity"
-                and active_opportunity >= MAX_OPPORTUNITY_POSITIONS
-            ):
-                return False
-
             # ------------------------------------------------
-            # ISOLATED + 5X
+            # POSITION LIMIT
             # ------------------------------------------------
+
+            current_positions = 0
 
             try:
+                existing = exchange.fetch_positions()
 
-                exchange.set_margin_mode(
-                    "isolated",
-                    symbol
-                )
+                current_positions = len([
+                    p for p in existing
+                    if float(
+                        p.get("contracts") or 0
+                    ) > 0
+                ])
 
             except Exception:
                 pass
 
-            try:
+            if current_positions >= MAX_TOTAL_POSITIONS:
+                logging.info(
+                    f"[POZİSYON LİMİT] "
+                    f"{symbol} | Aktif={current_positions}"
+                )
+                return False
 
+            # ------------------------------------------------
+            # MARGIN / LEVERAGE
+            # ------------------------------------------------
+
+            try:
+                exchange.set_margin_mode(
+                    "isolated",
+                    symbol
+                )
+            except Exception:
+                pass
+
+            try:
                 exchange.set_leverage(
                     LEVERAGE,
                     symbol
                 )
-
             except Exception:
                 pass
 
@@ -2413,63 +2436,77 @@ def pozisyon_ac(
                 )
             )
 
-            if amount <= 0:
-                return False
-
-            real_notional = (
-                amount *
-                price
-            )
-
-            real_margin = (
-                real_notional /
-                LEVERAGE
-            )
-
-            # ------------------------------------------------
-            # ORDER
-            # ------------------------------------------------
-
             side = (
                 "buy"
                 if direction == "buy"
                 else "sell"
             )
 
-            logging.info(
-                "============================================================"
+            # ------------------------------------------------
+            # CURRENT ATR
+            # ------------------------------------------------
+
+            df_temp = ohlcv_getir(
+                exchange,
+                symbol,
+                (
+                    SCALP_TRIGGER_TIMEFRAME
+                    if p_type == "scalp"
+                    else OPPORTUNITY_TRIGGER_TIMEFRAME
+                ),
+                80
             )
 
-            logging.info(
-                f"[İŞLEM AÇILIYOR] "
-                f"{symbol} | "
-                f"{p_type.upper()} | "
-                f"{side.upper()}"
+            if df_temp is not None:
+
+                atr = float(
+                    df_temp.iloc[-2]["atr"]
+                )
+
+            else:
+
+                atr = (
+                    price *
+                    0.01
+                )
+
+            if eval_res is not None:
+
+                momentum_data = eval_res[
+                    "momentum"
+                ]
+
+                final_score = eval_res[
+                    "final_score"
+                ]
+
+            else:
+
+                momentum_data = calculate_momentum_engine(
+                    df_temp,
+                    direction
+                )
+
+                final_score = score
+
+            # ------------------------------------------------
+            # DYNAMIC TRADE PLAN
+            # ------------------------------------------------
+
+            trade_plan = hesapla_dinamik_trade_plan(
+                price,
+                side,
+                atr,
+                p_type,
+                LEVERAGE,
+                target_margin,
+                momentum_data,
+                final_score
             )
 
-            logging.info(
-                f"[SKOR] {score}"
-            )
-
-            logging.info(
-                f"[DETAY] {analiz_detay}"
-            )
-
-            logging.info(
-                f"[GİRİŞ] {price}"
-            )
-
-            logging.info(
-                f"[MARJ] {real_margin:.2f} USDT"
-            )
-
-            logging.info(
-                f"[LEVERAGE] {LEVERAGE}X"
-            )
-
-            logging.info(
-                "============================================================"
-            )
+            # ------------------------------------------------
+            # MARKET ORDER
+            # ------------------------------------------------
 
             order = exchange.create_order(
                 symbol,
@@ -2486,63 +2523,56 @@ def pozisyon_ac(
                 return False
 
             # ------------------------------------------------
-            # STATE
+            # RUNTIME STATE
             # ------------------------------------------------
 
-            pozisyon_tipleri[symbol] = p_type
-            pozisyon_yonleri[symbol] = direction
+            pozisyon_tipleri[
+                symbol
+            ] = p_type
 
-            pozisyon_giris_fiyatlari[symbol] = price
+            pozisyon_yonleri[
+                symbol
+            ] = direction
 
-            pozisyon_en_yuksek_kar[symbol] = 0.0
+            pozisyon_giris_fiyatlari[
+                symbol
+            ] = price
 
-            pozisyon_acilis_zamanlari[symbol] = time.time()
+            pozisyon_en_yuksek_kar[
+                symbol
+            ] = 0.0
 
-            pozisyon_son_sl.pop(
-                symbol,
-                None
+            pozisyon_en_yuksek_roi[
+                symbol
+            ] = 0.0
+
+            pozisyon_acilis_zamanlari[
+                symbol
+            ] = time.time()
+
+            pozisyon_trade_plan[
+                symbol
+            ] = trade_plan
+
+            pozisyon_saglik_loglari[
+                symbol
+            ] = 100
+
+            pozisyon_son_momentum[
+                symbol
+            ] = momentum_data
+
+            pozisyon_son_analiz_zamani[
+                symbol
+            ] = time.time()
+
+            cooldown_baslat(
+                symbol
             )
-
-            cooldown_baslat(symbol)
 
             # ------------------------------------------------
-            # INITIAL SL / TP
+            # EXCHANGE STOP / TP
             # ------------------------------------------------
-
-            time.sleep(1.0)
-
-            timeframe = (
-                SCALP_SCAN_TIMEFRAME
-                if p_type == "scalp"
-                else OPPORTUNITY_SCAN_TIMEFRAME
-            )
-
-            df_temp = ohlcv_getir(
-                exchange,
-                symbol,
-                timeframe,
-                100
-            )
-
-            if df_temp is not None:
-
-                last_closed = son_kapanmis_mum(
-                    df_temp
-                )
-
-                atr = float(
-                    last_closed["atr"]
-                )
-
-            else:
-
-                atr = (
-                    price *
-                    0.01
-                )
-
-            if atr <= 0:
-                atr = price * 0.01
 
             close_side = (
                 "sell"
@@ -2550,133 +2580,79 @@ def pozisyon_ac(
                 else "buy"
             )
 
-            # ------------------------------------------------
-            # SCALP
-            # ------------------------------------------------
+            try:
 
-            if p_type == "scalp":
-
-                tp_price = scalp_tp_price(
-                    exchange,
+                exchange.create_order(
                     symbol,
-                    side,
+                    "stop_market",
+                    close_side,
                     amount,
-                    price
+                    None,
+                    {
+                        "stopPrice": exchange.price_to_precision(
+                            symbol,
+                            trade_plan["sl_price"]
+                        ),
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE"
+                    }
                 )
 
-                sl_distance = (
-                    atr *
-                    1.8
+            except Exception as e:
+
+                logging.error(
+                    f"[SL EMİR HATA] "
+                    f"{symbol}: {e}"
                 )
 
-                sl_price = (
-                    price - sl_distance
-                    if side == "buy"
-                    else
-                    price + sl_distance
+            try:
+
+                exchange.create_order(
+                    symbol,
+                    "take_profit_market",
+                    close_side,
+                    amount,
+                    None,
+                    {
+                        "stopPrice": exchange.price_to_precision(
+                            symbol,
+                            trade_plan["tp_price"]
+                        ),
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE"
+                    }
                 )
 
-                sl_price = float(
-                    exchange.price_to_precision(
-                        symbol,
-                        sl_price
-                    )
+            except Exception as e:
+
+                logging.error(
+                    f"[TP EMİR HATA] "
+                    f"{symbol}: {e}"
                 )
-
-                try:
-
-                    exchange.create_order(
-                        symbol,
-                        "take_profit_market",
-                        close_side,
-                        amount,
-                        None,
-                        {
-                            "stopPrice": tp_price,
-                            "reduceOnly": True,
-                            "workingType": "MARK_PRICE"
-                        }
-                    )
-
-                    exchange.create_order(
-                        symbol,
-                        "stop_market",
-                        close_side,
-                        amount,
-                        None,
-                        {
-                            "stopPrice": sl_price,
-                            "reduceOnly": True,
-                            "workingType": "MARK_PRICE"
-                        }
-                    )
-
-                    logging.info(
-                        f"[SCALP TP] {tp_price}"
-                    )
-
-                    logging.info(
-                        f"[SCALP SL] {sl_price}"
-                    )
-
-                except Exception as e:
-
-                    logging.error(
-                        f"Scalp SL/TP hata: {e}"
-                    )
 
             # ------------------------------------------------
-            # OPPORTUNITY
+            # DETAILED LOG
             # ------------------------------------------------
 
-            else:
-
-                sl_distance = (
-                    atr *
-                    2.5
-                )
-
-                sl_price = (
-                    price - sl_distance
-                    if side == "buy"
-                    else
-                    price + sl_distance
-                )
-
-                sl_price = float(
-                    exchange.price_to_precision(
-                        symbol,
-                        sl_price
-                    )
-                )
-
-                try:
-
-                    exchange.create_order(
-                        symbol,
-                        "stop_market",
-                        close_side,
-                        amount,
-                        None,
-                        {
-                            "stopPrice": sl_price,
-                            "reduceOnly": True,
-                            "workingType": "MARK_PRICE"
-                        }
-                    )
-
-                    pozisyon_son_sl[symbol] = sl_price
-
-                    logging.info(
-                        f"[OPPORTUNITY INITIAL SL] "
-                        f"{sl_price}"
-                    )
-
-                except Exception as e:
-
-                    logging.error(
-                        f"Opportunity SL hata: {e}"
-                    )
+            logging.info(
+                f"[BAŞARILI İŞLEM] "
+                f"{symbol} | "
+                f"{p_type.upper()} | "
+                f"{'LONG' if side == 'buy' else 'SHORT'} | "
+                f"Entry={price:.8f} | "
+                f"Score={final_score:.2f} | "
+                f"Momentum={momentum_data['momentum_score']:.1f} | "
+                f"Trend={momentum_data['trend_score']:.1f} | "
+                f"Volume={momentum_data['volume_ratio']:.2f} | "
+                f"Target=${trade_plan['target_usdt']:.4f} | "
+                f"TargetROI={trade_plan['target_roi']:.2f}% | "
+                f"MaxLoss=${trade_plan['max_loss_usdt']:.4f} | "
+                f"MaxLossROI={trade_plan['max_loss_roi']:.2f}% | "
+                f"TP={trade_plan['tp_price']:.8f} | "
+                f"SL={trade_plan['sl_price']:.8f} | "
+                f"Plan={trade_plan['hold_minutes']}dk | "
+                f"Trailing={'ON' if TRAILING_ENABLED else 'OFF'}"
+            )
 
             return True
 
@@ -2705,15 +2681,18 @@ def pozisyon_kapat(
 
         close_side = (
             "sell"
-            if side == "long"
+            if side in ["buy", "long"]
             else "buy"
         )
 
-        exchange.cancel_all_orders(
-            symbol
-        )
+        try:
+            exchange.cancel_all_orders(
+                symbol
+            )
+        except Exception:
+            pass
 
-        time.sleep(0.2)
+        time.sleep(0.15)
 
         exchange.create_order(
             symbol,
@@ -2729,7 +2708,7 @@ def pozisyon_kapat(
         logging.warning(
             f"[POZİSYON KAPATILDI] "
             f"{symbol} | "
-            f"{reason}"
+            f"Neden={reason}"
         )
 
         return True
@@ -2745,370 +2724,7 @@ def pozisyon_kapat(
 
 
 # ============================================================
-# SCALP TIME STOP
-# ============================================================
-
-def scalp_time_stop(
-    exchange,
-    symbol,
-    side,
-    contracts,
-    roi
-):
-
-    open_time = (
-        pozisyon_acilis_zamanlari
-        .get(symbol)
-    )
-
-    if open_time is None:
-        return False
-
-    elapsed_minutes = (
-        time.time() -
-        open_time
-    ) / 60
-
-    if elapsed_minutes < SCALP_MAX_HOLD_MINUTES:
-        return False
-
-    # 0.35 hedefe yaklaşmış ama henüz alamamışsa
-    # biraz daha tolerans vermiyoruz.
-    if roi < 0.5:
-
-        logging.warning(
-            f"[SCALP TIME STOP] "
-            f"{symbol} | "
-            f"{elapsed_minutes:.1f} dk | "
-            f"ROI %{roi:.2f}"
-        )
-
-        return pozisyon_kapat(
-            exchange,
-            symbol,
-            side,
-            contracts,
-            "TIME_STOP"
-        )
-
-    return False
-
-
-# ============================================================
-# SCALP PROFIT PROTECTION
-# ============================================================
-
-def scalp_profit_protection(
-    exchange,
-    symbol,
-    side,
-    contracts,
-    roi
-):
-
-    if not SCALP_EARLY_PROFIT_PROTECTION_ENABLED:
-        return False
-
-    if roi < SCALP_EARLY_PROFIT_MIN_ROI:
-        return False
-
-    timeframe = SCALP_SCAN_TIMEFRAME
-
-    df = ohlcv_getir(
-        exchange,
-        symbol,
-        timeframe,
-        80
-    )
-
-    if df is None:
-        return False
-
-    direction = (
-        "buy"
-        if side == "long"
-        else "sell"
-    )
-
-    mom = calculate_momentum_engine(
-        df,
-        direction
-    )
-
-    # Kârdayken momentum tamamen bozulursa
-    # geri dönüşü beklemiyoruz.
-    if (
-        mom["exhaustion_score"] >= 70
-        or
-        mom["state"] == "EXHAUSTING"
-    ):
-
-        logging.warning(
-            f"[SCALP KAR KORUMA] "
-            f"{symbol} | "
-            f"ROI %{roi:.2f} | "
-            f"Exhaustion {mom['exhaustion_score']}"
-        )
-
-        return pozisyon_kapat(
-            exchange,
-            symbol,
-            side,
-            contracts,
-            "MOMENTUM_EXHAUSTION"
-        )
-
-    return False
-
-
-# ============================================================
-# OPPORTUNITY TRAILING
-# ============================================================
-
-def opportunity_trailing(
-    exchange,
-    symbol,
-    side,
-    contracts,
-    entry_price,
-    mark_price,
-    leverage,
-    current_max
-):
-
-    yeni_sl = None
-
-    # --------------------------------------------------------
-    # 5 ROI sonrası koruma başlar
-    # --------------------------------------------------------
-
-    if current_max >= 5:
-
-        # 5 -> 15 ROI arası kademeli koruma
-        progress = min(
-            (current_max - 5) / 10,
-            1
-        )
-
-        locked_roi = (
-            1.0 +
-            progress * 4.0
-        )
-
-        price_move = (
-            locked_roi /
-            100 /
-            leverage
-        )
-
-        if side == "long":
-
-            yeni_sl = (
-                entry_price *
-                (1 + price_move)
-            )
-
-        else:
-
-            yeni_sl = (
-                entry_price *
-                (1 - price_move)
-            )
-
-    # --------------------------------------------------------
-    # 15+ ROI sonrası daha sıkı trailing
-    # --------------------------------------------------------
-
-    if current_max >= 15:
-
-        locked_roi = max(
-            8,
-            current_max - 3
-        )
-
-        price_move = (
-            locked_roi /
-            100 /
-            leverage
-        )
-
-        if side == "long":
-
-            yeni_sl = (
-                entry_price *
-                (1 + price_move)
-            )
-
-        else:
-
-            yeni_sl = (
-                entry_price *
-                (1 - price_move)
-            )
-
-    if yeni_sl is None:
-        return
-
-    # --------------------------------------------------------
-    # Stop mevcut fiyattan geride olmalı
-    # --------------------------------------------------------
-
-    if side == "long":
-
-        if yeni_sl >= mark_price:
-            yeni_sl = (
-                mark_price *
-                0.998
-            )
-
-    else:
-
-        if yeni_sl <= mark_price:
-            yeni_sl = (
-                mark_price *
-                1.002
-            )
-
-    yeni_sl = float(
-        exchange.price_to_precision(
-            symbol,
-            yeni_sl
-        )
-    )
-
-    eski_sl = pozisyon_son_sl.get(
-        symbol
-    )
-
-    # Stop daha kötüye gitmeyecek.
-    if eski_sl is not None:
-
-        if side == "long" and yeni_sl <= eski_sl:
-            return
-
-        if side == "short" and yeni_sl >= eski_sl:
-            return
-
-    try:
-
-        # Gereksiz cancel/create spam'i yok.
-        exchange.cancel_all_orders(
-            symbol
-        )
-
-        time.sleep(0.15)
-
-        close_side = (
-            "sell"
-            if side == "long"
-            else "buy"
-        )
-
-        exchange.create_order(
-            symbol,
-            "stop_market",
-            close_side,
-            contracts,
-            None,
-            {
-                "stopPrice": yeni_sl,
-                "reduceOnly": True,
-                "workingType": "MARK_PRICE"
-            }
-        )
-
-        pozisyon_son_sl[symbol] = yeni_sl
-
-        logging.info(
-            f"[TRAILING] "
-            f"{symbol} | "
-            f"MaxROI %{current_max:.2f} | "
-            f"YeniSL {yeni_sl}"
-        )
-
-    except Exception as e:
-
-        logging.error(
-            f"Trailing hata {symbol}: {e}"
-        )
-
-
-# ============================================================
-# OPPORTUNITY MOMENTUM EXIT
-# ============================================================
-
-def opportunity_momentum_exit(
-    exchange,
-    symbol,
-    side,
-    contracts,
-    roi
-):
-
-    if not OPPORTUNITY_MOMENTUM_EXIT_ENABLED:
-        return False
-
-    # Zararda iken sadece exhaustion nedeniyle
-    # agresif kapatma yapmıyoruz.
-    if roi < 0:
-        return False
-
-    df = ohlcv_getir(
-        exchange,
-        symbol,
-        OPPORTUNITY_SCAN_TIMEFRAME,
-        100
-    )
-
-    if df is None:
-        return False
-
-    direction = (
-        "buy"
-        if side == "long"
-        else "sell"
-    )
-
-    mom = calculate_momentum_engine(
-        df,
-        direction
-    )
-
-    # Büyük kâr + momentum dönüşü
-    if (
-        roi >= 12 and
-        (
-            mom["state"] == "EXHAUSTING"
-            or
-            (
-                mom["acceleration_score"] < 40
-                and
-                mom["momentum_score"] < 55
-            )
-        )
-    ):
-
-        logging.warning(
-            f"[OPPORTUNITY TREND EXIT] "
-            f"{symbol} | "
-            f"ROI %{roi:.2f} | "
-            f"Momentum {mom['momentum_score']} | "
-            f"Acceleration {mom['acceleration_score']}"
-        )
-
-        return pozisyon_kapat(
-            exchange,
-            symbol,
-            side,
-            contracts,
-            "TREND_REVERSAL"
-        )
-
-    return False
-
-
-# ============================================================
-# POSITION MANAGER
+# POSITION MANAGEMENT
 # ============================================================
 
 def pozisyonlari_yonet(
@@ -3127,66 +2743,6 @@ def pozisyonlari_yonet(
             p.get("contracts") or 0
         ) > 0
     }
-
-    # --------------------------------------------------------
-    # KAPANANLAR
-    # --------------------------------------------------------
-
-    kapananlar = (
-        onceki_aktif_pozisyonlar -
-        aktif_semboller
-    )
-
-    for sym in kapananlar:
-
-        pozisyon_tipleri.pop(
-            sym,
-            None
-        )
-
-        pozisyon_en_yuksek_kar.pop(
-            sym,
-            None
-        )
-
-        pozisyon_yonleri.pop(
-            sym,
-            None
-        )
-
-        pozisyon_giris_fiyatlari.pop(
-            sym,
-            None
-        )
-
-        pozisyon_acilis_zamanlari.pop(
-            sym,
-            None
-        )
-
-        pozisyon_son_sl.pop(
-            sym,
-            None
-        )
-
-        try:
-            exchange.cancel_all_orders(
-                sym
-            )
-        except Exception:
-            pass
-
-        logging.info(
-            f"[POZİSYON KAPANDI] {sym}"
-        )
-
-    onceki_aktif_pozisyonlar = (
-        aktif_semboller.copy()
-    )
-
-    # --------------------------------------------------------
-    # AKTİF
-    # --------------------------------------------------------
 
     for p in positions:
 
@@ -3213,41 +2769,371 @@ def pozisyonlari_yonet(
                 p.get("markPrice") or 0
             )
 
-            leverage = float(
-                p.get("leverage") or LEVERAGE
-            )
-
             roi = float(
                 p.get("percentage") or 0
             )
 
-            if entry_price <= 0 or mark_price <= 0:
-                continue
-
-            p_type = pozisyon_tipini_cozumle(p)
-
-            # ------------------------------------------------
-            # MAX ROI
-            # ------------------------------------------------
-
-            current_max = (
-                pozisyon_en_yuksek_kar
-                .get(symbol, 0)
+            unrealized_pnl = float(
+                p.get("unrealizedPnl") or 0
             )
 
-            if roi > current_max:
+            p_type = pozisyon_tipini_cozumle(
+                p
+            )
 
-                pozisyon_en_yuksek_kar[
+            plan = pozisyon_trade_plan.get(
+                symbol
+            )
+
+            # =================================================
+            # PLAN YOKSA OLUŞTUR
+            # =================================================
+
+            if plan is None:
+
+                df = ohlcv_getir(
+                    exchange,
+                    symbol,
+                    (
+                        SCALP_TRIGGER_TIMEFRAME
+                        if p_type == "scalp"
+                        else OPPORTUNITY_TRIGGER_TIMEFRAME
+                    ),
+                    80
+                )
+
+                if df is not None:
+
+                    atr = float(
+                        df.iloc[-2]["atr"]
+                    )
+
+                    direction = (
+                        "buy"
+                        if side == "long"
+                        else "sell"
+                    )
+
+                    momentum_data = calculate_momentum_engine(
+                        df,
+                        direction
+                    )
+
+                    margin = (
+                        SCALP_MARGIN
+                        if p_type == "scalp"
+                        else OPPORTUNITY_MARGIN
+                    )
+
+                    plan = hesapla_dinamik_trade_plan(
+                        entry_price,
+                        direction,
+                        atr,
+                        p_type,
+                        LEVERAGE,
+                        margin,
+                        momentum_data,
+                        80
+                    )
+
+                    pozisyon_trade_plan[
+                        symbol
+                    ] = plan
+
+            if plan is None:
+                continue
+
+            # =================================================
+            # HIGH WATER MARK
+            # =================================================
+
+            if roi > pozisyon_en_yuksek_roi.get(
+                symbol,
+                0
+            ):
+
+                pozisyon_en_yuksek_roi[
                     symbol
                 ] = roi
 
-                current_max = roi
+                pozisyon_en_yuksek_kar[
+                    symbol
+                ] = unrealized_pnl
 
-                logging.info(
-                    f"[ZİRVE] "
-                    f"{symbol} | "
-                    f"ROI %{roi:.2f}"
+            highest_roi = (
+                pozisyon_en_yuksek_roi.get(
+                    symbol,
+                    roi
                 )
+            )
+
+            # =================================================
+            # MOMENTUM CONTINUATION
+            # =================================================
+
+            continuation = momentum_continuation_analizi(
+                exchange,
+                symbol,
+                side,
+                p_type
+            )
+
+            momentum_score = continuation[
+                "score"
+            ]
+
+            pozisyon_son_momentum[
+                symbol
+            ] = continuation
+
+            pozisyon_son_analiz_zamani[
+                symbol
+            ] = time.time()
+
+            # =================================================
+            # TRADE HEALTH
+            # =================================================
+
+            df_health = ohlcv_getir(
+                exchange,
+                symbol,
+                (
+                    SCALP_TRIGGER_TIMEFRAME
+                    if p_type == "scalp"
+                    else OPPORTUNITY_TRIGGER_TIMEFRAME
+                ),
+                60
+            )
+
+            if df_health is not None:
+
+                direction = (
+                    "buy"
+                    if side == "long"
+                    else "sell"
+                )
+
+                health_mom = calculate_momentum_engine(
+                    df_health,
+                    direction
+                )
+
+                health_score = trade_health_analizi(
+                    df_health,
+                    side,
+                    roi,
+                    health_mom
+                )
+
+                pozisyon_saglik_loglari[
+                    symbol
+                ] = health_score
+
+            else:
+
+                health_score = 50
+
+            # =================================================
+            # HARD MAX LOSS
+            # =================================================
+
+            max_loss_roi = -float(
+                plan["max_loss_roi"]
+            )
+
+            if roi <= max_loss_roi:
+
+                pozisyon_kapat(
+                    exchange,
+                    symbol,
+                    side,
+                    contracts,
+                    "TARGET_BASED_MAX_LOSS"
+                )
+
+                continue
+
+            # =================================================
+            # TIME STOP
+            # =================================================
+
+            open_time = pozisyon_acilis_zamanlari.get(
+                symbol,
+                time.time()
+            )
+
+            elapsed_minutes = (
+                time.time() -
+                open_time
+            ) / 60
+
+            planned_minutes = float(
+                plan["hold_minutes"]
+            )
+
+            if elapsed_minutes >= planned_minutes:
+
+                # Kârda ise momentum durumuna bak.
+                if roi > 0:
+
+                    if momentum_score < 55:
+
+                        pozisyon_kapat(
+                            exchange,
+                            symbol,
+                            side,
+                            contracts,
+                            "DYNAMIC_TIME_STOP_MOMENTUM_WEAK"
+                        )
+
+                        continue
+
+                else:
+
+                    # Zarardaki pozisyon süreyi doldurduysa
+                    # momentum güçlü değilse artık taşımıyoruz.
+                    if momentum_score < 60:
+
+                        pozisyon_kapat(
+                            exchange,
+                            symbol,
+                            side,
+                            contracts,
+                            "DYNAMIC_TIME_STOP"
+                        )
+
+                        continue
+
+            # =================================================
+            # MOMENTUM REVERSAL
+            # =================================================
+
+            if MOMENTUM_CONTINUATION_ENABLED:
+
+                if momentum_score < MOMENTUM_HEALTH_EXIT_SCORE:
+
+                    pozisyon_kapat(
+                        exchange,
+                        symbol,
+                        side,
+                        contracts,
+                        "MOMENTUM_REVERSAL"
+                    )
+
+                    continue
+
+                # Zararda ve momentum ciddi biçimde
+                # zayıflıyorsa stopu bekleme.
+                if (
+                    roi < 0 and
+                    momentum_score < MOMENTUM_WEAK_SCORE
+                ):
+
+                    pozisyon_kapat(
+                        exchange,
+                        symbol,
+                        side,
+                        contracts,
+                        "LOSS_MOMENTUM_WEAK"
+                    )
+
+                    continue
+
+            # =================================================
+            # TRAILING
+            # =================================================
+
+            if TRAILING_ENABLED:
+
+                atr = (
+                    float(
+                        df_health.iloc[-2]["atr"]
+                    )
+                    if df_health is not None
+                    else entry_price * 0.01
+                )
+
+                trailing_price = dinamik_trailing_hesapla(
+                    entry_price,
+                    mark_price,
+                    side,
+                    p_type,
+                    roi,
+                    highest_roi,
+                    atr,
+                    float(
+                        plan["target_roi"]
+                    )
+                )
+
+                if trailing_price is not None:
+
+                    plan[
+                        "trailing_started"
+                    ] = True
+
+                    plan[
+                        "trailing_price"
+                    ] = trailing_price
+
+                    plan[
+                        "highest_roi"
+                    ] = highest_roi
+
+                    # LONG
+                    if side == "long":
+
+                        if mark_price <= trailing_price:
+
+                            pozisyon_kapat(
+                                exchange,
+                                symbol,
+                                side,
+                                contracts,
+                                "DYNAMIC_TRAILING"
+                            )
+
+                            continue
+
+                    # SHORT
+                    else:
+
+                        if mark_price >= trailing_price:
+
+                            pozisyon_kapat(
+                                exchange,
+                                symbol,
+                                side,
+                                contracts,
+                                "DYNAMIC_TRAILING"
+                            )
+
+                            continue
+
+            # =================================================
+            # EARLY PROFIT PROTECTION
+            # =================================================
+
+            if p_type == "scalp" and \
+               SCALP_EARLY_PROFIT_PROTECTION_ENABLED:
+
+                if roi >= SCALP_EARLY_PROFIT_MIN_ROI:
+
+                    if momentum_score < 55:
+
+                        pozisyon_kapat(
+                            exchange,
+                            symbol,
+                            side,
+                            contracts,
+                            "SCALP_PROFIT_MOMENTUM_FADE"
+                        )
+
+                        continue
+
+            # =================================================
+            # LOG
+            # =================================================
 
             logging.info(
                 f"[POZİSYON] "
@@ -3255,58 +3141,10 @@ def pozisyonlari_yonet(
                 f"{p_type.upper()} | "
                 f"{side.upper()} | "
                 f"ROI %{roi:.2f} | "
-                f"MAX %{current_max:.2f}"
+                f"MAX %{highest_roi:.2f} | "
+                f"Momentum={momentum_score:.1f} | "
+                f"Health={health_score:.1f}"
             )
-
-            # ------------------------------------------------
-            # SCALP
-            # ------------------------------------------------
-
-            if p_type == "scalp":
-
-                if scalp_time_stop(
-                    exchange,
-                    symbol,
-                    side,
-                    contracts,
-                    roi
-                ):
-                    continue
-
-                if scalp_profit_protection(
-                    exchange,
-                    symbol,
-                    side,
-                    contracts,
-                    roi
-                ):
-                    continue
-
-            # ------------------------------------------------
-            # OPPORTUNITY
-            # ------------------------------------------------
-
-            else:
-
-                if opportunity_momentum_exit(
-                    exchange,
-                    symbol,
-                    side,
-                    contracts,
-                    roi
-                ):
-                    continue
-
-                opportunity_trailing(
-                    exchange,
-                    symbol,
-                    side,
-                    contracts,
-                    entry_price,
-                    mark_price,
-                    leverage,
-                    current_max
-                )
 
         except Exception as e:
 
@@ -3315,9 +3153,211 @@ def pozisyonlari_yonet(
                 f"{symbol}: {e}"
             )
 
+    onceki_aktif_pozisyonlar = (
+        aktif_semboller.copy()
+    )
+
 
 # ============================================================
-# POSITION MONITOR LOOP
+# SCAN MARKET
+# ============================================================
+
+def market_ticker_pool(exchange):
+
+    try:
+
+        tickers = exchange.fetch_tickers()
+
+        usdt_tickers = [
+            t
+            for t in tickers.values()
+            if gecerli_kripto_mu(
+                t.get("symbol")
+            )
+            and
+            t.get("percentage") is not None
+        ]
+
+        gainers = sorted(
+            usdt_tickers,
+            key=lambda x: float(
+                x["percentage"]
+            ),
+            reverse=True
+        )[:GAINER_COUNT]
+
+        losers = sorted(
+            usdt_tickers,
+            key=lambda x: float(
+                x["percentage"]
+            )
+        )[:LOSER_COUNT]
+
+        return gainers, losers
+
+    except Exception as e:
+
+        logging.error(
+            f"Ticker pool hata: {e}"
+        )
+
+        return [], []
+
+
+# ============================================================
+# SCALP MARKET
+# ============================================================
+
+def scan_scalp_market(exchange):
+
+    try:
+
+        gainers, losers = market_ticker_pool(
+            exchange
+        )
+
+        candidates = []
+
+        # -----------------------------
+        # LONG
+        # -----------------------------
+
+        for ticker in gainers[:10]:
+
+            symbol = ticker["symbol"]
+
+            if cooldown_aktif_mi(symbol):
+                continue
+
+            df = ohlcv_getir(
+                exchange,
+                symbol,
+                SCALP_SCAN_TIMEFRAME,
+                100
+            )
+
+            if df is None:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "direction": "buy",
+                "df": df
+            })
+
+        # -----------------------------
+        # SHORT
+        # -----------------------------
+
+        for ticker in losers[:10]:
+
+            symbol = ticker["symbol"]
+
+            if cooldown_aktif_mi(symbol):
+                continue
+
+            df = ohlcv_getir(
+                exchange,
+                symbol,
+                SCALP_SCAN_TIMEFRAME,
+                100
+            )
+
+            if df is None:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "direction": "sell",
+                "df": df
+            })
+
+        return candidates
+
+    except Exception as e:
+
+        logging.error(
+            f"Scalp tarama hatası: {e}"
+        )
+
+        return []
+
+
+# ============================================================
+# OPPORTUNITY MARKET
+# ============================================================
+
+def scan_opportunity_market(exchange):
+
+    try:
+
+        gainers, losers = market_ticker_pool(
+            exchange
+        )
+
+        candidates = []
+
+        # LONG
+        for ticker in gainers[:10]:
+
+            symbol = ticker["symbol"]
+
+            if cooldown_aktif_mi(symbol):
+                continue
+
+            df = ohlcv_getir(
+                exchange,
+                symbol,
+                OPPORTUNITY_SCAN_TIMEFRAME,
+                100
+            )
+
+            if df is None:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "direction": "buy",
+                "df": df
+            })
+
+        # SHORT
+        for ticker in losers[:10]:
+
+            symbol = ticker["symbol"]
+
+            if cooldown_aktif_mi(symbol):
+                continue
+
+            df = ohlcv_getir(
+                exchange,
+                symbol,
+                OPPORTUNITY_SCAN_TIMEFRAME,
+                100
+            )
+
+            if df is None:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "direction": "sell",
+                "df": df
+            })
+
+        return candidates
+
+    except Exception as e:
+
+        logging.error(
+            f"Opportunity tarama hatası: {e}"
+        )
+
+        return []
+
+
+# ============================================================
+# MONITOR LOOP
 # ============================================================
 
 def pozisyon_monitor_loop():
@@ -3341,7 +3381,6 @@ def pozisyon_monitor_loop():
             if exchange is None:
 
                 exchange = get_exchange()
-
                 exchange.load_markets()
 
             if pozisyon_monitor_lock.acquire(
@@ -3358,7 +3397,9 @@ def pozisyon_monitor_loop():
                         p
                         for p in positions
                         if float(
-                            p.get("contracts") or 0
+                            p.get(
+                                "contracts"
+                            ) or 0
                         ) > 0
                     ]
 
@@ -3374,12 +3415,12 @@ def pozisyon_monitor_loop():
         except Exception as e:
 
             logging.error(
-                f"Monitor bağlantı/hata: {e}"
+                f"Monitor hata: {e}"
             )
 
             exchange = None
 
-        # Süre 15 saniyeye güncellendi
+        # Binance rate-limit koruması
         time.sleep(15.0)
 
 
@@ -3399,44 +3440,7 @@ def monitor_baslat():
 
 
 # ============================================================
-# CANDIDATE LOG
-# ============================================================
-
-def candidate_log(
-    mode,
-    symbol,
-    direction,
-    evaluation
-):
-
-    mom = evaluation.get(
-        "momentum",
-        {}
-    )
-
-    logging.info(
-        f"ANALİZ: "
-        f"{symbol} | "
-        f"Mode={mode.upper()} | "
-        f"Dir={direction.upper()} | "
-        f"Final={evaluation.get('final_score', 0):.2f} | "
-        f"Trend={mom.get('trend_score', 0):.1f} | "
-        f"Momentum={mom.get('momentum_score', 0):.1f} | "
-        f"Acceleration={mom.get('acceleration_score', 0):.1f} | "
-        f"Entry={mom.get('entry_score', 0):.1f} | "
-        f"Exhaustion={mom.get('exhaustion_score', 0):.1f} | "
-        f"Structure={mom.get('structure_score', 0):.1f} | "
-        f"Pullback={mom.get('pullback_score', 0):.1f} | "
-        f"State={mom.get('state', 'NA')} | "
-        f"BreakoutATR={mom.get('breakout_distance_atr', 0):.2f} | "
-        f"Volume={mom.get('volume_ratio', 0):.2f} | "
-        f"Trigger={mom.get('trigger_score', 0):.1f} | "
-        f"R²={evaluation.get('regression_r2', 0):.2f}"
-    )
-
-
-# ============================================================
-# MAIN SCAN LOOP
+# MAIN ANALYSIS LOOP
 # ============================================================
 
 def ana_tarama_dongusu():
@@ -3456,490 +3460,80 @@ def ana_tarama_dongusu():
             exchange.load_markets()
 
             logging.info(
-                "=============================================="
+                ">>> HİBRİT ANALİZ TARAMASI BAŞLADI <<<"
             )
-
-            logging.info(
-                ">>> YENİ HİBRİT ANALİZ BAŞLADI <<<"
-            )
-
-            logging.info(
-                "=============================================="
-            )
-
-            anlik_islem_loglari = []
-            scalp_takip = []
-            firsat_takip = []
-            aktif_pozisyonlar_roi_listesi = []
-            aciklama_loglari = []
-
-            # ------------------------------------------------
-            # POSITIONS
-            # ------------------------------------------------
-
-            positions = (
-                exchange.fetch_positions()
-            )
-
-            active_pos = [
-                p
-                for p in positions
-                if float(
-                    p.get("contracts") or 0
-                ) > 0
-            ]
-
-            aktif_scalp_var = False
-            aktif_firsat_var = False
-
-            for p in active_pos:
-
-                sym = sembol_duzelt(
-                    p.get("symbol")
-                )
-
-                turu = pozisyon_tipini_cozumle(
-                    p
-                )
-
-                roi = float(
-                    p.get("percentage") or 0
-                )
-
-                max_roi = (
-                    pozisyon_en_yuksek_kar
-                    .get(sym, 0)
-                )
-
-                aktif_pozisyonlar_roi_listesi.append({
-                    "symbol": sym,
-                    "mod": turu.upper(),
-                    "binance_gercek_roi_yuzde": round(
-                        roi,
-                        2
-                    ),
-                    "max_gorulen_zirve_kar_yuzde": round(
-                        max_roi,
-                        2
-                    )
-                })
-
-                if turu == "scalp":
-                    aktif_scalp_var = True
-                else:
-                    aktif_firsat_var = True
 
             # =================================================
             # OPPORTUNITY
             # =================================================
 
-            if not aktif_firsat_var:
+            firsat_listesi = (
+                scan_opportunity_market(
+                    exchange
+                )
+            )
 
-                logging.info(
-                    "[FIRSAT] Pozisyon yok -> tarama başlıyor"
+            firsat_listesi = sorted(
+                firsat_listesi,
+                key=lambda x: 0,
+                reverse=True
+            )
+
+            for candidate in firsat_listesi:
+
+                eval_res = evaluate_entry(
+                    exchange,
+                    candidate["symbol"],
+                    candidate["direction"],
+                    "opportunity",
+                    candidate["df"]
                 )
 
-                firsat_listesi = (
-                    scan_opportunity_market(
-                        exchange
-                    )
-                )
+                if eval_res["approved"]:
 
-                logging.info(
-                    f"[FIRSAT] "
-                    f"{len(firsat_listesi)} aday"
-                )
-
-                for i, candidate in enumerate(
-                    firsat_listesi,
-                    1
-                ):
-
-                    sym = candidate["symbol"]
-                    direction = candidate["direction"]
-
-                    evaluation = evaluate_entry(
-                        exchange,
-                        sym,
-                        direction,
-                        "opportunity",
-                        candidate["df"]
-                    )
-
-                    candidate_log(
-                        "opportunity",
-                        sym,
-                        direction,
-                        evaluation
-                    )
-
-                    mom = candidate["momentum"]
-
-                    firsat_takip.append({
-                        "symbol": sym,
-                        "yon": direction,
-                        "final_score": evaluation.get(
-                            "final_score",
-                            0
-                        ),
-                        "entry_score": mom.get(
-                            "entry_score",
-                            0
-                        ),
-                        "momentum": mom.get(
-                            "momentum_score",
-                            0
-                        ),
-                        "acceleration": mom.get(
-                            "acceleration_score",
-                            0
-                        ),
-                        "exhaustion": mom.get(
-                            "exhaustion_score",
-                            0
-                        ),
-                        "state": mom.get(
-                            "state",
-                            ""
-                        ),
-                        "volume": mom.get(
-                            "volume_ratio",
-                            0
-                        ),
-                        "breakout_atr": mom.get(
-                            "breakout_distance_atr",
-                            0
-                        ),
-                        "r2": evaluation.get(
-                            "regression_r2",
-                            0
-                        ),
-                        "approved": evaluation.get(
-                            "approved",
-                            False
-                        )
-                    })
-
-                # En yüksek final skorunu seç
-                evaluated = []
-
-                for candidate in firsat_listesi:
-
-                    evaluation = evaluate_entry(
+                    pozisyon_ac(
                         exchange,
                         candidate["symbol"],
                         candidate["direction"],
+                        eval_res["final_score"],
                         "opportunity",
-                        candidate["df"]
+                        eval_res=eval_res
                     )
 
-                    if evaluation.get(
-                        "approved",
-                        False
-                    ):
-
-                        evaluated.append(
-                            (
-                                evaluation.get(
-                                    "final_score",
-                                    0
-                                ),
-                                candidate,
-                                evaluation
-                            )
-                        )
-
-                evaluated.sort(
-                    key=lambda x: x[0],
-                    reverse=True
-                )
-
-                if evaluated:
-
-                    final_score, candidate, evaluation = (
-                        evaluated[0]
-                    )
-
-                    sym = candidate["symbol"]
-                    direction = candidate["direction"]
-
-                    mom = evaluation["momentum"]
-
-                    analiz_detayi = (
-                        f"Final={final_score:.2f} | "
-                        f"Trend={mom['trend_score']:.1f} | "
-                        f"Momentum={mom['momentum_score']:.1f} | "
-                        f"Acceleration={mom['acceleration_score']:.1f} | "
-                        f"Entry={mom['entry_score']:.1f} | "
-                        f"Exhaustion={mom['exhaustion_score']:.1f} | "
-                        f"Structure={mom['structure_score']:.1f} | "
-                        f"Pullback={mom['pullback_score']:.1f} | "
-                        f"State={mom['state']} | "
-                        f"BreakoutATR={mom['breakout_distance_atr']:.2f} | "
-                        f"Volume={mom['volume_ratio']:.2f} | "
-                        f"R²={evaluation['regression_r2']:.2f}"
-                    )
-
-                    logging.info(
-                        f"[FIRSAT ONAY] "
-                        f"{sym} | "
-                        f"{direction.upper()} | "
-                        f"{analiz_detayi}"
-                    )
-
-                    basarili = pozisyon_ac(
-                        exchange,
-                        sym,
-                        direction,
-                        final_score,
-                        "opportunity",
-                        analiz_detayi
-                    )
-
-                    if basarili:
-
-                        anlik_islem_loglari.append(
-                            f"Fırsat: {sym} "
-                            f"{direction.upper()} "
-                            f"Final={final_score:.2f}"
-                        )
-
-                else:
-
-                    logging.info(
-                        "[FIRSAT] Uygun entry bulunamadı"
-                    )
-
-                # Data cleanup
-                for item in firsat_listesi:
-
-                    if (
-                        item.get("df") is not None
-                    ):
-
-                        del item["df"]
-
-            else:
-
-                logging.info(
-                    "[FIRSAT] Aktif pozisyon mevcut"
-                )
+                    break
 
             # =================================================
             # SCALP
             # =================================================
 
-            if not aktif_scalp_var:
+            scalp_listesi = (
+                scan_scalp_market(
+                    exchange
+                )
+            )
 
-                logging.info(
-                    "[SCALP] Pozisyon yok -> tarama başlıyor"
+            for candidate in scalp_listesi:
+
+                eval_res = evaluate_entry(
+                    exchange,
+                    candidate["symbol"],
+                    candidate["direction"],
+                    "scalp",
+                    candidate["df"]
                 )
 
-                scalp_listesi = (
-                    scan_scalp_market(
-                        exchange
-                    )
-                )
+                if eval_res["approved"]:
 
-                logging.info(
-                    f"[SCALP] "
-                    f"{len(scalp_listesi)} aday"
-                )
-
-                for candidate in scalp_listesi:
-
-                    sym = candidate["symbol"]
-                    direction = candidate["direction"]
-
-                    evaluation = evaluate_entry(
-                        exchange,
-                        sym,
-                        direction,
-                        "scalp",
-                        candidate["df"]
-                    )
-
-                    candidate_log(
-                        "scalp",
-                        sym,
-                        direction,
-                        evaluation
-                    )
-
-                    mom = candidate["momentum"]
-
-                    scalp_takip.append({
-                        "symbol": sym,
-                        "yon": direction,
-                        "final_score": evaluation.get(
-                            "final_score",
-                            0
-                        ),
-                        "entry_score": mom.get(
-                            "entry_score",
-                            0
-                        ),
-                        "momentum": mom.get(
-                            "momentum_score",
-                            0
-                        ),
-                        "acceleration": mom.get(
-                            "acceleration_score",
-                            0
-                        ),
-                        "exhaustion": mom.get(
-                            "exhaustion_score",
-                            0
-                        ),
-                        "state": mom.get(
-                            "state",
-                            ""
-                        ),
-                        "volume": mom.get(
-                            "volume_ratio",
-                            0
-                        ),
-                        "breakout_atr": mom.get(
-                            "breakout_distance_atr",
-                            0
-                        ),
-                        "r2": evaluation.get(
-                            "regression_r2",
-                            0
-                        ),
-                        "approved": evaluation.get(
-                            "approved",
-                            False
-                        )
-                    })
-
-                # ------------------------------------------------
-                # En iyi Scalping entry
-                # ------------------------------------------------
-
-                evaluated = []
-
-                for candidate in scalp_listesi:
-
-                    evaluation = evaluate_entry(
+                    pozisyon_ac(
                         exchange,
                         candidate["symbol"],
                         candidate["direction"],
+                        eval_res["final_score"],
                         "scalp",
-                        candidate["df"]
+                        eval_res=eval_res
                     )
 
-                    if evaluation.get(
-                        "approved",
-                        False
-                    ):
-
-                        evaluated.append(
-                            (
-                                evaluation.get(
-                                    "final_score",
-                                    0
-                                ),
-                                candidate,
-                                evaluation
-                            )
-                        )
-
-                evaluated.sort(
-                    key=lambda x: x[0],
-                    reverse=True
-                )
-
-                if evaluated:
-
-                    final_score, candidate, evaluation = (
-                        evaluated[0]
-                    )
-
-                    sym = candidate["symbol"]
-                    direction = candidate["direction"]
-
-                    mom = evaluation["momentum"]
-
-                    analiz_detayi = (
-                        f"Final={final_score:.2f} | "
-                        f"Trend={mom['trend_score']:.1f} | "
-                        f"Momentum={mom['momentum_score']:.1f} | "
-                        f"Acceleration={mom['acceleration_score']:.1f} | "
-                        f"Entry={mom['entry_score']:.1f} | "
-                        f"Exhaustion={mom['exhaustion_score']:.1f} | "
-                        f"Structure={mom['structure_score']:.1f} | "
-                        f"Pullback={mom['pullback_score']:.1f} | "
-                        f"State={mom['state']} | "
-                        f"BreakoutATR={mom['breakout_distance_atr']:.2f} | "
-                        f"Volume={mom['volume_ratio']:.2f} | "
-                        f"Trigger={mom['trigger_score']:.1f} | "
-                        f"R²={evaluation['regression_r2']:.2f}"
-                    )
-
-                    logging.info(
-                        f"[SCALP ONAY] "
-                        f"{sym} | "
-                        f"{direction.upper()} | "
-                        f"{analiz_detayi}"
-                    )
-
-                    basarili = pozisyon_ac(
-                        exchange,
-                        sym,
-                        direction,
-                        final_score,
-                        "scalp",
-                        analiz_detayi
-                    )
-
-                    if basarili:
-
-                        anlik_islem_loglari.append(
-                            f"Scalp: {sym} "
-                            f"{direction.upper()} "
-                            f"Final={final_score:.2f}"
-                        )
-
-                else:
-
-                    logging.info(
-                        "[SCALP] Uygun entry bulunamadı"
-                    )
-
-                for item in scalp_listesi:
-
-                    if (
-                        item.get("df") is not None
-                    ):
-
-                        del item["df"]
-
-            else:
-
-                logging.info(
-                    "[SCALP] Aktif pozisyon mevcut"
-                )
-
-            # =================================================
-            # RAPOR
-            # =================================================
-
-            son_detayli_analiz_raporu = {
-                "zaman": pd.Timestamp.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "scalp_takip_listesi": scalp_takip,
-                "firsat_takip_listesi": firsat_takip,
-                "aktif_pozisyonlar_roi_durumu":
-                    aktif_pozisyonlar_roi_listesi,
-                "yapilan_islemler":
-                    anlik_islem_loglari,
-                "aciklamalar":
-                    aciklama_loglari
-            }
-
-            active_pos.clear()
+                    break
 
         except Exception as e:
 
@@ -3947,20 +3541,14 @@ def ana_tarama_dongusu():
                 f"Ana döngü hatası: {e}"
             )
 
-            son_detayli_analiz_raporu[
-                "hata"
-            ] = str(e)
-
         finally:
 
             gc.collect()
 
-        logging.info(
-            ">>> ANALİZ TAMAMLANDI - "
-            "300 SANİYE BEKLENİYOR <<<"
-        )
+        # Cron yerine mevcut yapıyı koruyoruz:
+        # analiz 5 dakikada bir.
+        # Pozisyon takibi ayrı thread'de 15 saniye.
 
-        # Süre 300 saniyeye güncellendi
         time.sleep(300)
 
 
@@ -3973,7 +3561,7 @@ def index():
 
     return jsonify({
         "status":
-            "Bot aktif - Momentum + Entry Timing Engine",
+            "Bot aktif - Dynamic Trade Plan + Momentum Engine",
         "trading_enabled":
             TRADING_ENABLED,
         "positions":
@@ -3986,105 +3574,26 @@ def index():
 @app.route("/durum")
 def durum():
 
-    try:
-
-        exchange = get_exchange()
-
-        exchange.load_markets()
-
-        positions = (
-            exchange.fetch_positions()
-        )
-
-        active_pos = [
-            p
-            for p in positions
-            if float(
-                p.get("contracts") or 0
-            ) > 0
-        ]
-
-        detaylar = []
-
-        for p in active_pos:
-
-            sym = sembol_duzelt(
-                p.get("symbol")
-            )
-
-            p_type = (
-                pozisyon_tipini_cozumle(p)
-            )
-
-            entry = float(
-                p.get("entryPrice") or 0
-            )
-
-            mark = float(
-                p.get("markPrice") or 0
-            )
-
-            lev = float(
-                p.get("leverage") or LEVERAGE
-            )
-
-            side = p.get("side")
-
-            roi = float(
-                p.get("percentage") or 0
-            )
-
-            detaylar.append({
-                "symbol": sym,
-                "mod": p_type.upper(),
-                "yon": (
-                    side.upper()
-                    if side
-                    else ""
-                ),
-                "giris_fiyati": entry,
-                "anlik_fiyat": mark,
-                "kaldirac": lev,
-                "binance_gercek_roi_yuzde":
-                    round(roi, 2),
-                "max_gorulen_zirve_kar_yuzde":
-                    round(
-                        pozisyon_en_yuksek_kar.get(
-                            sym,
-                            0
-                        ),
-                        2
-                    ),
-                "trailing_stop":
-                    pozisyon_son_sl.get(
-                        sym
-                    )
-            })
-
-        return jsonify({
-            "success": True,
-            "aktif_islem_sayisi":
-                len(detaylar),
-            "islemler":
-                detaylar
-        })
-
-    except Exception as e:
-
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        })
+    return jsonify({
+        "success": True,
+        "aktif_islem_sayisi":
+            len(
+                pozisyon_tipleri
+            ),
+        "saglik_durumlari":
+            pozisyon_saglik_loglari,
+        "trade_planlari":
+            pozisyon_trade_plan,
+        "momentum_durumlari":
+            pozisyon_son_momentum
+    })
 
 
 @app.route("/otomatik-analiz")
 def otomatik_analiz():
 
     return jsonify({
-        "success":
-            True,
-        "mesaj":
-            "Momentum & Entry Timing analiz raporu",
+        "success": True,
         "analiz_raporu":
             son_detayli_analiz_raporu
     })
