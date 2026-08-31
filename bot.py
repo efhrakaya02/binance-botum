@@ -765,13 +765,56 @@ def get_funding(symbol):
 # verisini kullanıyoruz. Bu veri her coin için ekstra bir API
 # çağrısı gerektirdiğinden yalnızca ön elemeyi geçen adaylarda
 # (top-5 aşamasında) kullanılması önerilir.
+#
+# NOT: Bu endpoint ccxt'de farklı sürümlerde farklı implicit
+# metot adlarıyla bulunabiliyor (bazı sürümlerde hiç yok). Bu
+# yüzden birkaç aday metot adını sırayla deneyip hangisi
+# kullanılabilir buluyoruz; hiçbiri yoksa BİR KEZ uyarı basıp
+# bu veriyi sessizce atlıyoruz (skor/işlem akışını etkilemez).
+
+TAKER_RATIO_METHOD_CANDIDATES = [
+    "fapiDataGetTakerlongshortRatio",
+    "fapiDataGetDeliveryPriceTakerlongshortRatio",
+    "fapiPublicGetFuturesDataTakerlongshortRatio",
+]
+
+_taker_ratio_method_name = None
+_taker_ratio_checked = False
+
+
+def _resolve_taker_ratio_method():
+    global _taker_ratio_method_name, _taker_ratio_checked
+
+    if _taker_ratio_checked:
+        return _taker_ratio_method_name
+
+    _taker_ratio_checked = True
+
+    for name in TAKER_RATIO_METHOD_CANDIDATES:
+        if hasattr(exchange, name):
+            _taker_ratio_method_name = name
+            logger.info("[TAKER RATIO] Kullanılacak ccxt metodu bulundu: %s", name)
+            return name
+
+    logger.warning(
+        "[TAKER RATIO] Bu ccxt sürümünde uygun endpoint bulunamadı, "
+        "taker ratio filtresi bu çalıştırmada pas geçilecek (diğer analizleri etkilemez)."
+    )
+    return None
+
 
 def get_taker_ratio(symbol, period="15m"):
+    method_name = _resolve_taker_ratio_method()
+
+    if not method_name:
+        return None
+
     try:
         market_symbol = normalize_symbol(symbol)
+        fn = getattr(exchange, method_name)
 
         raw = safe_call(
-            exchange.fapiPublicGetFuturesDataTakerlongshortRatio,
+            fn,
             {
                 "symbol": market_symbol,
                 "period": period,
@@ -2144,10 +2187,13 @@ def live_signal_check(symbol, direction):
         m5 = momentum_analysis(df5)
         m15 = momentum_analysis(df15)
 
-        trend_ok = (t5["direction"] == direction or t5["strength"] < 45)
-        trend_ok = trend_ok and (t15["direction"] == direction or t15["strength"] < 45)
+        # "ok" (bozulma yok) sayılma eşiği yükseltildi: ters yönde
+        # sadece belirgin güçte (>=55) bir sinyal varsa "bozuldu"
+        # sayılsın; zayıf/geçici dalgalanmalar erken çıkışı tetiklemesin.
+        trend_ok = (t5["direction"] == direction or t5["strength"] < 55)
+        trend_ok = trend_ok and (t15["direction"] == direction or t15["strength"] < 55)
 
-        momentum_ok = (m5["direction"] == direction or m5["strength"] < 45)
+        momentum_ok = (m5["direction"] == direction or m5["strength"] < 55)
 
         strength = (
             t5["strength"] * 0.25 +
@@ -2202,17 +2248,20 @@ def update_position_management(position, price):
         if position["locked_roi"] is None or position["locked_roi"] < lock:
             position["locked_roi"] = lock
 
-    if roi >= tp * 0.40:
+    if roi >= tp * 0.55:
         position["trailing_active"] = True
 
+        # Daha geniş mesafe: normal geri çekilmelerde hedefe giden
+        # işlemin erken kesilmesini önlemek için trailing daha geç
+        # aktifleşir ve daha toleranslı takip eder.
         if position["mode"] == "scalp":
-            trail = max(0.35, tp * 0.20)
+            trail = max(0.45, tp * 0.35)
         else:
-            trail = max(0.60, tp * 0.25)
+            trail = max(0.75, tp * 0.40)
 
-        if roi >= tp * 0.70:
+        if roi >= tp * 0.75:
             trail *= 0.80
-        if roi >= tp * 0.90:
+        if roi >= tp * 0.92:
             trail *= 0.70
 
         position["trail_distance_pct"] = trail
@@ -2262,14 +2311,16 @@ def should_close_position(position, price):
 
         # Opportunity modu daha uzun soluklu bir strateji olduğu için
         # erken çıkış eşikleri Scalp'e göre daha sabırlı (geç tetiklenir).
+        # Eşikler yükseltildi: küçük geri çekilmelerde değil, sadece
+        # gerçekten belirgin bir bozulmada erken çıkılsın.
         if position["mode"] == "opportunity":
-            reversal_trigger = 0.35
-            fade_trigger = 0.60
-            fade_strength_floor = 25
+            reversal_trigger = 0.50
+            fade_trigger = 0.75
+            fade_strength_floor = 20
         else:
-            reversal_trigger = 0.25
-            fade_trigger = 0.50
-            fade_strength_floor = 30
+            reversal_trigger = 0.40
+            fade_trigger = 0.65
+            fade_strength_floor = 25
 
         if roi > tp * reversal_trigger and not check["trend_ok"] and not check["momentum_ok"]:
             return True, "TREND_MOMENTUM_REVERSAL"
