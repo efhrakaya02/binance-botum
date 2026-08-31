@@ -47,7 +47,7 @@ API_KEY = os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 PORT = int(os.getenv("PORT", "8080"))
 
