@@ -66,7 +66,7 @@ MAX_OPPORTUNITY_POSITIONS = 1
 MAX_TOTAL_POSITIONS = 2
 
 MIN_LEVERAGE = 3
-MAX_LEVERAGE = 10
+MAX_LEVERAGE = 5
 
 # ------------------------------------------------------------
 # Skorlar
@@ -93,8 +93,17 @@ MAX_OPP_TP_PCT = 10.00
 # ------------------------------------------------------------
 
 POSITION_MONITOR_INTERVAL = 1.0
-ANALYSIS_INTERVAL = 45
-NO_SIGNAL_INTERVAL = 20
+ANALYSIS_INTERVAL = 300
+NO_SIGNAL_INTERVAL = 60
+
+# ------------------------------------------------------------
+# Aday sayısı / Likidite / BTC rejimi (YENİ)
+# ------------------------------------------------------------
+
+TOP_N_CANDIDATES = 5
+MIN_QUOTE_VOLUME_USDT = 5_000_000
+BTC_SYMBOL = "BTC/USDT"
+BTC_REGIME_MIN_STRENGTH = 50
 
 # ------------------------------------------------------------
 # Cooldown
@@ -495,11 +504,13 @@ def adx(df, period=14):
         (plus_di + minus_di).replace(0, np.nan)
     )
 
-    return dx.ewm(
+    adx_val = dx.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=period
     ).mean().fillna(0)
+
+    return adx_val, plus_di.fillna(0), minus_di.fillna(0)
 
 
 def bollinger(series, period=20, std_mult=2):
@@ -604,7 +615,7 @@ def enrich_dataframe(df):
         df["macd_hist"]
     ) = macd(df["close"])
 
-    df["adx"] = adx(df)
+    df["adx"], df["plus_di"], df["minus_di"] = adx(df)
 
     (
         df["bb_mid"],
@@ -649,7 +660,7 @@ def enrich_dataframe(df):
 
 
 # ============================================================
-# GAINERS / LOSERS
+# GAINERS / LOSERS  (+ LIKIDITE FILTRESI)
 # ============================================================
 
 def get_top_movers():
@@ -694,29 +705,24 @@ def get_top_movers():
 
     df = pd.DataFrame(rows)
 
-    # Likidite filtresi
-    df = df[
-        df["quoteVolume"] > 0
-    ]
+    # Likidite filtresi (eski: sadece > 0, yeni: minimum eşik)
+    df = df[df["quoteVolume"] >= MIN_QUOTE_VOLUME_USDT]
+
+    if df.empty:
+        logger.warning(
+            "[LIKIDITE] MIN_QUOTE_VOLUME_USDT=%s eşiğini geçen coin yok.",
+            MIN_QUOTE_VOLUME_USDT
+        )
+        return [], []
 
     gainers = (
-        df.sort_values(
-            "percentage",
-            ascending=False
-        )
-        .head(25)
-        ["symbol"]
-        .tolist()
+        df.sort_values("percentage", ascending=False)
+        .head(25)["symbol"].tolist()
     )
 
     losers = (
-        df.sort_values(
-            "percentage",
-            ascending=True
-        )
-        .head(25)
-        ["symbol"]
-        .tolist()
+        df.sort_values("percentage", ascending=True)
+        .head(25)["symbol"].tolist()
     )
 
     return gainers, losers
@@ -742,6 +748,129 @@ def get_funding(symbol):
 
 
 # ============================================================
+# TAKER BUY/SELL RATIO
+# ============================================================
+# Hacim artışının gerçekten alıcı mı satıcı mı kaynaklı olduğunu
+# ayırt etmek için Binance Futures'ın taker long/short ratio
+# verisini kullanıyoruz. Bu veri her coin için ekstra bir API
+# çağrısı gerektirdiğinden yalnızca ön elemeyi geçen adaylarda
+# (top-5 aşamasında) kullanılması önerilir.
+
+def get_taker_ratio(symbol, period="15m"):
+    try:
+        market_symbol = normalize_symbol(symbol)
+
+        raw = safe_call(
+            exchange.fapiPublicGetFuturesDataTakerlongshortRatio,
+            {
+                "symbol": market_symbol,
+                "period": period,
+                "limit": 5
+            }
+        )
+
+        if not raw:
+            return None
+
+        last = raw[-1]
+
+        buy_vol = safe_float(last.get("buyVol"))
+        sell_vol = safe_float(last.get("sellVol"))
+
+        if buy_vol <= 0 and sell_vol <= 0:
+            return None
+
+        total = buy_vol + sell_vol
+
+        if total <= 0:
+            return None
+
+        return {
+            "buy_ratio": buy_vol / total,
+            "sell_ratio": sell_vol / total,
+        }
+
+    except Exception as e:
+        logger.info(
+            "%s taker ratio alınamadı (opsiyonel veri): %s",
+            symbol,
+            e
+        )
+        return None
+
+
+# ============================================================
+# BTC PIYASA REJIMI FILTRESI
+# ============================================================
+# Altcoinler büyük ölçüde BTC ile korelasyonlu hareket eder.
+# BTC net bir trend içindeyken bu trende ters yönde açılan
+# işlemler istatistiksel olarak dezavantajlıdır. Bu fonksiyon
+# analysis_cycle başında BIR KEZ çağrılır ve tüm adaylara
+# parametre olarak geçirilir (her coin için tekrar tekrar
+# çağırmak gereksiz API yükü yaratır).
+
+def get_btc_regime():
+    try:
+        df15 = fetch_ohlcv(BTC_SYMBOL, "15m", 100)
+        df1h = fetch_ohlcv(BTC_SYMBOL, "1h", 100)
+
+        if df15 is None or df1h is None:
+            return {"direction": "neutral", "strength": 0}
+
+        df15 = enrich_dataframe(df15)
+        df1h = enrich_dataframe(df1h)
+
+        t15 = timeframe_trend(df15)
+        t1h = timeframe_trend(df1h)
+
+        if (
+            t15["direction"] == t1h["direction"]
+            and t15["direction"] != "neutral"
+        ):
+            strength = (t15["strength"] + t1h["strength"]) / 2
+            return {"direction": t15["direction"], "strength": strength}
+
+        return {"direction": "neutral", "strength": 0}
+
+    except Exception as e:
+        logger.warning("BTC rejim analizi başarısız: %s", e)
+        return {"direction": "neutral", "strength": 0}
+
+
+# ============================================================
+# ANOMALI / PUMP-DUMP FILTRESI
+# ============================================================
+# Gainers/losers listesi doğası gereği ani, sert hareketli
+# coinleri getirir. Bunların bir kısmı düşük likiditeli
+# coinlerde manipülatif (pump&dump) olabilir. Son birkaç mumda
+# hacim teyidi OLMADAN aşırı sert tek yönlü hareket varsa
+# bu coini eliyoruz.
+
+def detect_anomaly(df):
+    if df is None or len(df) < 10:
+        return False
+
+    last5 = df.tail(5)
+
+    price_change_pct = (
+        (last5["close"].iloc[-1] - last5["close"].iloc[0])
+        / last5["close"].iloc[0] * 100
+    )
+
+    avg_volume_ratio = safe_float(
+        last5["volume_ratio"].mean(),
+        1
+    )
+
+    # Son 5 mumda %8'den fazla hareket ama hacim teyidi zayıfsa
+    # (ör. ortalama hacim oranı 1.3'ün altındaysa) şüpheli kabul et
+    if abs(price_change_pct) >= 8 and avg_volume_ratio < 1.3:
+        return True
+
+    return False
+
+
+# ============================================================
 # TREND ANALYSIS
 # ============================================================
 
@@ -762,6 +891,8 @@ def timeframe_trend(df):
     e200 = safe_float(x["ema200"])
 
     adx_val = safe_float(x["adx"])
+    plus_di = safe_float(x.get("plus_di"))
+    minus_di = safe_float(x.get("minus_di"))
 
     bullish = (
         price > e21 >
@@ -786,29 +917,46 @@ def timeframe_trend(df):
     if adx_val >= ADX_VERY_STRONG:
         strength += 20
 
+    # +DI / -DI yön teyidi: trend yönü DI'lar tarafından
+    # doğrulanmıyorsa (ör. bullish görünüyor ama -DI > +DI ise)
+    # güç puanını cezalandır.
+    if bullish and plus_di <= minus_di:
+        strength -= 20
+
+    if bearish and minus_di <= plus_di:
+        strength -= 20
+
+    strength = clamp(strength, 0, 100)
+
     if bullish:
         return {
             "direction": "long",
-            "strength": clamp(strength, 0, 100)
+            "strength": strength
         }
 
     if bearish:
         return {
             "direction": "short",
-            "strength": clamp(strength, 0, 100)
+            "strength": strength
         }
 
     # Daha yumuşak trend
     if price > e50 and e9 > e21:
+        soft_strength = 35
+        if plus_di <= minus_di:
+            soft_strength -= 15
         return {
             "direction": "long",
-            "strength": 35
+            "strength": clamp(soft_strength, 0, 100)
         }
 
     if price < e50 and e9 < e21:
+        soft_strength = 35
+        if minus_di <= plus_di:
+            soft_strength -= 15
         return {
             "direction": "short",
-            "strength": 35
+            "strength": clamp(soft_strength, 0, 100)
         }
 
     return {
@@ -844,35 +992,30 @@ def momentum_analysis(df):
     long_points = 0
     short_points = 0
 
-    # RSI
     if 52 <= rsi_val <= 70:
         long_points += 20
 
     if 30 <= rsi_val <= 48:
         short_points += 20
 
-    # MACD
     if macd_hist > 0:
         long_points += 20
 
     if macd_hist < 0:
         short_points += 20
 
-    # Histogram acceleration
     if macd_hist > prev_hist:
         long_points += 15
 
     if macd_hist < prev_hist:
         short_points += 15
 
-    # ROC
     if roc_val > 0:
         long_points += 15
 
     if roc_val < 0:
         short_points += 15
 
-    # Volume
     if volume_ratio >= VOLUME_CONFIRMATION:
         if long_points >= short_points:
             long_points += 15
@@ -924,57 +1067,25 @@ def structure_analysis(df):
             "state": "unknown"
         }
 
-    previous_high = safe_float(
-        df.iloc[-2]["recent_high"]
-    )
+    previous_high = safe_float(df.iloc[-2]["recent_high"])
+    previous_low = safe_float(df.iloc[-2]["recent_low"])
 
-    previous_low = safe_float(
-        df.iloc[-2]["recent_low"]
-    )
-
-    # Breakout
     if close > previous_high:
-        return {
-            "direction": "long",
-            "strength": 80,
-            "state": "breakout"
-        }
+        return {"direction": "long", "strength": 80, "state": "breakout"}
 
     if close < previous_low:
-        return {
-            "direction": "short",
-            "strength": 80,
-            "state": "breakdown"
-        }
+        return {"direction": "short", "strength": 80, "state": "breakdown"}
 
-    # Pullback
-    distance_high = (
-        high20 - close
-    )
-
-    distance_low = (
-        close - low20
-    )
+    distance_high = high20 - close
+    distance_low = close - low20
 
     if distance_high <= atr_val * 1.2:
-        return {
-            "direction": "long",
-            "strength": 60,
-            "state": "pullback_long"
-        }
+        return {"direction": "long", "strength": 60, "state": "pullback_long"}
 
     if distance_low <= atr_val * 1.2:
-        return {
-            "direction": "short",
-            "strength": 60,
-            "state": "pullback_short"
-        }
+        return {"direction": "short", "strength": 60, "state": "pullback_short"}
 
-    return {
-        "direction": "neutral",
-        "strength": 25,
-        "state": "range"
-    }
+    return {"direction": "neutral", "strength": 25, "state": "range"}
 
 
 # ============================================================
@@ -983,27 +1094,19 @@ def structure_analysis(df):
 
 def entry_timing(df, direction):
     if df is None or len(df) < 30:
-        return {
-            "confirmed": False,
-            "score": 0,
-            "reason": "insufficient_data"
-        }
+        return {"confirmed": False, "score": 0, "reason": "insufficient_data"}
 
     x = df.iloc[-1]
     p = df.iloc[-2]
 
     close = safe_float(x["close"])
-
     ema9 = safe_float(x["ema9"])
     ema21 = safe_float(x["ema21"])
 
     prev_close = safe_float(p["close"])
     prev_ema9 = safe_float(p["ema9"])
 
-    volume_ratio = safe_float(
-        x["volume_ratio"],
-        1
-    )
+    volume_ratio = safe_float(x["volume_ratio"], 1)
 
     macd_hist = safe_float(x["macd_hist"])
     prev_macd_hist = safe_float(p["macd_hist"])
@@ -1090,26 +1193,17 @@ def is_overextended(df, direction):
         return True
 
     if direction == "long":
-
         distance = close - ema21
-
         if distance > atr_val * 2.4:
             return True
-
         distance50 = close - ema50
-
         if distance50 > atr_val * 4.0:
             return True
-
     else:
-
         distance = ema21 - close
-
         if distance > atr_val * 2.4:
             return True
-
         distance50 = ema50 - close
-
         if distance50 > atr_val * 4.0:
             return True
 
@@ -1120,38 +1214,32 @@ def is_overextended(df, direction):
 # MULTI TIMEFRAME SCORE
 # ============================================================
 
-def analyze_coin(symbol, mode):
-    timeframes = [
-        "5m",
-        "15m",
-        "1h",
-        "4h"
-    ]
+def analyze_coin(symbol, mode, btc_regime=None):
+    timeframes = ["5m", "15m", "1h", "4h"]
 
     data = {}
 
     for tf in timeframes:
-        df = fetch_ohlcv(
-            symbol,
-            tf
-        )
+        df = fetch_ohlcv(symbol, tf)
 
         if df is None:
             return None
 
         data[tf] = enrich_dataframe(df)
 
+    # --------------------------------------------------------
+    # Anomali (pump/dump) filtresi — 15m üzerinde kontrol
+    # --------------------------------------------------------
+
+    if detect_anomaly(data["15m"]):
+        return None
+
     trend = {}
     momentum = {}
 
     for tf in timeframes:
-        trend[tf] = timeframe_trend(
-            data[tf]
-        )
-
-        momentum[tf] = momentum_analysis(
-            data[tf]
-        )
+        trend[tf] = timeframe_trend(data[tf])
+        momentum[tf] = momentum_analysis(data[tf])
 
     # --------------------------------------------------------
     # Direction voting
@@ -1164,13 +1252,11 @@ def analyze_coin(symbol, mode):
 
         if trend[tf]["direction"] == "long":
             long_votes += 1
-
         elif trend[tf]["direction"] == "short":
             short_votes += 1
 
         if momentum[tf]["direction"] == "long":
             long_votes += 0.5
-
         elif momentum[tf]["direction"] == "short":
             short_votes += 0.5
 
@@ -1180,6 +1266,21 @@ def analyze_coin(symbol, mode):
         direction = "short"
     else:
         return None
+
+    # --------------------------------------------------------
+    # BTC piyasa rejimi filtresi (YENİ)
+    # --------------------------------------------------------
+    # BTC net bir trend içindeyse ve bu coin BTC'ye ters yöndeyse
+    # işlemi ele. BTC_SYMBOL'ün kendisini analiz ederken bu
+    # kontrolü atla (sonsuz döngü olmasın diye).
+
+    if btc_regime and symbol != BTC_SYMBOL:
+        if (
+            btc_regime["direction"] != "neutral"
+            and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
+            and btc_regime["direction"] != direction
+        ):
+            return None
 
     # --------------------------------------------------------
     # Weighted trend
@@ -1206,41 +1307,29 @@ def analyze_coin(symbol, mode):
     alignment = 0
 
     for tf in timeframes:
-
         if (
             trend[tf]["direction"] == direction and
             momentum[tf]["direction"] == direction
         ):
             alignment += 25
 
-    alignment = clamp(
-        alignment,
-        0,
-        100
-    )
+    alignment = clamp(alignment, 0, 100)
 
     # --------------------------------------------------------
     # Current structure
     # --------------------------------------------------------
 
-    structure = structure_analysis(
-        data["15m"]
-    )
+    structure = structure_analysis(data["15m"])
 
     structure_score = (
-        structure["strength"]
-        if structure["direction"] == direction
-        else 0
+        structure["strength"] if structure["direction"] == direction else 0
     )
 
     # --------------------------------------------------------
     # Entry timing
     # --------------------------------------------------------
 
-    timing = entry_timing(
-        data["5m"],
-        direction
-    )
+    timing = entry_timing(data["5m"], direction)
 
     # --------------------------------------------------------
     # Volume
@@ -1248,30 +1337,17 @@ def analyze_coin(symbol, mode):
 
     current = data["15m"].iloc[-1]
 
-    volume_ratio = safe_float(
-        current["volume_ratio"],
-        1
-    )
+    volume_ratio = safe_float(current["volume_ratio"], 1)
 
-    volume_score = clamp(
-        (volume_ratio - 1) * 80,
-        0,
-        100
-    )
+    volume_score = clamp((volume_ratio - 1) * 80, 0, 100)
 
     # --------------------------------------------------------
     # ADX
     # --------------------------------------------------------
 
-    adx_val = safe_float(
-        current["adx"]
-    )
+    adx_val = safe_float(current["adx"])
 
-    adx_score = clamp(
-        (adx_val / 45) * 100,
-        0,
-        100
-    )
+    adx_score = clamp((adx_val / 45) * 100, 0, 100)
 
     # --------------------------------------------------------
     # Raw score
@@ -1287,10 +1363,7 @@ def analyze_coin(symbol, mode):
         adx_score * 0.05
     )
 
-    score = round(
-        clamp(score, 0, 100),
-        2
-    )
+    score = round(clamp(score, 0, 100), 2)
 
     # --------------------------------------------------------
     # Funding
@@ -1305,149 +1378,100 @@ def analyze_coin(symbol, mode):
     # Overextension
     # --------------------------------------------------------
 
-    if is_overextended(
-        data["15m"],
-        direction
-    ):
+    if is_overextended(data["15m"], direction):
         return None
 
     # --------------------------------------------------------
     # Strict confirmation
     # --------------------------------------------------------
 
-    if mode == "scalp":
-        minimum = SCALP_MIN_SCORE
-    else:
-        minimum = OPPORTUNITY_MIN_SCORE
+    minimum = SCALP_MIN_SCORE if mode == "scalp" else OPPORTUNITY_MIN_SCORE
 
     if score < minimum:
         return None
 
-    # 1h + 4h direction must not directly contradict
     for tf in ["1h", "4h"]:
-
         if (
             trend[tf]["direction"] != direction
             and trend[tf]["strength"] >= 60
         ):
             return None
 
-    # Momentum confirmation
     if momentum["15m"]["direction"] != direction:
         return None
 
-    # Entry timing
     if not timing["confirmed"]:
         return None
 
-    # Opportunity is deliberately stricter
     if mode == "opportunity":
-
         if alignment < 70:
             return None
-
         if trend["1h"]["strength"] < 55:
             return None
-
         if trend["4h"]["strength"] < 55:
             return None
-
         if momentum["1h"]["strength"] < 55:
             return None
-
         if adx_val < 22:
             return None
+
+    # --------------------------------------------------------
+    # Taker buy/sell ratio (YENİ) — sadece skoru geçen adaylarda
+    # ekstra API çağrısı yapıyoruz, tüm coinlerde değil.
+    # --------------------------------------------------------
+
+    taker = get_taker_ratio(symbol)
+    taker_note = "n/a"
+
+    if taker:
+        if direction == "long" and taker["buy_ratio"] < 0.48:
+            return None
+        if direction == "short" and taker["sell_ratio"] < 0.48:
+            return None
+        taker_note = (
+            f"buy={taker['buy_ratio']:.2f} sell={taker['sell_ratio']:.2f}"
+        )
 
     # --------------------------------------------------------
     # Dynamic TP / SL
     # --------------------------------------------------------
 
-    price = safe_float(
-        current["close"]
-    )
+    price = safe_float(current["close"])
 
-    atr_pct = safe_float(
-        current["atr_pct"]
-    )
-
-    atr_pct = clamp(
-        atr_pct,
-        0.15,
-        6.0
-    )
+    atr_pct = safe_float(current["atr_pct"])
+    atr_pct = clamp(atr_pct, 0.15, 6.0)
 
     if mode == "scalp":
-
         tp_pct = (
             atr_pct * 1.20 +
             momentum_score * 0.012 +
             adx_score * 0.006
         )
-
-        tp_pct = clamp(
-            tp_pct,
-            MIN_SCALP_TP_PCT,
-            MAX_SCALP_TP_PCT
-        )
-
+        tp_pct = clamp(tp_pct, MIN_SCALP_TP_PCT, MAX_SCALP_TP_PCT)
     else:
-
         tp_pct = (
             atr_pct * 2.00 +
             momentum_score * 0.020 +
             alignment * 0.010
         )
+        tp_pct = clamp(tp_pct, MIN_OPP_TP_PCT, MAX_OPP_TP_PCT)
 
-        tp_pct = clamp(
-            tp_pct,
-            MIN_OPP_TP_PCT,
-            MAX_OPP_TP_PCT
-        )
+    max_sl_pct = tp_pct * MAX_LOSS_TO_TARGET_RATIO
 
-    max_sl_pct = (
-        tp_pct *
-        MAX_LOSS_TO_TARGET_RATIO
-    )
+    volatility_sl = atr_pct * (0.85 if mode == "scalp" else 1.10)
 
-    # Volatility-aware stop, but never > 60% target
-    volatility_sl = atr_pct * (
-        0.85 if mode == "scalp"
-        else 1.10
-    )
+    sl_pct = min(volatility_sl, max_sl_pct)
+    sl_pct = max(sl_pct, 0.35)
 
-    sl_pct = min(
-        volatility_sl,
-        max_sl_pct
-    )
-
-    # Avoid absurdly tiny SL
-    sl_pct = max(
-        sl_pct,
-        0.35
-    )
-
-    # If min SL violates 60% rule, recalculate TP upward
     if sl_pct > tp_pct * MAX_LOSS_TO_TARGET_RATIO:
-
         tp_pct = sl_pct / MAX_LOSS_TO_TARGET_RATIO
 
         if mode == "scalp":
-            tp_pct = clamp(
-                tp_pct,
-                MIN_SCALP_TP_PCT,
-                MAX_SCALP_TP_PCT
-            )
+            tp_pct = clamp(tp_pct, MIN_SCALP_TP_PCT, MAX_SCALP_TP_PCT)
         else:
-            tp_pct = clamp(
-                tp_pct,
-                MIN_OPP_TP_PCT,
-                MAX_OPP_TP_PCT
-            )
+            tp_pct = clamp(tp_pct, MIN_OPP_TP_PCT, MAX_OPP_TP_PCT)
 
-        sl_pct = min(
-            sl_pct,
-            tp_pct * MAX_LOSS_TO_TARGET_RATIO
-        )
+        sl_pct = min(sl_pct, tp_pct * MAX_LOSS_TO_TARGET_RATIO)
 
     return {
         "symbol": symbol,
@@ -1464,6 +1488,7 @@ def analyze_coin(symbol, mode):
         "adx": adx_val,
         "atr_pct": atr_pct,
         "funding": funding,
+        "taker_note": taker_note,
         "price": price,
         "tp_pct": tp_pct,
         "sl_pct": sl_pct,
@@ -1476,23 +1501,16 @@ def analyze_coin(symbol, mode):
 # ============================================================
 
 def is_on_cooldown(symbol):
-    t = cooldowns.get(
-        normalize_symbol(symbol)
-    )
+    t = cooldowns.get(normalize_symbol(symbol))
 
     if not t:
         return False
 
-    return (
-        now_ms() - t <
-        COOLDOWN_MS
-    )
+    return (now_ms() - t) < COOLDOWN_MS
 
 
 def set_cooldown(symbol):
-    cooldowns[
-        normalize_symbol(symbol)
-    ] = now_ms()
+    cooldowns[normalize_symbol(symbol)] = now_ms()
 
 
 # ============================================================
@@ -1501,28 +1519,18 @@ def set_cooldown(symbol):
 
 def get_local_positions():
     with state_lock:
-        return {
-            k: dict(v)
-            for k, v in local_positions.items()
-        }
+        return {k: dict(v) for k, v in local_positions.items()}
 
 
 def local_position_count(mode=None):
     with state_lock:
-
         if mode is None:
             return len(local_positions)
-
-        return sum(
-            1
-            for p in local_positions.values()
-            if p.get("mode") == mode
-        )
+        return sum(1 for p in local_positions.values() if p.get("mode") == mode)
 
 
 def has_local_symbol(symbol):
     normalized = normalize_symbol(symbol)
-
     with state_lock:
         return any(
             normalize_symbol(p["symbol"]) == normalized
@@ -1536,17 +1544,12 @@ def has_local_symbol(symbol):
 
 def fetch_real_positions():
     try:
-        positions = safe_call(
-            exchange.fetch_positions
-        )
+        positions = safe_call(exchange.fetch_positions)
 
         active = []
 
         for p in positions:
-
-            contracts = safe_float(
-                p.get("contracts")
-            )
+            contracts = safe_float(p.get("contracts"))
 
             if abs(contracts) <= 0:
                 continue
@@ -1556,42 +1559,20 @@ def fetch_real_positions():
             if not symbol:
                 continue
 
-            side = p.get("side")
-
-            entry = safe_float(
-                p.get("entryPrice")
-            )
-
-            mark = safe_float(
-                p.get("markPrice")
-            )
-
-            unrealized = safe_float(
-                p.get("unrealizedPnl")
-            )
-
-            leverage = safe_float(
-                p.get("leverage")
-            )
-
             active.append({
                 "symbol": symbol,
-                "side": side,
+                "side": p.get("side"),
                 "contracts": contracts,
-                "entryPrice": entry,
-                "markPrice": mark,
-                "unrealizedPnl": unrealized,
-                "leverage": leverage,
+                "entryPrice": safe_float(p.get("entryPrice")),
+                "markPrice": safe_float(p.get("markPrice")),
+                "unrealizedPnl": safe_float(p.get("unrealizedPnl")),
+                "leverage": safe_float(p.get("leverage")),
             })
 
         return active
 
     except Exception as e:
-        logger.warning(
-            "Gerçek pozisyonlar alınamadı: %s",
-            e
-        )
-
+        logger.warning("Gerçek pozisyonlar alınamadı: %s", e)
         return []
 
 
@@ -1602,30 +1583,15 @@ def sync_real_positions():
     real = fetch_real_positions()
 
     with state_lock:
+        real_symbols = {normalize_symbol(p["symbol"]) for p in real}
 
-        real_symbols = {
-            normalize_symbol(
-                p["symbol"]
-            )
-            for p in real
-        }
-
-        # Gerçekte kapanmış pozisyonları local state'ten sil
-        remove = []
-
-        for key, local in local_positions.items():
-
-            if normalize_symbol(
-                local["symbol"]
-            ) not in real_symbols:
-
-                remove.append(key)
+        remove = [
+            key for key, local in local_positions.items()
+            if normalize_symbol(local["symbol"]) not in real_symbols
+        ]
 
         for key in remove:
-            local_positions.pop(
-                key,
-                None
-            )
+            local_positions.pop(key, None)
 
 
 # ============================================================
@@ -1639,19 +1605,13 @@ def can_open_mode(mode):
         return False
 
     if mode == "scalp":
-        return (
-            local_position_count("scalp")
-            < MAX_SCALP_POSITIONS
-        )
+        return local_position_count("scalp") < MAX_SCALP_POSITIONS
 
-    return (
-        local_position_count("opportunity")
-        < MAX_OPPORTUNITY_POSITIONS
-    )
+    return local_position_count("opportunity") < MAX_OPPORTUNITY_POSITIONS
 
 
 # ============================================================
-# LEVERAGE
+# LEVERAGE  (tavan artık 5x)
 # ============================================================
 
 def calculate_leverage(signal):
@@ -1662,70 +1622,36 @@ def calculate_leverage(signal):
     leverage = MIN_LEVERAGE
 
     if score >= 85:
-        leverage += 2
+        leverage += 1
 
-    if score >= 90:
+    if score >= 92:
         leverage += 1
 
     if adx_val >= 30:
         leverage += 1
 
-    if atr_pct < 1.5:
-        leverage += 1
-
     if atr_pct > 4:
-        leverage -= 2
+        leverage -= 1
 
-    return int(
-        clamp(
-            leverage,
-            MIN_LEVERAGE,
-            MAX_LEVERAGE
-        )
-    )
+    return int(clamp(leverage, MIN_LEVERAGE, MAX_LEVERAGE))
 
 
 def set_isolated_and_leverage(symbol, leverage):
     try:
-
         try:
-            safe_call(
-                exchange.set_margin_mode,
-                "isolated",
-                symbol
-            )
+            safe_call(exchange.set_margin_mode, "isolated", symbol)
         except Exception as e:
             text = str(e).lower()
-
-            if (
-                "already" not in text
-                and "no need" not in text
-            ):
-                logger.warning(
-                    "%s isolated ayarlanamadı: %s",
-                    symbol,
-                    e
-                )
+            if "already" not in text and "no need" not in text:
+                logger.warning("%s isolated ayarlanamadı: %s", symbol, e)
 
         try:
-            safe_call(
-                exchange.set_leverage,
-                leverage,
-                symbol
-            )
+            safe_call(exchange.set_leverage, leverage, symbol)
         except Exception as e:
-            logger.warning(
-                "%s leverage ayarlanamadı: %s",
-                symbol,
-                e
-            )
+            logger.warning("%s leverage ayarlanamadı: %s", symbol, e)
 
     except Exception as e:
-        logger.warning(
-            "%s margin/leverage hatası: %s",
-            symbol,
-            e
-        )
+        logger.warning("%s margin/leverage hatası: %s", symbol, e)
 
 
 # ============================================================
@@ -1733,14 +1659,8 @@ def set_isolated_and_leverage(symbol, leverage):
 # ============================================================
 
 def fetch_current_price(symbol):
-    ticker = safe_call(
-        exchange.fetch_ticker,
-        symbol
-    )
-
-    return safe_float(
-        ticker.get("last")
-    )
+    ticker = safe_call(exchange.fetch_ticker, symbol)
+    return safe_float(ticker.get("last"))
 
 
 # ============================================================
@@ -1748,17 +1668,8 @@ def fetch_current_price(symbol):
 # ============================================================
 
 def calculate_amount(symbol, margin, leverage, price):
-    notional = (
-        margin *
-        leverage
-    )
-
-    amount = (
-        notional /
-        price
-    )
-
-    return amount
+    notional = margin * leverage
+    return notional / price
 
 
 # ============================================================
@@ -1769,35 +1680,19 @@ def create_dry_run_position(signal):
     symbol = signal["symbol"]
     direction = signal["direction"]
     mode = signal["mode"]
-
     price = signal["price"]
 
-    leverage = calculate_leverage(
-        signal
-    )
+    leverage = calculate_leverage(signal)
 
-    margin = (
-        SCALP_MARGIN
-        if mode == "scalp"
-        else OPPORTUNITY_MARGIN
-    )
+    margin = SCALP_MARGIN if mode == "scalp" else OPPORTUNITY_MARGIN
 
-    amount = calculate_amount(
-        symbol,
-        margin,
-        leverage,
-        price
-    )
+    amount = calculate_amount(symbol, margin, leverage, price)
 
-    key = (
-        f"{mode}:{normalize_symbol(symbol)}"
-    )
+    key = f"{mode}:{normalize_symbol(symbol)}"
 
     with state_lock:
-
         if key in local_positions:
             return False
-
         if not can_open_mode(mode):
             return False
 
@@ -1824,18 +1719,11 @@ def create_dry_run_position(signal):
         }
 
     logger.warning(
-        "[DRY RUN] %s %s açıldı | score=%.2f | "
-        "TP=%.2f%% | SL=%.2f%% | lev=%sx",
-        mode.upper(),
-        symbol,
-        signal["score"],
-        signal["tp_pct"],
-        signal["sl_pct"],
-        leverage
+        "[DRY RUN] %s %s açıldı | score=%.2f | TP=%.2f%% | SL=%.2f%% | lev=%sx | margin=%s$",
+        mode.upper(), symbol, signal["score"], signal["tp_pct"], signal["sl_pct"], leverage, margin
     )
 
     bot_stats["orders"] += 1
-
     return True
 
 
@@ -1848,115 +1736,61 @@ def create_real_position(signal):
     direction = signal["direction"]
     mode = signal["mode"]
 
-    key = (
-        f"{mode}:{normalize_symbol(symbol)}"
-    )
+    key = f"{mode}:{normalize_symbol(symbol)}"
 
-    # Son güvenlik kontrolü
     with state_lock:
-
         if len(local_positions) >= MAX_TOTAL_POSITIONS:
             return False
-
         if not can_open_mode(mode):
             return False
-
         if has_local_symbol(symbol):
             return False
 
-    # Gerçek Binance pozisyon kontrolü
     real_positions = fetch_real_positions()
-
     normalized = normalize_symbol(symbol)
 
     for p in real_positions:
-
         if (
-            normalize_symbol(
-                p["symbol"]
-            ) == normalized
-            and abs(
-                safe_float(p["contracts"])
-            ) > 0
+            normalize_symbol(p["symbol"]) == normalized
+            and abs(safe_float(p["contracts"])) > 0
         ):
-            logger.info(
-                "%s zaten açık pozisyon. Emir iptal.",
-                symbol
-            )
+            logger.info("%s zaten açık pozisyon. Emir iptal.", symbol)
             return False
 
-    leverage = calculate_leverage(
-        signal
-    )
+    leverage = calculate_leverage(signal)
+    margin = SCALP_MARGIN if mode == "scalp" else OPPORTUNITY_MARGIN
 
-    margin = (
-        SCALP_MARGIN
-        if mode == "scalp"
-        else OPPORTUNITY_MARGIN
-    )
-
-    price = fetch_current_price(
-        symbol
-    )
+    price = fetch_current_price(symbol)
 
     if price <= 0:
         return False
 
-    amount = calculate_amount(
-        symbol,
-        margin,
-        leverage,
-        price
-    )
-
-    amount = float(
-        format_amount(
-            symbol,
-            amount
-        )
-    )
+    amount = calculate_amount(symbol, margin, leverage, price)
+    amount = float(format_amount(symbol, amount))
 
     if amount <= 0:
         return False
 
-    set_isolated_and_leverage(
-        symbol,
-        leverage
-    )
+    set_isolated_and_leverage(symbol, leverage)
 
-    side = (
-        "buy"
-        if direction == "long"
-        else "sell"
-    )
+    side = "buy" if direction == "long" else "sell"
 
     order = safe_call(
         exchange.create_order,
-        symbol,
-        "market",
-        side,
-        amount,
-        None,
-        {
-            "positionSide": "BOTH"
-        }
+        symbol, "market", side, amount, None,
+        {"positionSide": "BOTH"}
     )
 
     entry_price = price
 
     try:
-        filled = safe_float(
-            order.get("average")
-        )
-
+        filled = safe_float(order.get("average"))
         if filled > 0:
             entry_price = filled
-
     except Exception:
         pass
 
     with state_lock:
-
         local_positions[key] = {
             "key": key,
             "symbol": symbol,
@@ -1980,19 +1814,11 @@ def create_real_position(signal):
         }
 
     logger.warning(
-        "[REAL] %s %s açıldı | entry=%s | score=%.2f | "
-        "TP=%.2f%% | SL=%.2f%% | lev=%sx",
-        mode.upper(),
-        symbol,
-        entry_price,
-        signal["score"],
-        signal["tp_pct"],
-        signal["sl_pct"],
-        leverage
+        "[REAL] %s %s açıldı | entry=%s | score=%.2f | TP=%.2f%% | SL=%.2f%% | lev=%sx | margin=%s$",
+        mode.upper(), symbol, entry_price, signal["score"], signal["tp_pct"], signal["sl_pct"], leverage, margin
     )
 
     bot_stats["orders"] += 1
-
     return True
 
 
@@ -2009,21 +1835,12 @@ def open_position(signal):
 
     if is_on_cooldown(symbol):
         return False
-
     if not can_open_mode(mode):
         return False
-
     if has_local_symbol(symbol):
         return False
 
-    if DRY_RUN:
-        result = create_dry_run_position(
-            signal
-        )
-    else:
-        result = create_real_position(
-            signal
-        )
+    result = create_dry_run_position(signal) if DRY_RUN else create_real_position(signal)
 
     if result:
         set_cooldown(symbol)
@@ -2036,14 +1853,8 @@ def open_position(signal):
 # ============================================================
 
 def calculate_roi(position, price):
-    entry = safe_float(
-        position["entry_price"]
-    )
-
-    leverage = safe_float(
-        position["leverage"],
-        1
-    )
+    entry = safe_float(position["entry_price"])
+    leverage = safe_float(position["leverage"], 1)
 
     if entry <= 0:
         return 0.0
@@ -2051,22 +1862,11 @@ def calculate_roi(position, price):
     side = position["side"]
 
     if side == "long":
-
-        price_change = (
-            price - entry
-        ) / entry
-
+        price_change = (price - entry) / entry
     else:
+        price_change = (entry - price) / entry
 
-        price_change = (
-            entry - price
-        ) / entry
-
-    return (
-        price_change *
-        leverage *
-        100
-    )
+    return price_change * leverage * 100
 
 
 # ============================================================
@@ -2075,25 +1875,11 @@ def calculate_roi(position, price):
 
 def live_signal_check(symbol, direction):
     try:
-
-        df5 = fetch_ohlcv(
-            symbol,
-            "5m",
-            100
-        )
-
-        df15 = fetch_ohlcv(
-            symbol,
-            "15m",
-            100
-        )
+        df5 = fetch_ohlcv(symbol, "5m", 100)
+        df15 = fetch_ohlcv(symbol, "15m", 100)
 
         if df5 is None or df15 is None:
-            return {
-                "trend_ok": True,
-                "momentum_ok": True,
-                "strength": 50
-            }
+            return {"trend_ok": True, "momentum_ok": True, "strength": 50}
 
         df5 = enrich_dataframe(df5)
         df15 = enrich_dataframe(df15)
@@ -2104,23 +1890,10 @@ def live_signal_check(symbol, direction):
         m5 = momentum_analysis(df5)
         m15 = momentum_analysis(df15)
 
-        trend_ok = (
-            t5["direction"] == direction
-            or t5["strength"] < 45
-        )
+        trend_ok = (t5["direction"] == direction or t5["strength"] < 45)
+        trend_ok = trend_ok and (t15["direction"] == direction or t15["strength"] < 45)
 
-        trend_ok = (
-            trend_ok and
-            (
-                t15["direction"] == direction
-                or t15["strength"] < 45
-            )
-        )
-
-        momentum_ok = (
-            m5["direction"] == direction
-            or m5["strength"] < 45
-        )
+        momentum_ok = (m5["direction"] == direction or m5["strength"] < 45)
 
         strength = (
             t5["strength"] * 0.25 +
@@ -2129,25 +1902,11 @@ def live_signal_check(symbol, direction):
             m15["strength"] * 0.20
         )
 
-        return {
-            "trend_ok": trend_ok,
-            "momentum_ok": momentum_ok,
-            "strength": strength
-        }
+        return {"trend_ok": trend_ok, "momentum_ok": momentum_ok, "strength": strength}
 
     except Exception as e:
-
-        logger.warning(
-            "%s live trend kontrolü başarısız: %s",
-            symbol,
-            e
-        )
-
-        return {
-            "trend_ok": True,
-            "momentum_ok": True,
-            "strength": 50
-        }
+        logger.warning("%s live trend kontrolü başarısız: %s", symbol, e)
+        return {"trend_ok": True, "momentum_ok": True, "strength": 50}
 
 
 # ============================================================
@@ -2155,108 +1914,50 @@ def live_signal_check(symbol, direction):
 # ============================================================
 
 def update_position_management(position, price):
-    roi = calculate_roi(
-        position,
-        price
-    )
-
+    roi = calculate_roi(position, price)
     position["current_roi"] = roi
-
-    # --------------------------------------------------------
-    # Peak ROI
-    # --------------------------------------------------------
 
     if roi > position["highest_roi"]:
         position["highest_roi"] = roi
-
     if roi < position["lowest_roi"]:
         position["lowest_roi"] = roi
 
     tp = position["tp_pct"]
-    initial_sl = position["initial_sl_pct"]
-
-    # --------------------------------------------------------
-    # Breakeven
-    # --------------------------------------------------------
 
     if roi >= tp * 0.30:
-
-        if (
-            position["locked_roi"] is None
-            or position["locked_roi"] < 0
-        ):
+        if position["locked_roi"] is None or position["locked_roi"] < 0:
             position["locked_roi"] = 0.0
 
-    # --------------------------------------------------------
-    # Kâr kilitleme
-    # --------------------------------------------------------
-
     if roi >= tp * 0.45:
-
         lock = tp * 0.15
-
-        if (
-            position["locked_roi"] is None
-            or position["locked_roi"] < lock
-        ):
+        if position["locked_roi"] is None or position["locked_roi"] < lock:
             position["locked_roi"] = lock
 
     if roi >= tp * 0.60:
-
         lock = tp * 0.30
-
-        if (
-            position["locked_roi"] is None
-            or position["locked_roi"] < lock
-        ):
+        if position["locked_roi"] is None or position["locked_roi"] < lock:
             position["locked_roi"] = lock
 
     if roi >= tp * 0.75:
-
         lock = tp * 0.45
-
-        if (
-            position["locked_roi"] is None
-            or position["locked_roi"] < lock
-        ):
+        if position["locked_roi"] is None or position["locked_roi"] < lock:
             position["locked_roi"] = lock
 
     if roi >= tp * 0.90:
-
         lock = tp * 0.60
-
-        if (
-            position["locked_roi"] is None
-            or position["locked_roi"] < lock
-        ):
+        if position["locked_roi"] is None or position["locked_roi"] < lock:
             position["locked_roi"] = lock
 
-    # --------------------------------------------------------
-    # Dynamic trailing
-    # --------------------------------------------------------
-
     if roi >= tp * 0.40:
-
         position["trailing_active"] = True
 
         if position["mode"] == "scalp":
-
-            trail = max(
-                0.35,
-                tp * 0.20
-            )
-
+            trail = max(0.35, tp * 0.20)
         else:
+            trail = max(0.60, tp * 0.25)
 
-            trail = max(
-                0.60,
-                tp * 0.25
-            )
-
-        # Güçlü kârda trailing sıkılaşır
         if roi >= tp * 0.70:
             trail *= 0.80
-
         if roi >= tp * 0.90:
             trail *= 0.70
 
@@ -2270,104 +1971,38 @@ def update_position_management(position, price):
 # ============================================================
 
 def should_close_position(position, price):
-    roi = update_position_management(
-        position,
-        price
-    )
+    roi = update_position_management(position, price)
 
     tp = position["tp_pct"]
     initial_sl = position["initial_sl_pct"]
 
-    # --------------------------------------------------------
-    # Hard initial SL
-    # --------------------------------------------------------
-
     if roi <= -initial_sl:
         return True, "INITIAL_STOP"
 
-    # --------------------------------------------------------
-    # Locked profit
-    # --------------------------------------------------------
-
-    locked = position.get(
-        "locked_roi"
-    )
-
-    if (
-        locked is not None
-        and roi <= locked
-    ):
+    locked = position.get("locked_roi")
+    if locked is not None and roi <= locked:
         return True, "PROFIT_LOCK"
 
-    # --------------------------------------------------------
-    # Trailing
-    # --------------------------------------------------------
-
-    if position.get(
-        "trailing_active"
-    ):
-
+    if position.get("trailing_active"):
         peak = position["highest_roi"]
-
-        distance = position.get(
-            "trail_distance_pct"
-        )
-
+        distance = position.get("trail_distance_pct")
         if distance:
-
-            if (
-                peak - roi >= distance
-                and roi > 0
-            ):
+            if peak - roi >= distance and roi > 0:
                 return True, "TRAILING_STOP"
-
-    # --------------------------------------------------------
-    # Dynamic live trend check
-    # --------------------------------------------------------
-
-    # Her pozisyon için çok sık OHLCV çağrısı yapmamak adına
-    # canlı trend kontrolünü belirli aralıklarla yapıyoruz.
 
     current_time = now_ms()
 
-    if (
-        current_time -
-        position.get(
-            "last_trend_check",
-            0
-        )
-    ) >= 15000:
-
+    if (current_time - position.get("last_trend_check", 0)) >= 15000:
         position["last_trend_check"] = current_time
 
-        check = live_signal_check(
-            position["symbol"],
-            position["side"]
-        )
-
+        check = live_signal_check(position["symbol"], position["side"])
         position["live_strength"] = check["strength"]
 
-        # Kârdayken trend + momentum birlikte bozulursa çık
-        if (
-            roi > tp * 0.25
-            and
-            not check["trend_ok"]
-            and
-            not check["momentum_ok"]
-        ):
+        if roi > tp * 0.25 and not check["trend_ok"] and not check["momentum_ok"]:
             return True, "TREND_MOMENTUM_REVERSAL"
 
-        # Çok zayıflayan yapı ve kâr varsa
-        if (
-            roi > tp * 0.50
-            and
-            check["strength"] < 30
-        ):
+        if roi > tp * 0.50 and check["strength"] < 30:
             return True, "MOMENTUM_FADE"
-
-    # --------------------------------------------------------
-    # Full target
-    # --------------------------------------------------------
 
     if roi >= tp:
         return True, "TARGET_REACHED"
@@ -2381,117 +2016,61 @@ def should_close_position(position, price):
 
 def close_dry_position(key, reason):
     with state_lock:
-
-        position = local_positions.get(
-            key
-        )
-
+        position = local_positions.get(key)
         if not position:
             return False
 
-        roi = position.get(
-            "current_roi",
-            0
-        )
-
+        roi = position.get("current_roi", 0)
         symbol = position["symbol"]
+        mode = position["mode"]
 
-        local_positions.pop(
-            key,
-            None
-        )
+        local_positions.pop(key, None)
 
     logger.warning(
         "[DRY RUN] %s %s kapandı | ROI=%.2f%% | sebep=%s",
-        position["mode"].upper(),
-        symbol,
-        roi,
-        reason
+        mode.upper(), symbol, roi, reason
     )
 
     bot_stats["closed_positions"] += 1
-
     return True
 
 
 def close_real_position(key, reason):
     with state_lock:
-
-        position = local_positions.get(
-            key
-        )
-
+        position = local_positions.get(key)
         if not position:
             return False
 
     symbol = position["symbol"]
 
     try:
-
         amount = position["amount"]
-
-        side = (
-            "sell"
-            if position["side"] == "long"
-            else "buy"
-        )
+        side = "sell" if position["side"] == "long" else "buy"
 
         safe_call(
             exchange.create_order,
-            symbol,
-            "market",
-            side,
-            amount,
-            None,
-            {
-                "reduceOnly": True,
-                "positionSide": "BOTH"
-            }
+            symbol, "market", side, amount, None,
+            {"reduceOnly": True, "positionSide": "BOTH"}
         )
 
         with state_lock:
-            local_positions.pop(
-                key,
-                None
-            )
+            local_positions.pop(key, None)
 
         logger.warning(
             "[REAL] %s %s kapandı | ROI=%.2f%% | sebep=%s",
-            position["mode"].upper(),
-            symbol,
-            position.get(
-                "current_roi",
-                0
-            ),
-            reason
+            position["mode"].upper(), symbol, position.get("current_roi", 0), reason
         )
 
         bot_stats["closed_positions"] += 1
-
         return True
 
     except Exception as e:
-
-        logger.error(
-            "%s kapatma hatası: %s",
-            symbol,
-            e
-        )
-
+        logger.error("%s kapatma hatası: %s", symbol, e)
         return False
 
 
 def close_position(key, reason):
-    if DRY_RUN:
-        return close_dry_position(
-            key,
-            reason
-        )
-
-    return close_real_position(
-        key,
-        reason
-    )
+    return close_dry_position(key, reason) if DRY_RUN else close_real_position(key, reason)
 
 
 # ============================================================
@@ -2499,37 +2078,24 @@ def close_position(key, reason):
 # ============================================================
 
 def monitor_positions():
-    logger.info(
-        "POSITION MONITOR başlatıldı."
-    )
+    logger.info("POSITION MONITOR başlatıldı.")
 
     while running:
-
         try:
-
             sync_real_positions()
 
             with state_lock:
-                positions = [
-                    dict(p)
-                    for p in local_positions.values()
-                ]
+                positions = [dict(p) for p in local_positions.values()]
 
             if not positions:
-                time.sleep(
-                    POSITION_MONITOR_INTERVAL
-                )
+                time.sleep(POSITION_MONITOR_INTERVAL)
                 continue
 
             for position in positions:
-
                 symbol = position["symbol"]
 
                 try:
-
-                    price = fetch_current_price(
-                        symbol
-                    )
+                    price = fetch_current_price(symbol)
 
                     if price <= 0:
                         continue
@@ -2537,79 +2103,35 @@ def monitor_positions():
                     key = position["key"]
 
                     with state_lock:
-
-                        current = local_positions.get(
-                            key
-                        )
+                        current = local_positions.get(key)
 
                         if not current:
                             continue
 
-                        should_close, reason = (
-                            should_close_position(
-                                current,
-                                price
-                            )
-                        )
+                        should_close, reason = should_close_position(current, price)
 
-                        roi = current.get(
-                            "current_roi",
-                            0
-                        )
-
-                        peak = current.get(
-                            "highest_roi",
-                            0
-                        )
-
+                        roi = current.get("current_roi", 0)
+                        peak = current.get("highest_roi", 0)
                         tp = current["tp_pct"]
                         sl = current["sl_pct"]
 
                     logger.info(
-                        "[MONITOR] %s | %s | "
-                        "price=%s | ROI=%+.2f%% | "
-                        "peak=%+.2f%% | TP=%.2f%% | "
-                        "SL=%.2f%% | lock=%s | trail=%s",
-                        symbol,
-                        position["mode"].upper(),
-                        price,
-                        roi,
-                        peak,
-                        tp,
-                        sl,
-                        current.get(
-                            "locked_roi"
-                        ),
-                        current.get(
-                            "trail_distance_pct"
-                        )
+                        "[MONITOR] %s | %s | price=%s | ROI=%+.2f%% | peak=%+.2f%% | "
+                        "TP=%.2f%% | SL=%.2f%% | lock=%s | trail=%s",
+                        symbol, position["mode"].upper(), price, roi, peak, tp, sl,
+                        current.get("locked_roi"), current.get("trail_distance_pct")
                     )
 
                     if should_close:
-                        close_position(
-                            key,
-                            reason
-                        )
+                        close_position(key, reason)
 
                 except Exception as e:
+                    logger.warning("%s monitor hatası: %s", symbol, e)
 
-                    logger.warning(
-                        "%s monitor hatası: %s",
-                        symbol,
-                        e
-                    )
-
-            time.sleep(
-                POSITION_MONITOR_INTERVAL
-            )
+            time.sleep(POSITION_MONITOR_INTERVAL)
 
         except Exception as e:
-
-            logger.error(
-                "Monitor ana hata: %s",
-                e
-            )
-
+            logger.error("Monitor ana hata: %s", e)
             time.sleep(2)
 
 
@@ -2617,64 +2139,37 @@ def monitor_positions():
 # CANDIDATE ANALYSIS
 # ============================================================
 
-def analyze_candidates(symbols, mode):
+def analyze_candidates(symbols, mode, btc_regime=None):
     candidates = []
 
-    for i, symbol in enumerate(symbols):
-
+    for symbol in symbols:
         if not symbol_is_valid(symbol):
             continue
-
         if is_on_cooldown(symbol):
             continue
-
         if has_local_symbol(symbol):
             continue
 
         try:
-
-            result = analyze_coin(
-                symbol,
-                mode
-            )
+            result = analyze_coin(symbol, mode, btc_regime=btc_regime)
 
             if result:
-                candidates.append(
-                    result
-                )
+                candidates.append(result)
 
                 logger.info(
-                    "[%s] %s | score=%.2f | "
-                    "trend=%.2f | momentum=%.2f | "
-                    "align=%s | timing=%s | "
-                    "TP=%.2f%% SL=%.2f%%",
-                    mode.upper(),
-                    symbol,
-                    result["score"],
-                    result["trend_score"],
-                    result["momentum_score"],
-                    result["alignment"],
-                    result["timing_score"],
-                    result["tp_pct"],
-                    result["sl_pct"]
+                    "[%s] %s | score=%.2f | trend=%.2f | momentum=%.2f | "
+                    "align=%s | timing=%s | taker=%s | TP=%.2f%% SL=%.2f%%",
+                    mode.upper(), symbol, result["score"], result["trend_score"],
+                    result["momentum_score"], result["alignment"], result["timing_score"],
+                    result["taker_note"], result["tp_pct"], result["sl_pct"]
                 )
 
         except Exception as e:
+            logger.warning("%s analiz hatası: %s", symbol, e)
 
-            logger.warning(
-                "%s analiz hatası: %s",
-                symbol,
-                e
-            )
-
-        # API baskısını azalt
         time.sleep(0.05)
 
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
+    candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates
 
 
@@ -2687,93 +2182,91 @@ def final_entry_confirmation(signal):
     direction = signal["direction"]
 
     try:
-
-        # En güncel 5m veriyi tekrar çek
-        df = fetch_ohlcv(
-            symbol,
-            "5m",
-            100
-        )
+        df = fetch_ohlcv(symbol, "5m", 100)
 
         if df is None:
             return False
 
         df = enrich_dataframe(df)
 
-        timing = entry_timing(
-            df,
-            direction
-        )
+        timing = entry_timing(df, direction)
 
         if not timing["confirmed"]:
-            logger.info(
-                "[ENTRY RED] %s timing teyidi yok.",
-                symbol
-            )
+            logger.info("[ENTRY RED] %s timing teyidi yok.", symbol)
             return False
 
-        # Son mum aşırı uzamış mı?
-        if is_overextended(
-            df,
-            direction
-        ):
-            logger.info(
-                "[ENTRY RED] %s aşırı uzamış.",
-                symbol
-            )
+        if is_overextended(df, direction):
+            logger.info("[ENTRY RED] %s aşırı uzamış.", symbol)
             return False
 
-        # Son fiyat
         last = df.iloc[-1]
-
-        close = safe_float(
-            last["close"]
-        )
-
-        ema21 = safe_float(
-            last["ema21"]
-        )
-
-        atr_val = safe_float(
-            last["atr"]
-        )
+        close = safe_float(last["close"])
+        ema21 = safe_float(last["ema21"])
+        atr_val = safe_float(last["atr"])
 
         if direction == "long":
-
-            # Fiyat EMA21'den çok uzaktaysa
-            if (
-                close - ema21 >
-                atr_val * 2.0
-            ):
+            if close - ema21 > atr_val * 2.0:
                 return False
-
         else:
-
-            if (
-                ema21 - close >
-                atr_val * 2.0
-            ):
+            if ema21 - close > atr_val * 2.0:
                 return False
 
-        # Funding
-        funding = get_funding(
-            symbol
-        )
-
+        funding = get_funding(symbol)
         if abs(funding) >= FUNDING_SKIP_THRESHOLD:
             return False
 
         return True
 
     except Exception as e:
+        logger.warning("%s final confirmation hatası: %s", symbol, e)
+        return False
 
-        logger.warning(
-            "%s final confirmation hatası: %s",
-            symbol,
-            e
+
+# ============================================================
+# TOP-N ADAY ÜZERINDEN SIRALI TEYIT  (YENİ)
+# ============================================================
+# Sadece en yüksek skorlu tek adaya bakmak yerine, top-5 adayı
+# skora göre sırayla dener. İlk teyidi geçen (ve emir başarıyla
+# açılan) adayda durur. Hiçbiri geçemezse o döngüde işlem açılmaz.
+
+def try_open_from_candidates(signals, mode):
+    top_candidates = signals[:TOP_N_CANDIDATES]
+
+    logger.info(
+        "[%s] Top %s aday: %s",
+        mode.upper(),
+        len(top_candidates),
+        [(c["symbol"], c["direction"], c["score"]) for c in top_candidates]
+    )
+
+    for candidate in top_candidates:
+        logger.info(
+            "[%s TEYİT DENENİYOR] %s | yön=%s | skor=%.2f | trend=%.2f | "
+            "momentum=%.2f | align=%s | timing=%s | taker=%s | funding=%.5f | "
+            "TP=%.2f%% SL=%.2f%%",
+            mode.upper(), candidate["symbol"], candidate["direction"], candidate["score"],
+            candidate["trend_score"], candidate["momentum_score"], candidate["alignment"],
+            candidate["timing_score"], candidate["taker_note"], candidate["funding"],
+            candidate["tp_pct"], candidate["sl_pct"]
         )
 
-        return False
+        if final_entry_confirmation(candidate):
+            logger.warning(
+                "[%s AÇILIYOR] %s %s | skor=%.2f | gerekçe: trend+momentum hizalı, "
+                "son teyit geçti, BTC rejimine ters değil",
+                mode.upper(), candidate["direction"], candidate["symbol"], candidate["score"]
+            )
+
+            if open_position(candidate):
+                return True
+        else:
+            logger.info(
+                "[%s RED] %s son teyidi geçemedi, sıradaki adaya geçiliyor.",
+                mode.upper(), candidate["symbol"]
+            )
+
+    logger.info("[%s] Top-%s aday içinde teyidi geçen olmadı.", mode.upper(), TOP_N_CANDIDATES)
+    return False
 
 
 # ============================================================
@@ -2785,51 +2278,36 @@ def analysis_cycle():
     global last_successful_analysis
 
     bot_stats["analysis_count"] += 1
-
     last_analysis_time = now_ms()
 
     logger.info("=" * 70)
-    logger.info(
-        "BOT ANALİZ BAŞLADI | %s",
-        datetime.now(
-            timezone.utc
-        ).isoformat()
-    )
-
-    # --------------------------------------------------------
-    # Pozisyon senkronizasyonu
-    # --------------------------------------------------------
+    logger.info("BOT ANALİZ BAŞLADI | %s", datetime.now(timezone.utc).isoformat())
 
     sync_real_positions()
 
     total = local_position_count()
-
-    scalp_count = local_position_count(
-        "scalp"
-    )
-
-    opp_count = local_position_count(
-        "opportunity"
-    )
+    scalp_count = local_position_count("scalp")
+    opp_count = local_position_count("opportunity")
 
     logger.info(
         "[POZİSYON] toplam=%s | scalp=%s | opportunity=%s",
-        total,
-        scalp_count,
-        opp_count
+        total, scalp_count, opp_count
     )
 
-    # --------------------------------------------------------
-    # Toplam doluysa analiz yapma
-    # --------------------------------------------------------
-
     if total >= MAX_TOTAL_POSITIONS:
-
-        logger.info(
-            "[DOLU] Maksimum pozisyon sayısına ulaşıldı."
-        )
-
+        logger.info("[DOLU] Maksimum pozisyon sayısına ulaşıldı, analiz atlanıyor.")
         return
+
+    # --------------------------------------------------------
+    # BTC piyasa rejimi — bu döngü için bir kez hesaplanır
+    # --------------------------------------------------------
+
+    btc_regime = get_btc_regime()
+
+    logger.info(
+        "[BTC REJİM] yön=%s | güç=%.1f",
+        btc_regime["direction"], btc_regime["strength"]
+    )
 
     # --------------------------------------------------------
     # Movers
@@ -2837,165 +2315,55 @@ def analysis_cycle():
 
     gainers, losers = get_top_movers()
 
-    logger.info(
-        "[GAINERS TOP25] %s",
-        gainers
-    )
-
-    logger.info(
-        "[LOSERS TOP25] %s",
-        losers
-    )
-
-    # --------------------------------------------------------
-    # Tekilleştir
-    # --------------------------------------------------------
+    logger.info("[GAINERS TOP25] %s", gainers)
+    logger.info("[LOSERS TOP25] %s", losers)
 
     candidates = []
-
     seen = set()
 
     for symbol in gainers + losers:
-
-        normalized = normalize_symbol(
-            symbol
-        )
-
+        normalized = normalize_symbol(symbol)
         if normalized in seen:
             continue
-
         seen.add(normalized)
+        candidates.append(symbol)
 
-        candidates.append(
-            symbol
-        )
-
-    logger.info(
-        "[TARAMA] %s benzersiz coin.",
-        len(candidates)
-    )
+    logger.info("[TARAMA] %s benzersiz coin (likidite filtresinden geçen).", len(candidates))
 
     # --------------------------------------------------------
-    # Scalp
+    # Scalp (bağımsız tarama — opportunity dolu olsa bile çalışır)
     # --------------------------------------------------------
 
-    if (
-        SCALP_ENABLED
-        and
-        scalp_count < MAX_SCALP_POSITIONS
-        and
-        total < MAX_TOTAL_POSITIONS
-    ):
+    if SCALP_ENABLED and scalp_count < MAX_SCALP_POSITIONS and total < MAX_TOTAL_POSITIONS:
+        logger.info("[SCALP] %s coin analiz ediliyor...", len(candidates))
 
-        logger.info(
-            "[SCALP] %s coin analiz ediliyor...",
-            len(candidates)
-        )
-
-        scalp_signals = analyze_candidates(
-            candidates,
-            "scalp"
-        )
+        scalp_signals = analyze_candidates(candidates, "scalp", btc_regime=btc_regime)
 
         if scalp_signals:
-
-            best = scalp_signals[0]
-
-            logger.warning(
-                "[SCALP EN İYİ] %s | %s | score=%.2f",
-                best["symbol"],
-                best["direction"],
-                best["score"]
-            )
-
-            if final_entry_confirmation(
-                best
-            ):
-
-                open_position(
-                    best
-                )
-
-            else:
-
-                logger.info(
-                    "[SCALP] Son teyit alınamadı."
-                )
-
+            try_open_from_candidates(scalp_signals, "scalp")
         else:
-
-            logger.info(
-                "[SCALP] Uygun sinyal yok."
-            )
+            logger.info("[SCALP] Uygun sinyal yok.")
 
     # --------------------------------------------------------
-    # Opportunity
+    # Opportunity (bağımsız tarama)
     # --------------------------------------------------------
 
-    # Pozisyon sayısını yeniden oku
     total = local_position_count()
-    opp_count = local_position_count(
-        "opportunity"
-    )
+    opp_count = local_position_count("opportunity")
 
-    if (
-        OPPORTUNITY_ENABLED
-        and
-        opp_count < MAX_OPPORTUNITY_POSITIONS
-        and
-        total < MAX_TOTAL_POSITIONS
-    ):
+    if OPPORTUNITY_ENABLED and opp_count < MAX_OPPORTUNITY_POSITIONS and total < MAX_TOTAL_POSITIONS:
+        logger.info("[OPPORTUNITY] %s coin analiz ediliyor...", len(candidates))
 
-        logger.info(
-            "[OPPORTUNITY] %s coin analiz ediliyor...",
-            len(candidates)
-        )
-
-        opp_signals = analyze_candidates(
-            candidates,
-            "opportunity"
-        )
+        opp_signals = analyze_candidates(candidates, "opportunity", btc_regime=btc_regime)
 
         if opp_signals:
-
-            best = opp_signals[0]
-
-            logger.warning(
-                "[OPPORTUNITY EN İYİ] %s | %s | score=%.2f",
-                best["symbol"],
-                best["direction"],
-                best["score"]
-            )
-
-            if final_entry_confirmation(
-                best
-            ):
-
-                open_position(
-                    best
-                )
-
-            else:
-
-                logger.info(
-                    "[OPPORTUNITY] Son teyit alınamadı."
-                )
-
+            try_open_from_candidates(opp_signals, "opportunity")
         else:
+            logger.info("[OPPORTUNITY] Uygun sinyal yok.")
 
-            logger.info(
-                "[OPPORTUNITY] Uygun sinyal yok."
-            )
+    last_successful_analysis = datetime.now(timezone.utc).isoformat()
 
-    last_successful_analysis = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
-    )
-
-    logger.info(
-        "BOT ANALİZ BİTTİ"
-    )
+    logger.info("BOT ANALİZ BİTTİ")
     logger.info("=" * 70)
 
 
@@ -3004,39 +2372,23 @@ def analysis_cycle():
 # ============================================================
 
 def analysis_loop():
-    logger.info(
-        "ANALYSIS LOOP başlatıldı."
-    )
+    logger.info("ANALYSIS LOOP başlatıldı.")
 
     while running:
-
         start = time.time()
 
         try:
             analysis_cycle()
-
         except Exception as e:
-
-            logger.exception(
-                "Analiz döngüsü hatası: %s",
-                e
-            )
+            logger.exception("Analiz döngüsü hatası: %s", e)
 
         elapsed = time.time() - start
 
-        # Döngü süresini dikkate al
-        wait_time = max(
-            NO_SIGNAL_INTERVAL,
-            ANALYSIS_INTERVAL - elapsed
-        )
+        wait_time = max(NO_SIGNAL_INTERVAL, ANALYSIS_INTERVAL - elapsed)
 
-        for _ in range(
-            int(wait_time)
-        ):
-
+        for _ in range(int(wait_time)):
             if not running:
                 break
-
             time.sleep(1)
 
 
@@ -3045,33 +2397,19 @@ def analysis_loop():
 # ============================================================
 
 def cleanup_loop():
-
     while running:
-
         try:
             gc.collect()
 
-            # Eski cache temizliği
-            cutoff = now_ms() - (
-                30 * 60 * 1000
-            )
+            cutoff = now_ms() - (30 * 60 * 1000)
 
             with candidate_lock:
-
                 old = [
-                    k
-                    for k, v in signal_cache.items()
-                    if v.get(
-                        "timestamp",
-                        0
-                    ) < cutoff
+                    k for k, v in signal_cache.items()
+                    if v.get("timestamp", 0) < cutoff
                 ]
-
                 for k in old:
-                    signal_cache.pop(
-                        k,
-                        None
-                    )
+                    signal_cache.pop(k, None)
 
         except Exception:
             pass
@@ -3084,68 +2422,28 @@ def cleanup_loop():
 # ============================================================
 
 def start_bot():
-
     global running
 
     logger.info("=" * 70)
-    logger.info(
-        "BINANCE FUTURES MOMENTUM BOT V2"
-    )
+    logger.info("BINANCE FUTURES MOMENTUM BOT V2")
     logger.info("=" * 70)
-
-    logger.info(
-        "DRY_RUN=%s | TESTNET=%s",
-        DRY_RUN,
-        TESTNET
-    )
+    logger.info("DRY_RUN=%s | TESTNET=%s | MAX_LEVERAGE=%sx | ANALYSIS_INTERVAL=%ss",
+                DRY_RUN, TESTNET, MAX_LEVERAGE, ANALYSIS_INTERVAL)
 
     create_exchange()
 
-    # --------------------------------------------------------
-    # Thread 1: Pozisyon monitor
-    # --------------------------------------------------------
-
-    monitor_thread = threading.Thread(
-        target=monitor_positions,
-        name="PositionMonitor",
-        daemon=True
-    )
-
+    monitor_thread = threading.Thread(target=monitor_positions, name="PositionMonitor", daemon=True)
     monitor_thread.start()
 
-    # --------------------------------------------------------
-    # Thread 2: Analiz
-    # --------------------------------------------------------
-
-    analysis_thread = threading.Thread(
-        target=analysis_loop,
-        name="AnalysisLoop",
-        daemon=True
-    )
-
+    analysis_thread = threading.Thread(target=analysis_loop, name="AnalysisLoop", daemon=True)
     analysis_thread.start()
 
-    # --------------------------------------------------------
-    # Thread 3: Cleanup
-    # --------------------------------------------------------
-
-    cleanup_thread = threading.Thread(
-        target=cleanup_loop,
-        name="Cleanup",
-        daemon=True
-    )
-
+    cleanup_thread = threading.Thread(target=cleanup_loop, name="Cleanup", daemon=True)
     cleanup_thread.start()
 
-    logger.info(
-        "BOT TAMAMEN AKTİF."
-    )
+    logger.info("BOT TAMAMEN AKTİF.")
 
-    return (
-        monitor_thread,
-        analysis_thread,
-        cleanup_thread
-    )
+    return monitor_thread, analysis_thread, cleanup_thread
 
 
 # ============================================================
@@ -3155,47 +2453,25 @@ def start_bot():
 if __name__ == "__main__":
 
     try:
-
         threads = start_bot()
 
-        # Flask ayrı thread
         flask_thread = threading.Thread(
-            target=lambda: app.run(
-                host="0.0.0.0",
-                port=PORT,
-                threaded=True,
-                use_reloader=False
-            ),
+            target=lambda: app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False),
             name="Flask",
             daemon=True
         )
-
         flask_thread.start()
 
-        logger.info(
-            "Health server :%s üzerinde çalışıyor.",
-            PORT
-        )
+        logger.info("Health server :%s üzerinde çalışıyor.", PORT)
 
-        # Ana thread'i canlı tut
         while True:
             time.sleep(60)
 
     except KeyboardInterrupt:
-
-        logger.warning(
-            "BOT DURDURULUYOR..."
-        )
-
+        logger.warning("BOT DURDURULUYOR...")
         running = False
 
     except Exception as e:
-
-        logger.exception(
-            "FATAL BOT HATASI: %s",
-            e
-        )
-
+        logger.exception("FATAL BOT HATASI: %s", e)
         running = False
-
         raise
