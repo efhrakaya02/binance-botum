@@ -1236,6 +1236,177 @@ def entry_timing(df, direction):
 
 
 # ============================================================
+# MOMENTUM REVERSAL + MICRO STRUCTURE CONFIRMATION
+# ============================================================
+# Amaç: yalnızca momentum zaten yükseldikten sonra değil, kısa vadeli
+# düşüş/yükseliş ivmesinin yön değiştirmeye başladığı ilk teyitli bölgede
+# giriş yapmak. Bu katman mevcut trend skorunun yerine geçmez; girişin
+# zamanlamasını doğrular.
+
+def _safe_series(df, col, n=6):
+    if df is None or col not in df.columns:
+        return None
+    return df[col].tail(n).astype(float)
+
+
+def detect_momentum_reversal(df, direction):
+    """5m'de erken momentum dönüşünü 0-100 arası skorlar.
+
+    Long için:
+      - MACD histogram ardışık şekilde iyileşiyor
+      - RSI yönünü yukarı çeviriyor
+      - EMA9 eğimi yukarı dönüyor
+      - kısa vadeli yapıdaki son lower-high kırılıyor
+      - kırılım hacimle destekleniyor
+
+    Short bunun simetriğidir.
+    """
+    if df is None or len(df) < 35:
+        return {"confirmed": False, "score": 0, "reasons": [], "structure_break": False}
+
+    x = df.iloc[-1]
+    p1 = df.iloc[-2]
+    p2 = df.iloc[-3]
+    p3 = df.iloc[-4]
+
+    close = safe_float(x["close"])
+    atr = safe_float(x.get("atr"), 0)
+    rsi = safe_float(x.get("rsi"), 50)
+    rsi1 = safe_float(p1.get("rsi"), 50)
+    rsi2 = safe_float(p2.get("rsi"), 50)
+
+    mh = safe_float(x.get("macd_hist"), 0)
+    mh1 = safe_float(p1.get("macd_hist"), 0)
+    mh2 = safe_float(p2.get("macd_hist"), 0)
+    mh3 = safe_float(p3.get("macd_hist"), 0)
+
+    ema9 = safe_float(x.get("ema9"), close)
+    ema91 = safe_float(p1.get("ema9"), ema9)
+    ema92 = safe_float(p2.get("ema9"), ema91)
+
+    volume_ratio = safe_float(x.get("volume_ratio"), 1.0)
+
+    score = 0
+    reasons = []
+
+    # 1) MACD histogram acceleration: tek mum yerine 2-3 barlık dönüş.
+    if direction == "long":
+        macd_turn = mh > mh1 > mh2 and mh2 >= mh3
+        macd_zero_turn = mh > mh1 and mh >= 0
+    else:
+        macd_turn = mh < mh1 < mh2 and mh2 <= mh3
+        macd_zero_turn = mh < mh1 and mh <= 0
+
+    if macd_turn:
+        score += 20
+        reasons.append("macd_2bar_turn")
+    elif macd_zero_turn:
+        score += 10
+        reasons.append("macd_turn")
+
+    # 2) RSI directional turn. Aşırı bölgeye yeni girmiş bir RSI'ı değil,
+    # dip/tepe sonrası yön değişimini tercih ederiz.
+    if direction == "long":
+        rsi_turn = rsi > rsi1 > rsi2 and rsi - rsi2 >= 2.0
+        rsi_recovery = rsi1 <= 48 and rsi >= 50
+    else:
+        rsi_turn = rsi < rsi1 < rsi2 and rsi2 - rsi >= 2.0
+        rsi_recovery = rsi1 >= 52 and rsi <= 50
+
+    if rsi_turn:
+        score += 15
+        reasons.append("rsi_directional_turn")
+    elif rsi_recovery:
+        score += 10
+        reasons.append("rsi_recovery")
+
+    # 3) EMA9 eğimi. EMA9'un fiyatı kesmesi şart değil; önce eğim değişsin.
+    if direction == "long":
+        ema_slope_turn = ema9 > ema91 > ema92
+    else:
+        ema_slope_turn = ema9 < ema91 < ema92
+
+    if ema_slope_turn:
+        score += 10
+        reasons.append("ema9_slope_turn")
+
+    # 4) Micro-structure break: son kapanan mum, önceki 3-5 mumun karşı
+    # tarafındaki kısa vadeli seviyeyi kırmalı. Bu, ilk yeşil/kırmızı mumdan
+    # daha güvenilir bir reversal teyididir.
+    lookback = df.iloc[-7:-2]
+    if len(lookback) >= 3 and atr > 0:
+        prior_high = safe_float(lookback["high"].max())
+        prior_low = safe_float(lookback["low"].min())
+        if direction == "long":
+            structure_break = close > prior_high + atr * 0.05
+        else:
+            structure_break = close < prior_low - atr * 0.05
+    else:
+        structure_break = False
+
+    if structure_break:
+        score += 20
+        reasons.append("micro_structure_break")
+
+    # 5) Kırılım/ivme hacimle destekleniyorsa +10.
+    if volume_ratio >= 1.15:
+        score += 10
+        reasons.append("volume_confirmation")
+
+    # 6) Mum kapanışı yön teyidi. Wick-only breakout'ları filtreler.
+    candle_range = max(safe_float(x["high"]) - safe_float(x["low"]), 1e-12)
+    body = abs(close - safe_float(x["open"]))
+    body_ratio = body / candle_range
+    if direction == "long":
+        candle_ok = close > safe_float(x["open"]) and body_ratio >= 0.45
+    else:
+        candle_ok = close < safe_float(x["open"]) and body_ratio >= 0.45
+
+    if candle_ok:
+        score += 10
+        reasons.append("directional_close")
+
+    # 7) Fiyatın EMA21'e göre konumu yalnızca destekleyici puandır.
+    # Reversal girişinin EMA21 geçişini bekleyerek geç kalmasını istemiyoruz.
+    ema21 = safe_float(x.get("ema21"), close)
+    if direction == "long" and close >= ema21:
+        score += 5
+        reasons.append("ema21_reclaimed")
+    elif direction == "short" and close <= ema21:
+        score += 5
+        reasons.append("ema21_lost")
+
+    # Zorunlu çekirdek teyit: structure break + (MACD veya RSI dönüşü).
+    core_momentum = macd_turn or rsi_turn or macd_zero_turn or rsi_recovery
+    confirmed = structure_break and core_momentum and score >= 60
+
+    return {
+        "confirmed": confirmed,
+        "score": min(score, 100),
+        "reasons": reasons,
+        "structure_break": structure_break,
+        "macd_turn": macd_turn or macd_zero_turn,
+        "rsi_turn": rsi_turn or rsi_recovery,
+        "volume_ratio": volume_ratio,
+    }
+
+
+def reversal_entry_confirmation(df, direction, mode="scalp"):
+    """Reversal teyidini son kez değerlendirir.
+
+    Score 70+ güçlü teyit; 60-69 yalnızca yüksek zaman dilimi trendi ile
+    uyumluysa kabul edilir. Böylece tek bir yeşil/kırmızı mum işlem açtırmaz.
+    """
+    rev = detect_momentum_reversal(df, direction)
+    if not rev["confirmed"]:
+        return rev
+
+    threshold = 65 if mode == "opportunity" else 70
+    rev["confirmed"] = rev["score"] >= threshold
+    return rev
+
+
+# ============================================================
 # OVEREXTENSION FILTER
 # ============================================================
 
@@ -1535,6 +1706,7 @@ def analyze_coin(symbol, mode, btc_regime=None):
     # --------------------------------------------------------
 
     timing = entry_timing(data["5m"], direction)
+    reversal = detect_momentum_reversal(data["5m"], direction)
 
     # --------------------------------------------------------
     # Volume
@@ -1563,7 +1735,8 @@ def analyze_coin(symbol, mode, btc_regime=None):
         momentum_score * 0.25 +
         alignment * 0.20 +
         structure_score * 0.10 +
-        timing["score"] * 0.10 +
+        timing["score"] * 0.05 +
+        reversal["score"] * 0.05 +
         volume_score * 0.05 +
         adx_score * 0.05
     )
@@ -1621,7 +1794,14 @@ def analyze_coin(symbol, mode, btc_regime=None):
         ):
             return None
 
-    if timing["score"] < (55 if mode == "opportunity" else 60):
+    if timing["score"] < (55 if mode == "opportunity" else 60) and not reversal["confirmed"]:
+        return None
+
+    # Erken dönüş teyidi: işlem, momentum yön değiştirmeden yalnızca trend
+    # skoru yüksek diye açılmasın. Güçlü continuation sinyallerinde de
+    # reversal katmanı başarısızsa giriş ertelenir.
+    reversal_min = 60 if mode == "opportunity" else 65
+    if reversal["score"] < reversal_min:
         return None
 
     if mode == "opportunity":
@@ -1709,6 +1889,8 @@ def analyze_coin(symbol, mode, btc_regime=None):
         "structure": structure["state"],
         "pattern": pattern_label,
         "timing_score": timing["score"],
+        "reversal_score": reversal["score"],
+        "reversal_reasons": ",".join(reversal["reasons"]),
         "timing_reason": timing["reason"],
         "volume_ratio": volume_ratio,
         "adx": adx_val,
@@ -2593,10 +2775,21 @@ def final_entry_confirmation(signal):
         df = enrich_dataframe(df)
 
         timing = entry_timing(df, direction)
+        reversal = reversal_entry_confirmation(
+            df, direction, signal.get("mode", "scalp")
+        )
 
         timing_threshold = 55 if signal.get("mode") == "opportunity" else 60
-        if timing["score"] < timing_threshold:
+        if timing["score"] < timing_threshold and not reversal["confirmed"]:
             logger.info("[ENTRY RED] %s timing teyidi yok | score=%s < %s", symbol, timing["score"], timing_threshold)
+            return False
+
+        reversal_min = 65 if signal.get("mode") == "opportunity" else 70
+        if reversal["score"] < reversal_min:
+            logger.info(
+                "[ENTRY RED] %s reversal teyidi yok | score=%s < %s | neden=%s",
+                symbol, reversal["score"], reversal_min, ",".join(reversal["reasons"])
+            )
             return False
 
         if is_overextended(df, direction):
@@ -2646,11 +2839,11 @@ def try_open_from_candidates(signals, mode):
     for candidate in top_candidates:
         logger.info(
             "[%s TEYİT DENENİYOR] %s | yön=%s | skor=%.2f | trend=%.2f | "
-            "momentum=%.2f | align=%s | timing=%s | taker=%s | funding=%.5f | "
+            "momentum=%.2f | align=%s | timing=%s | reversal=%s | taker=%s | funding=%.5f | "
             "TP=%.2f%% SL=%.2f%%",
             mode.upper(), candidate["symbol"], candidate["direction"], candidate["score"],
             candidate["trend_score"], candidate["momentum_score"], candidate["alignment"],
-            candidate["timing_score"], candidate["taker_note"], candidate["funding"],
+            candidate["timing_score"], candidate.get("reversal_score", 0), candidate["taker_note"], candidate["funding"],
             candidate["tp_pct"], candidate["sl_pct"]
         )
 
