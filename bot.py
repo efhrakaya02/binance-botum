@@ -228,6 +228,7 @@ def status():
 
 def create_exchange():
     global exchange
+
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
             "BINANCE_API_KEY / BINANCE_API_SECRET tanımlı değil."
@@ -700,7 +701,7 @@ def get_top_movers():
             continue
 
     if not rows:
-        return [], []
+        return [], [], []
 
     df = pd.DataFrame(rows)
 
@@ -712,7 +713,7 @@ def get_top_movers():
             "[LIKIDITE] MIN_QUOTE_VOLUME_USDT=%s eşiğini geçen coin yok.",
             MIN_QUOTE_VOLUME_USDT
         )
-        return [], []
+        return [], [], []
 
     gainers = (
         df.sort_values("percentage", ascending=False)
@@ -724,7 +725,17 @@ def get_top_movers():
         .head(25)["symbol"].tolist()
     )
 
-    return gainers, losers
+    # 24s hacim lideri top 25 (YENİ)
+    # Gainers/losers %değişime göre seçilir, bu yüzden yüksek
+    # likiditeli ama o an aşırı %hareket göstermeyen (dolayısıyla
+    # gainers/losers listesine girmeyen) coinleri kaçırabilir.
+    # Hacme göre ayrı bir top-25 bu boşluğu kapatır.
+    volume_leaders = (
+        df.sort_values("quoteVolume", ascending=False)
+        .head(25)["symbol"].tolist()
+    )
+
+    return gainers, losers, volume_leaders
 
 
 # ============================================================
@@ -2312,22 +2323,30 @@ def analysis_cycle():
     # Movers
     # --------------------------------------------------------
 
-    gainers, losers = get_top_movers()
+    gainers, losers, volume_leaders = get_top_movers()
 
     logger.info("[GAINERS TOP25] %s", gainers)
     logger.info("[LOSERS TOP25] %s", losers)
+    logger.info("[VOLUME TOP25] %s", volume_leaders)
 
     candidates = []
     seen = set()
 
-    for symbol in gainers + losers:
+    btc_normalized = normalize_symbol(BTC_SYMBOL)
+
+    for symbol in gainers + losers + volume_leaders:
         normalized = normalize_symbol(symbol)
         if normalized in seen:
+            continue
+        if normalized == btc_normalized:
+            # BTC yalnızca piyasa rejimi (yön) belirlemek için
+            # kullanılır, min notional / margin uyumsuzluğu
+            # nedeniyle işlem adayı olarak taranmaz.
             continue
         seen.add(normalized)
         candidates.append(symbol)
 
-    logger.info("[TARAMA] %s benzersiz coin (likidite filtresinden geçen).", len(candidates))
+    logger.info("[TARAMA] %s benzersiz coin (likidite filtresinden geçen, BTC hariç).", len(candidates))
 
     # --------------------------------------------------------
     # Scalp (bağımsız tarama — opportunity dolu olsa bile çalışır)
