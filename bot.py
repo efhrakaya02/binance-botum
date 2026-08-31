@@ -228,14 +228,6 @@ def status():
 
 def create_exchange():
     global exchange
-     # --- GEÇİCİ TEŞHİS SATIRLARI ---
-    env_keys = [k for k in os.environ.keys() if "BINANCE" in k.upper()]
-    logger.warning("Ortamda BINANCE içeren değişken adları: %s", env_keys)
-    logger.warning(
-        "API_KEY uzunluk=%s | API_SECRET uzunluk=%s",
-        len(API_KEY), len(API_SECRET)
-    )
-    # --- TEŞHİS SONU ---
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
             "BINANCE_API_KEY / BINANCE_API_SECRET tanımlı değil."
