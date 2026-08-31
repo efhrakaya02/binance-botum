@@ -26,10 +26,10 @@ from flask import Flask, jsonify
 # - 5m / 15m / 1h / 4h analiz
 # - Trend + momentum + hacim + fiyat yapısı
 # - Entry timing confirmation
-# - Scalp: kısa/dinamik TP
-# - Opportunity: daha geniş hedef
-# - Dinamik trailing
-# - Kâr kilitleme
+# - Scalp: dinamik hedef + ATR trailing
+# - Opportunity: geniş hedef + ATR trailing
+# - Hedef %75 görüldüğünde kâr kilitleme
+# - Güçlü trend devam ederse TP sonrası pozisyonu taşıma
 # - Momentum/trend bozulmasında erken çıkış
 # - Başlangıç SL <= TP'nin %60'ı
 # - Maksimum 1 Scalp + 1 Opportunity
@@ -73,7 +73,7 @@ MAX_LEVERAGE = 5
 # ------------------------------------------------------------
 
 SCALP_MIN_SCORE = 68
-OPPORTUNITY_MIN_SCORE = 74
+OPPORTUNITY_MIN_SCORE = 70
 
 # ------------------------------------------------------------
 # Risk
@@ -82,8 +82,8 @@ OPPORTUNITY_MIN_SCORE = 74
 MAX_LOSS_TO_TARGET_RATIO = 0.60
 
 # Maksimum başlangıç SL
-MIN_SCALP_TP_PCT = 0.80
-MAX_SCALP_TP_PCT = 4.50
+MIN_SCALP_TP_PCT = 1.20
+MAX_SCALP_TP_PCT = 5.00
 
 MIN_OPP_TP_PCT = 2.00
 MAX_OPP_TP_PCT = 10.00
@@ -95,6 +95,15 @@ MAX_OPP_TP_PCT = 10.00
 POSITION_MONITOR_INTERVAL = 1.0
 ANALYSIS_INTERVAL = 300
 NO_SIGNAL_INTERVAL = 60
+
+# Dynamic ATR stop / profit lock
+ATR_STOP_MULTIPLIER_SCALP = 1.60
+ATR_STOP_MULTIPLIER_OPPORTUNITY = 2.20
+ATR_REFRESH_INTERVAL_MS = 15_000
+PROFIT_LOCK_TRIGGER = 0.75
+PROFIT_LOCK_RATIO = 0.60
+TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0004"))
+NET_PROFIT_BUFFER_ROI = float(os.getenv("NET_PROFIT_BUFFER_ROI", "0.20"))
 
 # ------------------------------------------------------------
 # Aday sayısı / Likidite / BTC rejimi (YENİ)
@@ -1597,22 +1606,38 @@ def analyze_coin(symbol, mode, btc_regime=None):
         ):
             return None
 
-    if momentum["15m"]["direction"] != direction:
-        return None
+    # Scalp'te 15m momentum yönü giriş yönüyle aynı olmalı.
+    # Opportunity'de ise zayıf/kararsız 15m momentum tamamen reddedilmez;
+    # yalnızca belirgin karşı momentum (>=55) engel olur. Böylece uzun
+    # vadeli trend devam ederken kısa süreli 15m pullback'ler fırsatı
+    # gereksiz yere elemez.
+    if mode == "scalp":
+        if momentum["15m"]["direction"] != direction:
+            return None
+    else:
+        if (
+            momentum["15m"]["direction"] not in (direction, "neutral")
+            and momentum["15m"]["strength"] >= 55
+        ):
+            return None
 
-    if not timing["confirmed"]:
+    if timing["score"] < (55 if mode == "opportunity" else 60):
         return None
 
     if mode == "opportunity":
-        if alignment < 60:
+        # Opportunity hâlâ çoklu zaman dilimi trendini ister, fakat
+        # önceki eşikler aşırı sıkıydı. Orta kuvvette devam eden trendler
+        # de kabul edilir; pozisyon açıldıktan sonra dinamik ATR stop ve
+        # canlı trend/momentum kontrolü riski yönetir.
+        if alignment < 55:
             return None
-        if trend["1h"]["strength"] < 48:
+        if trend["1h"]["strength"] < 42:
             return None
-        if trend["4h"]["strength"] < 48:
+        if trend["4h"]["strength"] < 42:
             return None
-        if momentum["1h"]["strength"] < 48:
+        if momentum["1h"]["strength"] < 42:
             return None
-        if adx_val < 18:
+        if adx_val < 16:
             return None
 
     # --------------------------------------------------------
@@ -1774,7 +1799,9 @@ def fetch_real_positions():
 
     except Exception as e:
         logger.warning("Gerçek pozisyonlar alınamadı: %s", e)
-        return []
+        # API hatasını "0 açık pozisyon" olarak yorumlama. Aksi halde
+        # geçici ağ/API probleminde local state yanlışlıkla silinebilir.
+        return None
 
 
 def sync_real_positions():
@@ -1782,6 +1809,8 @@ def sync_real_positions():
         return
 
     real = fetch_real_positions()
+    if real is None:
+        return
 
     with state_lock:
         real_symbols = {normalize_symbol(p["symbol"]) for p in real}
@@ -1973,12 +2002,16 @@ def create_dry_run_position(signal):
             "leverage": leverage,
             "tp_pct": signal["tp_pct"],
             "sl_pct": signal["sl_pct"],
-            "initial_sl_pct": signal["sl_pct"],
+            "initial_sl_pct": min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
+            "atr_pct": signal.get("atr_pct", 0.0),
+            "dynamic_stop_roi": -min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
             "highest_roi": 0.0,
             "lowest_roi": 0.0,
             "locked_roi": None,
+            "profit_lock_active": False,
             "trailing_active": False,
             "trail_distance_pct": None,
+            "last_atr_refresh": now_ms(),
             "opened_at": now_ms(),
             "last_monitor": now_ms(),
             "last_trend_check": 0,
@@ -2014,6 +2047,10 @@ def create_real_position(signal):
             return False
 
     real_positions = fetch_real_positions()
+    if real_positions is None:
+        logger.warning("%s gerçek pozisyon kontrolü başarısız; yeni emir açılmayacak.", symbol)
+        return False
+
     normalized = normalize_symbol(symbol)
 
     for p in real_positions:
@@ -2069,12 +2106,16 @@ def create_real_position(signal):
             "leverage": leverage,
             "tp_pct": signal["tp_pct"],
             "sl_pct": signal["sl_pct"],
-            "initial_sl_pct": signal["sl_pct"],
+            "initial_sl_pct": min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
+            "atr_pct": signal.get("atr_pct", 0.0),
+            "dynamic_stop_roi": -min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
             "highest_roi": 0.0,
             "lowest_roi": 0.0,
             "locked_roi": None,
+            "profit_lock_active": False,
             "trailing_active": False,
             "trail_distance_pct": None,
+            "last_atr_refresh": now_ms(),
             "opened_at": now_ms(),
             "last_monitor": now_ms(),
             "last_trend_check": 0,
@@ -2084,12 +2125,10 @@ def create_real_position(signal):
     # --------------------------------------------------------
     # Borsa seviyesinde failsafe stop emri
     # --------------------------------------------------------
-    # initial_sl_pct bir ROI% değeridir (kaldıraçlı). Native emir
-    # ham fiyat seviyesinde çalıştığından, ROI hedefini gerçek fiyat
-    # mesafesine çeviriyoruz: fiyat_mesafesi = sl_roi% / 100 / kaldıraç.
-    # Yazılımsal SL'den daha geç tetiklensin diye HARD_STOP_BUFFER ile
-    # biraz genişletiyoruz (bu yüzden normal şartlarda asla tetiklenmemesi
-    # beklenir — sadece bot/ağ arızasında devreye girer).
+    # Native emir başlangıçta maksimum zarar sınırının biraz dışında
+    # bir SON ÇARE failsafe olarak kalır. Normal çalışma sırasında asıl
+    # çıkış kararı ATR bazlı dinamik yazılım stopundan gelir.
+    # ROI -> gerçek fiyat mesafesi dönüşümü kaldıraçla yapılır.
 
     try:
         price_distance_fraction = (
@@ -2143,6 +2182,35 @@ def open_position(signal):
         set_cooldown(symbol)
 
     return result
+
+
+# ============================================================
+# FEE / NET ROI
+# ============================================================
+
+def estimated_fee_roi(position):
+    """Round-trip tahmini komisyonun kaldıraçlı ROI karşılığı."""
+    leverage = max(safe_float(position.get("leverage"), 1.0), 1.0)
+    return TAKER_FEE_RATE * 2.0 * leverage * 100.0
+
+
+def calculate_net_roi(position, gross_roi=None):
+    if gross_roi is None:
+        gross_roi = safe_float(position.get("current_roi"), 0.0)
+    return gross_roi - estimated_fee_roi(position)
+
+
+def calculate_atr_stop_distance_roi(position, atr_pct=None):
+    if atr_pct is None:
+        atr_pct = safe_float(position.get("atr_pct"), 0.0)
+    atr_pct = clamp(atr_pct, 0.05, 10.0)
+    leverage = max(safe_float(position.get("leverage"), 1.0), 1.0)
+    multiplier = (
+        ATR_STOP_MULTIPLIER_SCALP
+        if position.get("mode") == "scalp"
+        else ATR_STOP_MULTIPLIER_OPPORTUNITY
+    )
+    return atr_pct * multiplier * leverage
 
 
 # ============================================================
@@ -2214,59 +2282,79 @@ def live_signal_check(symbol, direction):
 # ============================================================
 
 def update_position_management(position, price):
-    roi = calculate_roi(position, price)
-    position["current_roi"] = roi
+    gross_roi = calculate_roi(position, price)
+    position["current_roi"] = gross_roi
+    position["net_roi"] = calculate_net_roi(position, gross_roi)
 
-    if roi > position["highest_roi"]:
-        position["highest_roi"] = roi
-    if roi < position["lowest_roi"]:
-        position["lowest_roi"] = roi
+    if gross_roi > position["highest_roi"]:
+        position["highest_roi"] = gross_roi
+    if gross_roi < position["lowest_roi"]:
+        position["lowest_roi"] = gross_roi
 
     tp = position["tp_pct"]
+    max_loss_roi = tp * MAX_LOSS_TO_TARGET_RATIO
 
-    if roi >= tp * 0.30:
-        if position["locked_roi"] is None or position["locked_roi"] < 0:
-            position["locked_roi"] = 0.0
+    # ATR yalnızca 15 saniyede bir yenilenir; böylece 1 saniyelik monitor
+    # döngüsü Binance API'sini gereksiz OHLCV çağrılarıyla boğmaz.
+    now = now_ms()
+    if now - position.get("last_atr_refresh", 0) >= ATR_REFRESH_INTERVAL_MS:
+        try:
+            df = fetch_ohlcv(position["symbol"], "5m", 100)
+            if df is not None:
+                df = enrich_dataframe(df)
+                latest_atr_pct = safe_float(df.iloc[-1]["atr_pct"], position.get("atr_pct", 0.0))
+                if latest_atr_pct > 0:
+                    position["atr_pct"] = clamp(latest_atr_pct, 0.05, 10.0)
+        except Exception as e:
+            logger.info("%s ATR yenileme atlandı: %s", position["symbol"], e)
+        position["last_atr_refresh"] = now
 
-    if roi >= tp * 0.45:
-        lock = tp * 0.15
-        if position["locked_roi"] is None or position["locked_roi"] < lock:
-            position["locked_roi"] = lock
+    atr_stop_distance = calculate_atr_stop_distance_roi(position)
 
-    if roi >= tp * 0.60:
-        lock = tp * 0.30
-        if position["locked_roi"] is None or position["locked_roi"] < lock:
-            position["locked_roi"] = lock
+    # ATR stop hiçbir zaman hedefin %60'ı olan maksimum zarar sınırını
+    # aşamaz. Pozisyon kâra geçtikçe stop, peak ROI'den ATR mesafesiyle
+    # yukarı taşınır; böylece kârı gereksiz yere erken kesmeden takip eder.
+    candidate_stop = position["highest_roi"] - atr_stop_distance
+    candidate_stop = max(candidate_stop, -max_loss_roi)
 
-    if roi >= tp * 0.75:
-        lock = tp * 0.45
-        if position["locked_roi"] is None or position["locked_roi"] < lock:
-            position["locked_roi"] = lock
+    previous_stop = safe_float(position.get("dynamic_stop_roi"), -max_loss_roi)
+    position["dynamic_stop_roi"] = max(previous_stop, candidate_stop)
 
-    if roi >= tp * 0.90:
-        lock = tp * 0.60
-        if position["locked_roi"] is None or position["locked_roi"] < lock:
-            position["locked_roi"] = lock
+    # Hedefin %75'i görüldüğü anda kâr kilidi. Kilit, tahmini round-trip
+    # komisyon + buffer'ın altında kalamaz. Böylece küçük +ROI kapanışları
+    # komisyon sonrası sistematik zarara dönüştürmez.
+    if gross_roi >= tp * PROFIT_LOCK_TRIGGER:
+        fee_roi = estimated_fee_roi(position)
+        lock = max(
+            tp * PROFIT_LOCK_TRIGGER * PROFIT_LOCK_RATIO,
+            fee_roi + NET_PROFIT_BUFFER_ROI
+        )
+        lock = min(lock, gross_roi)
+        position["locked_roi"] = max(
+            safe_float(position.get("locked_roi"), -999.0),
+            lock
+        )
+        position["profit_lock_active"] = True
 
-    if roi >= tp * 0.55:
+    # Profit lock sonrası ATR trailing daha sıkılaşır; ancak kilit
+    # seviyesinin altına inmesine izin verilmez.
+    if position.get("profit_lock_active"):
+        trailing_distance = max(atr_stop_distance * 0.75, tp * 0.08)
         position["trailing_active"] = True
+    else:
+        trailing_distance = atr_stop_distance
+        position["trailing_active"] = gross_roi > 0
 
-        # Daha geniş mesafe: normal geri çekilmelerde hedefe giden
-        # işlemin erken kesilmesini önlemek için trailing daha geç
-        # aktifleşir ve daha toleranslı takip eder.
-        if position["mode"] == "scalp":
-            trail = max(0.45, tp * 0.35)
-        else:
-            trail = max(0.75, tp * 0.40)
+    position["trail_distance_pct"] = trailing_distance
 
-        if roi >= tp * 0.75:
-            trail *= 0.80
-        if roi >= tp * 0.92:
-            trail *= 0.70
+    if position["trailing_active"]:
+        trailing_stop = position["highest_roi"] - trailing_distance
+        position["dynamic_stop_roi"] = max(
+            position["dynamic_stop_roi"],
+            trailing_stop
+        )
 
-        position["trail_distance_pct"] = trail
-
-    return roi
+    return gross_roi
 
 
 # ============================================================
@@ -2275,32 +2363,24 @@ def update_position_management(position, price):
 
 def should_close_position(position, price):
     roi = update_position_management(position, price)
-
     tp = position["tp_pct"]
-    initial_sl = position["initial_sl_pct"]
 
-    # Mutlak güvenlik tavanı: hiçbir hesaplama/gecikme bu seviyeyi
-    # aşarak pozisyonu açık tutamaz. initial_sl'nin normalde çok
-    # altında olması beklenir; bu sadece son çare bir sigortadır.
-    hard_cap = initial_sl * 2.0
+    # Dinamik ATR stop. Başlangıçta maksimum zarar = hedefin %60'ı;
+    # pozisyon lehine ilerledikçe stop yalnızca yukarı hareket eder.
+    dynamic_stop = safe_float(
+        position.get("dynamic_stop_roi"),
+        -tp * MAX_LOSS_TO_TARGET_RATIO
+    )
 
-    if roi <= -hard_cap:
-        return True, "HARD_FAILSAFE_STOP"
-
-    if roi <= -initial_sl:
-        return True, "INITIAL_STOP"
+    if roi <= dynamic_stop:
+        return True, "ATR_DYNAMIC_STOP"
 
     locked = position.get("locked_roi")
-    if locked is not None and roi <= locked:
+    if locked is not None and roi <= safe_float(locked):
         return True, "PROFIT_LOCK"
 
-    if position.get("trailing_active"):
-        peak = position["highest_roi"]
-        distance = position.get("trail_distance_pct")
-        if distance:
-            if peak - roi >= distance and roi > 0:
-                return True, "TRAILING_STOP"
-
+    # Trend + momentum tersine dönüşü, kârı koruyan ana erken çıkış
+    # mekanizmasıdır. Küçük geri çekilmeler tek başına pozisyonu kapatmaz.
     current_time = now_ms()
 
     if (current_time - position.get("last_trend_check", 0)) >= 15000:
@@ -2309,28 +2389,19 @@ def should_close_position(position, price):
         check = live_signal_check(position["symbol"], position["side"])
         position["live_strength"] = check["strength"]
 
-        # Opportunity modu daha uzun soluklu bir strateji olduğu için
-        # erken çıkış eşikleri Scalp'e göre daha sabırlı (geç tetiklenir).
-        # Eşikler yükseltildi: küçük geri çekilmelerde değil, sadece
-        # gerçekten belirgin bir bozulmada erken çıkılsın.
-        if position["mode"] == "opportunity":
-            reversal_trigger = 0.50
-            fade_trigger = 0.75
-            fade_strength_floor = 20
-        else:
-            reversal_trigger = 0.40
-            fade_trigger = 0.65
-            fade_strength_floor = 25
+        reversal_trigger = 0.50 if position["mode"] == "opportunity" else 0.40
 
         if roi > tp * reversal_trigger and not check["trend_ok"] and not check["momentum_ok"]:
             return True, "TREND_MOMENTUM_REVERSAL"
 
-        if roi > tp * fade_trigger and check["strength"] < fade_strength_floor:
-            return True, "MOMENTUM_FADE"
+        # Tek başına momentum zayıflaması pozisyonu kapatmaz.
+        # Trend ve momentum gerçekten tersine dönmedikçe ATR stop / profit
+        # lock pozisyonu taşımaya devam eder.
 
-    if roi >= tp:
-        return True, "TARGET_REACHED"
-
+    # TP artık zorunlu kapanış değil. Hedefe ulaşıldığında trend/momentum
+    # güçlü kalıyorsa pozisyonu taşımaya devam ediyoruz; ATR trailing ve
+    # profit-lock kazanımı koruyor. Böylece güçlü hareketlerde hedefin
+    # üzerine çıkma ihtimali korunur.
     return False, None
 
 
@@ -2350,9 +2421,10 @@ def close_dry_position(key, reason):
 
         local_positions.pop(key, None)
 
+    net_roi = calculate_net_roi(position, roi)
     logger.warning(
-        "[DRY RUN] %s %s kapandı | ROI=%.2f%% | sebep=%s",
-        mode.upper(), symbol, roi, reason
+        "[DRY RUN] %s %s kapandı | gross ROI=%+.2f%% | net ROI≈%+.2f%% | sebep=%s",
+        mode.upper(), symbol, roi, net_roi, reason
     )
 
     bot_stats["closed_positions"] += 1
@@ -2384,9 +2456,11 @@ def close_real_position(key, reason):
         with state_lock:
             local_positions.pop(key, None)
 
+        gross_roi = safe_float(position.get("current_roi"), 0.0)
+        net_roi = calculate_net_roi(position, gross_roi)
         logger.warning(
-            "[REAL] %s %s kapandı | ROI=%.2f%% | sebep=%s",
-            position["mode"].upper(), symbol, position.get("current_roi", 0), reason
+            "[REAL] %s %s kapandı | gross ROI=%+.2f%% | net ROI≈%+.2f%% | sebep=%s",
+            position["mode"].upper(), symbol, gross_roi, net_roi, reason
         )
 
         bot_stats["closed_positions"] += 1
@@ -2444,10 +2518,11 @@ def monitor_positions():
                         sl = current["sl_pct"]
 
                     logger.info(
-                        "[MONITOR] %s | %s | price=%s | ROI=%+.2f%% | peak=%+.2f%% | "
-                        "TP=%.2f%% | SL=%.2f%% | lock=%s | trail=%s",
-                        symbol, position["mode"].upper(), price, roi, peak, tp, sl,
-                        current.get("locked_roi"), current.get("trail_distance_pct")
+                        "[MONITOR] %s | %s | price=%s | gross=%+.2f%% | net≈%+.2f%% | peak=%+.2f%% | "
+                        "TP=%.2f%% | dynSL=%+.2f%% | lock=%s | trail=%s",
+                        symbol, position["mode"].upper(), price, roi, calculate_net_roi(current, roi), peak, tp,
+                        current.get("dynamic_stop_roi", -sl), current.get("locked_roi"),
+                        current.get("trail_distance_pct")
                     )
 
                     if should_close:
@@ -2519,8 +2594,9 @@ def final_entry_confirmation(signal):
 
         timing = entry_timing(df, direction)
 
-        if not timing["confirmed"]:
-            logger.info("[ENTRY RED] %s timing teyidi yok.", symbol)
+        timing_threshold = 55 if signal.get("mode") == "opportunity" else 60
+        if timing["score"] < timing_threshold:
+            logger.info("[ENTRY RED] %s timing teyidi yok | score=%s < %s", symbol, timing["score"], timing_threshold)
             return False
 
         if is_overextended(df, direction):
