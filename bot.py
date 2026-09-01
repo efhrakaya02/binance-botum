@@ -641,27 +641,43 @@ def calculate_trigger_score(momentum_accel, rsi_turn, ema_slope_ok, structure_br
 
 
 # ============================================================
-# ANALYSIS PIPELINE
+# ANALYSIS PIPELINE (OPTIMIZED LOGGING)
 # ============================================================
 
 def analyze_high_conviction(symbol, btc_regime=None):
+    diag_stage(symbol, "scanned")
     tf_data = {}
     for tf in ["4h", "1h", "15m", "5m"]:
         df = fetch_ohlcv_closed(symbol, tf)
-        if df is None: return None
+        if df is None:
+            diag_reject(symbol, "data_missing", f"{tf} veri eksik")
+            return None
         tf_data[tf] = enrich_dataframe(df)
 
-    if detect_anomaly(tf_data["15m"]): return None
+    if detect_anomaly(tf_data["15m"]):
+        diag_reject(symbol, "anomaly", "15m anomali tespit edildi")
+        return None
+        
     t1h = timeframe_trend(tf_data["1h"])
-    if t1h["direction"] == "neutral" or t1h["strength"] < 30: return None
+    if t1h["direction"] == "neutral" or t1h["strength"] < 30:
+        diag_reject(symbol, "trend_neutral", f"1H trend yetersiz: {t1h}")
+        return None
     direction = t1h["direction"]
+    diag_stage(symbol, "trend_ok", f"Yön: {direction.upper()} (Güç: {t1h['strength']})")
 
     pattern = detect_chart_patterns(tf_data["15m"], direction)
     pb_detected = detect_pullback(tf_data["15m"], direction)
     pb_quality = assess_pullback_quality(tf_data["15m"], direction) if pb_detected else {"healthy": False, "score": 0}
     pattern_setup = bool(pattern.get("detected"))
     
-    if not pb_quality.get("healthy") and not pattern_setup: return None
+    if not pb_quality.get("healthy") and not pattern_setup:
+        diag_reject(symbol, "no_setup", "Pullback sağlıklı değil ve formasyon bulunamadı")
+        return None
+        
+    if pattern_setup:
+        diag_stage(symbol, "pattern_candidate", f"Formasyon: {pattern.get('type')}")
+    if pb_quality.get("healthy"):
+        diag_stage(symbol, "pullback_healthy", f"Pullback Skor: {pb_quality.get('score')}")
 
     momentum_accel = calculate_momentum_acceleration(tf_data["5m"], direction)
     rsi_v = tf_data["5m"]["rsi"].tail(4).values
@@ -685,23 +701,40 @@ def analyze_high_conviction(symbol, btc_regime=None):
             level = pattern.get("break_level") if pattern_setup else structure_break.get("level")
             breakout_result, breakout_type = {"confirmed": True, "type": "early_momentum"}, "early_momentum"
         else:
+            diag_reject(symbol, "no_breakout", "Yapı kırılımı veya formasyon breakout doğrulanamadı")
             return None
 
-    if not breakout_result.get("confirmed"): return None
+    if not breakout_result.get("confirmed"):
+        diag_reject(symbol, "breakout_unconfirmed", "Breakout onaylanmadı")
+        return None
+        
+    diag_stage(symbol, "breakout_confirmed", f"Tip: {breakout_type} | Seviye: {level}")
 
     current_5m = tf_data["5m"].iloc[-1]
     price, atr_val = safe_float(current_5m["close"]), safe_float(current_5m["atr"])
-    if level is None or atr_val <= 0 or (abs(price - level) / atr_val) > MAX_ENTRY_CHASE_ATR: return None
+    if level is None or atr_val <= 0 or (abs(price - level) / atr_val) > MAX_ENTRY_CHASE_ATR:
+        diag_reject(symbol, "entry_chase", "Fiyat kırılma seviyesinden çok uzaklaşmış (Chase)")
+        return None
 
     setup_score, setup_bd = calculate_setup_score(direction, timeframe_trend(tf_data["4h"]), t1h, pb_quality, safe_float(current_5m["atr_pct"]), get_funding(symbol), safe_float(current_5m["volume_ratio"], 1), True)
     trigger_score, trigger_bd, confs = calculate_trigger_score(momentum_accel, rsi_turn, True, {"broken": structure_break["broken"] or pattern_breakout["confirmed"]}, breakout_result, True)
 
-    if setup_score < MIN_SETUP_SCORE or trigger_score < MIN_TRIGGER_SCORE: return None
+    if setup_score < MIN_SETUP_SCORE:
+        diag_reject(symbol, "setup_score_low", f"Setup Skor düşük: {setup_score} < {MIN_SETUP_SCORE}")
+        return None
+    if trigger_score < MIN_TRIGGER_SCORE:
+        diag_reject(symbol, "trigger_score_low", f"Trigger Skor düşük: {trigger_score} < {MIN_TRIGGER_SCORE}")
+        return None
+
+    diag_stage(symbol, "scores_passed", f"Setup: {setup_score} | Trigger: {trigger_score}")
 
     leverage = calculate_leverage(setup_score, trigger_score, safe_float(current_5m["atr_pct"]))
     expected_move = calculate_expected_move(tf_data["1h"], direction, price, leverage)
-    if not expected_move["sufficient"]: return None
+    if not expected_move["sufficient"]:
+        diag_reject(symbol, "expected_move", "Beklenen hareket hedef ROI için yetersiz")
+        return None
 
+    diag_stage(symbol, "final_candidate", f"Tüm filtreler geçti! Kaldıraç: {leverage}x")
     return {
         "symbol": symbol, "direction": direction, "setup_type": "continuation", "setup_score": setup_score,
         "trigger_score": trigger_score, "price": price, "atr": atr_val, "structure_level": level, "leverage": leverage,
@@ -829,16 +862,59 @@ def should_close_position(position, price):
 
 def close_position(position, reason="MANUAL"):
     symbol, side, amount = position["symbol"], position["side"], position["amount"]
+    
+    # Kapanış fiyatını alabilmek için son 1m mumu çekelim
+    last_df = fetch_ohlcv(symbol, "1m", 5)
+    close_price = safe_float(last_df.iloc[-1]["close"]) if last_df is not None and not last_df.empty else position["entry_price"]
+
     if not DRY_RUN:
         try:
-            safe_call(exchange.create_order, symbol, "market", "sell" if side == "long" else "buy", format_amount(symbol, amount), None, {"positionSide": "BOTH"})
+            order = safe_call(exchange.create_order, symbol, "market", "sell" if side == "long" else "buy", format_amount(symbol, amount), None, {"positionSide": "BOTH"})
+            close_price = safe_float(order.get("average"), close_price)
         except Exception as e:
             logger.error("%s pozisyon kapatma emri hatası: %s", symbol, e)
+
+    # İşlem Sonuç Formu Hesaplamaları
+    entry_price = safe_float(position["entry_price"])
+    leverage = safe_float(position["leverage"], 1)
+    margin = safe_float(position["margin"])
+    
+    final_roi = calculate_roi(position, close_price)
+    profit_usdt = margin * (final_roi / 100.0)
+    
+    opened_at = position.get("opened_at", now_ms())
+    closed_at = now_ms()
+    duration_sec = max(1, (closed_at - opened_at) // 1000)
+    duration_min = duration_sec / 60.0
 
     with state_lock:
         local_positions.pop(position["key"], None)
     bot_stats["closed_positions"] += 1
-    logger.warning("[POZİSYON KAPANDI] %s | Neden: %s | ROI: %.2f%%", symbol, reason, position.get("current_roi", 0))
+
+    # İşlem Sonuç Formu Log Formatı
+    logger.warning("=" * 70)
+    logger.warning("[İŞLEM SONUÇ FORMU] 📋 Rapor Özeti")
+    logger.warning("Sembol            : %s (%s)", symbol, side.upper())
+    logger.warning("Giriş Fiyatı      : %s", entry_price)
+    logger.warning("Kapanış Fiyatı    : %s", close_price)
+    logger.warning("İşlem Süresi      : %.2f dakika (%d sn)", duration_min, duration_sec)
+    logger.warning("Hedef ROI         : %%%.2f", MIN_TARGET_ROI)
+    logger.warning("Gerçekleşen ROI   : %%%.2f", final_roi)
+    logger.warning("Elde Edilen Kazanç: %.2f USDT", profit_usdt)
+    logger.warning("Kapanış Nedeni    : %s", reason)
+    logger.warning("=" * 70)
+
+    # İsteğe bağlı olarak journal dosyasına da yazalım (Trade Journal Path)
+    try:
+        journal_entry = {
+            "symbol": symbol, "side": side, "entry_price": entry_price, "close_price": close_price,
+            "leverage": leverage, "margin": margin, "roi": final_roi, "profit_usdt": profit_usdt,
+            "duration_sec": duration_sec, "reason": reason, "opened_at": opened_at, "closed_at": closed_at
+        }
+        with open(TRADE_JOURNAL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(journal_entry) + "\n")
+    except Exception as je:
+        logger.error("Trade journal kayıt hatası: %s", je)
 
 
 # ============================================================
@@ -850,7 +926,9 @@ def monitor_loop():
         try:
             positions = get_local_positions()
             for key, pos in positions.items():
-                price = safe_float(fetch_ohlcv(pos["symbol"], "1m", 5))
+                df_m = fetch_ohlcv(pos["symbol"], "1m", 5)
+                if df_m is None or df_m.empty: continue
+                price = safe_float(df_m.iloc[-1]["close"])
                 if price <= 0: continue
                 should_close, reason = should_close_position(pos, price)
                 if should_close:
@@ -863,16 +941,26 @@ def strategy_loop():
     global last_successful_analysis
     while running:
         try:
+            reset_cycle_diagnostics()
+            scanned_count = 0
+            final_candidates_count = 0
+            opened_count = 0
+
             if local_position_count() < MAX_OPEN_POSITIONS:
                 gainers, losers, vol_leaders = get_top_movers()
                 candidates = list(set(gainers[:TOP_N_CANDIDATES] + vol_leaders[:TOP_N_CANDIDATES]))
                 btc_regime = get_btc_regime()
+                scanned_count = len(candidates)
 
                 for symbol in candidates:
                     if has_local_symbol(symbol) or local_position_count() >= MAX_OPEN_POSITIONS: continue
                     analysis = analyze_high_conviction(symbol, btc_regime)
                     if analysis:
-                        open_position(analysis)
+                        final_candidates_count += 1
+                        if open_position(analysis):
+                            opened_count += 1
+                            
+            log_cycle_diagnostics(scanned_count, final_candidates_count, opened_count)
             last_successful_analysis = datetime.now(timezone.utc).isoformat()
         except Exception as e:
             logger.error("Strategy loop hatası: %s", e)
