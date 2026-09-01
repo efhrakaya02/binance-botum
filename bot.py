@@ -112,6 +112,7 @@ MAX_ENTRY_CHASE_ATR = 1.8             # Kırılımdan bu kadar ATR uzaklaşmış
 TOP_N_CANDIDATES = 5
 MIN_QUOTE_VOLUME_USDT = 2_000_000
 BTC_SYMBOL = "BTC/USDT"
+EXCLUDED_TRADE_SYMBOLS = {"BTC/USDT:USDT", "BTC/USDT", "XAU/USDT:USDT", "XAU/USDT"}
 BTC_REGIME_MIN_STRENGTH = 60
 CORRELATION_MAX_ALLOWED = 0.85        # Açık pozisyonlarla bu korelasyonun üzerindeki adaylar elenir
 
@@ -140,7 +141,7 @@ DETAILED_DIAGNOSTICS = os.getenv("DETAILED_DIAGNOSTICS", "true").lower() == "tru
 LOG_EVERY_CANDIDATE_STAGE = os.getenv("LOG_EVERY_CANDIDATE_STAGE", "true").lower() == "true"
 
 DIAGNOSTIC_KEYS = [
-    "scanned", "invalid_symbol", "cooldown", "already_position", "data_missing",
+    "scanned", "excluded_symbol", "invalid_symbol", "cooldown", "already_position", "data_missing",
     "anomaly", "trend_neutral", "trend_weak", "momentum_conflict", "htf_conflict",
     "funding", "no_setup", "pullback_unhealthy", "no_15m_reversal", "pattern_none",
     "pattern_BULL_FLAG", "pattern_BEAR_FLAG", "pattern_TOBO", "pattern_OBO",
@@ -207,9 +208,9 @@ def log_cycle_diagnostics(scanned, final_candidates, opened):
     logger.info("[HC DIAGNOSTICS] Opportunity Funnel")
     logger.info("taranan=%s | final_aday=%s | açılan=%s", scanned, final_candidates, opened)
     logger.info(
-        "[HC DIAGNOSTICS] Ön eleme | invalid=%s cooldown=%s açık_pozisyon=%s data_missing=%s "
+        "[HC DIAGNOSTICS] Ön eleme | excluded=%s invalid=%s cooldown=%s açık_pozisyon=%s data_missing=%s "
         "anomaly=%s trend_neutral=%s trend_weak=%s momentum_conflict=%s htf_conflict=%s funding=%s",
-        d.get("invalid_symbol",0), d.get("cooldown",0), d.get("already_position",0),
+        d.get("excluded_symbol",0), d.get("invalid_symbol",0), d.get("cooldown",0), d.get("already_position",0),
         d.get("data_missing",0), d.get("anomaly",0), d.get("trend_neutral",0),
         d.get("trend_weak",0), d.get("momentum_conflict",0), d.get("htf_conflict",0),
         d.get("funding",0)
@@ -447,6 +448,8 @@ def symbol_is_valid(symbol):
         return False
 
     s = symbol.upper()
+    if normalize_symbol(s) in {normalize_symbol(x) for x in EXCLUDED_TRADE_SYMBOLS}:
+        return False
 
     if "/USDT" not in s:
         return False
@@ -1515,11 +1518,23 @@ def analyze_high_conviction(symbol, btc_regime=None):
 
     # --------------------------------------------------------
     # SETUP: klasik pullback veya chart pattern
+    # Pattern motoru pullback filtresinden bağımsız taranır; böylece
+    # pattern kaynaklı fırsatlar diagnostics'te gerçekten görünür.
     # --------------------------------------------------------
+    pattern = detect_chart_patterns(tf_data["15m"], direction)
+    diag_inc("pattern_scanned")
+    if pattern.get("detected"):
+        diag_inc("pattern_candidate")
+        diag_inc("pattern_valid")
+        diag_inc(pattern_diag_key(pattern.get("type")))
+        if pattern.get("details", {}).get("broken"):
+            diag_inc("pattern_breakout")
+        diag_stage(symbol, "PATTERN_OK", f"type={pattern.get('type')} score={safe_float(pattern.get('score')):.1f} break={pattern.get('break_level')}")
+    else:
+        diag_stage(symbol, "PATTERN_NONE")
+
     pullback_detected = detect_pullback(tf_data["15m"], direction)
     pullback_quality = assess_pullback_quality(tf_data["15m"], direction) if pullback_detected else {"healthy": False, "score": 0, "issues": []}
-    pattern = detect_chart_patterns(tf_data["15m"], direction)
-
     pattern_setup = bool(pattern.get("detected"))
     valid_setup = pullback_quality.get("healthy") or pattern_setup
     if not valid_setup:
@@ -1566,6 +1581,15 @@ def analyze_high_conviction(symbol, btc_regime=None):
         breakout_result = pattern_breakout
         breakout_type = pattern_breakout.get("type")
     else:
+        diag_inc("no_breakout")
+        diag_reject(symbol, "no_breakout", "micro_structure/pattern breakout yok")
+        return None
+
+    if breakout_result.get("confirmed"):
+        diag_inc("breakout_confirmed")
+    else:
+        diag_inc("no_breakout")
+        diag_reject(symbol, "no_breakout", f"type={breakout_type}")
         return None
 
     current_5m = tf_data["5m"].iloc[-1]
@@ -1629,7 +1653,8 @@ def analyze_high_conviction(symbol, btc_regime=None):
     leverage = calculate_leverage(setup_score, trigger_score, atr_pct)
     expected_move = calculate_expected_move(tf_data["1h"], direction, price, leverage)
     if not expected_move["sufficient"]:
-        diag_reject(symbol, "expected_move", f"available={expected_move.get('available_move_pct')} required={expected_move.get('required_move_pct')}")
+        diag_inc("expected_move")
+        diag_reject(symbol, "expected_move", f"available={safe_float(expected_move.get('available_move_pct')):.2f}% required={safe_float(expected_move.get('required_move_pct')):.2f}%")
         return None
     diag_stage(symbol, "EXPECTED_MOVE_OK", f"available={expected_move.get('available_move_pct'):.2f}% required={expected_move.get('required_move_pct'):.2f}%")
 
@@ -2633,59 +2658,85 @@ def monitor_positions():
 # ============================================================
 
 def final_entry_confirmation(candidate):
-    """Top-N aday sıraya girdikten sonra, emir açılmadan hemen önce
-    EN GÜNCEL kapanmış 5m mumla yapı kırılımı ve breakout'un hâlâ
-    geçerli olduğunu, entry chasing'e dönüşmediğini son kez doğrular."""
+    """Emirden hemen önce en güncel kapanmış 5m verisiyle son teyit.
+    Karar ve red nedeni diagnostics'e açık şekilde yazılır."""
     symbol = candidate["symbol"]
     direction = candidate["direction"]
-
+    reason = ""
     try:
-        df5 = fetch_ohlcv_closed(symbol, "5m", 100)
-        if df5 is None:
+        if normalize_symbol(symbol) in {normalize_symbol(x) for x in EXCLUDED_TRADE_SYMBOLS}:
+            diag_inc("final_confirmation")
+            logger.info("[HC FINAL] %s | EXCLUDED_TRADE_SYMBOL", symbol)
             return False
 
+        df5 = fetch_ohlcv_closed(symbol, "5m", 100)
+        if df5 is None:
+            diag_inc("final_confirmation")
+            diag_inc("final_reason_no_data")
+            log_final_decision(symbol, direction, None, pd.DataFrame(), None, accepted=False, reason="NO_DATA")
+            return False
         df5 = enrich_dataframe(df5)
 
         structure_break = detect_micro_structure_break(df5, direction)
         pattern = detect_chart_patterns(df5, direction) if candidate.get("chart_pattern") else {"detected": False}
+        level = None
+        breakout_result = {"confirmed": False, "type": None, "reasons": []}
 
-        if structure_break["broken"]:
-            level = structure_break["level"]
+        if structure_break.get("broken"):
+            level = structure_break.get("level")
             breakout_result = confirm_breakout(df5, level, direction)
-            if not breakout_result["confirmed"]:
+            if not breakout_result.get("confirmed"):
                 breakout_result = confirm_breakout_retest(df5, level, direction)
-            if not breakout_result["confirmed"] and pattern.get("detected"):
+            if not breakout_result.get("confirmed") and pattern.get("detected"):
                 level = pattern.get("break_level")
                 breakout_result = confirm_pattern_breakout(df5, pattern, direction)
         elif pattern.get("detected"):
             level = pattern.get("break_level")
             breakout_result = confirm_pattern_breakout(df5, pattern, direction)
         else:
-            logger.info("[ENTRY RED] %s yapı/pattern kırılımı artık geçerli değil.", symbol)
-            return False
-
-        if not breakout_result["confirmed"]:
+            reason = "BREAKOUT"
             diag_inc("final_confirmation")
-            logger.info("[ENTRY RED] %s breakout/pattern teyidi artık geçerli değil. reasons=%s",
-                        symbol, breakout_result.get("reasons", []))
+            diag_inc("final_reason_breakout")
+            log_final_decision(symbol, direction, level, df5, breakout_result, accepted=False, reason=reason)
             return False
 
-        if is_entry_chasing(df5, direction, level):
+        current = df5.iloc[-1]
+        momentum_accel = calculate_momentum_acceleration(df5, direction)
+        rsi_vals = df5["rsi"].tail(4).values if "rsi" in df5.columns else []
+        rsi_turn = bool(len(rsi_vals) >= 2 and ((rsi_vals[-1] > rsi_vals[-2]) if direction == "long" else (rsi_vals[-1] < rsi_vals[-2])))
+        volume_ok = safe_float(current.get("volume_ratio"), 1.0) >= (PATTERN_VOLUME_RATIO if pattern.get("detected") else MIN_BREAKOUT_VOLUME_RATIO)
+        retest = "retest" in str(breakout_result.get("type", "")).lower()
+        funding = get_funding(symbol)
+
+        if not breakout_result.get("confirmed"):
+            reason = "BREAKOUT"
+            diag_inc("final_confirmation")
+            diag_inc("final_reason_breakout")
+        elif is_entry_chasing(df5, direction, level):
+            reason = "CHASE"
             diag_inc("final_confirmation")
             diag_inc("entry_chase")
-            diag_inc("final_confirmation")
             diag_inc("final_reason_chase")
-            logger.info("[ENTRY RED] %s fiyat kırılımdan çok uzaklaşmış (chase).", symbol)
-            return False
+        elif abs(funding) >= FUNDING_SKIP_THRESHOLD:
+            reason = "FUNDING"
+            diag_inc("final_confirmation")
+            diag_inc("final_reason_funding")
+        else:
+            log_final_decision(symbol, direction, level, df5, breakout_result,
+                               momentum_accel=momentum_accel.get("accelerating"),
+                               rsi_turn=rsi_turn, volume_ok=volume_ok, retest=retest,
+                               funding=funding, accepted=True, reason="PASS")
+            return True
 
-        funding = get_funding(symbol)
-        if abs(funding) >= FUNDING_SKIP_THRESHOLD:
-            logger.info("[ENTRY RED] %s funding aşırı.", symbol)
-            return False
-
-        return True
+        log_final_decision(symbol, direction, level, df5, breakout_result,
+                           momentum_accel=momentum_accel.get("accelerating"),
+                           rsi_turn=rsi_turn, volume_ok=volume_ok, retest=retest,
+                           funding=funding, accepted=False, reason=reason)
+        return False
 
     except Exception as e:
+        diag_inc("analysis_error")
+        diag_inc("final_confirmation")
         logger.warning("%s final confirmation hatası: %s", symbol, e)
         return False
 
@@ -2698,7 +2749,12 @@ def analyze_candidates(symbols, btc_regime=None):
     candidates = []
 
     for symbol in symbols:
+        diag_inc("scanned")
+        if normalize_symbol(symbol) in {normalize_symbol(x) for x in EXCLUDED_TRADE_SYMBOLS}:
+            diag_reject(symbol, "excluded_symbol", "işlem evreni dışında")
+            continue
         if not symbol_is_valid(symbol):
+            diag_reject(symbol, "invalid_symbol")
             continue
         if is_on_cooldown(symbol):
             continue
@@ -2716,8 +2772,9 @@ def analyze_candidates(symbols, btc_regime=None):
                     "expected_move=%.2f%% (gerekli=%.2f%%)",
                     symbol, result["direction"], result["setup_score"], result["trigger_score"],
                     result["confirmations"], result["setup_type"], result["breakout_type"],
-                    result["expected_move"]["available_move_pct"],
-                    result["expected_move"]["required_move_pct"]
+                    result.get("chart_pattern"),
+                    safe_float(result["expected_move"].get("available_move_pct")),
+                    safe_float(result["expected_move"].get("required_move_pct"))
                 )
 
         except Exception as e:
@@ -2808,16 +2865,16 @@ def analysis_cycle():
 
     candidates_pool = []
     seen = set()
-    btc_normalized = normalize_symbol(BTC_SYMBOL)
+    excluded_normalized = {normalize_symbol(x) for x in EXCLUDED_TRADE_SYMBOLS}
 
     for symbol in gainers + losers + volume_leaders:
         normalized = normalize_symbol(symbol)
-        if normalized in seen or normalized == btc_normalized:
+        if normalized in seen or normalized in excluded_normalized:
             continue
         seen.add(normalized)
         candidates_pool.append(symbol)
 
-    logger.info("[TARAMA] %s benzersiz coin (likidite filtresinden geçen, BTC hariç).", len(candidates_pool))
+    logger.info("[TARAMA] %s benzersiz coin (işlem evreni filtresinden geçen, BTC/XAU hariç).", len(candidates_pool))
 
     signals = analyze_candidates(candidates_pool, btc_regime=btc_regime)
 
