@@ -121,6 +121,10 @@ TOP_N_CANDIDATES = 5
 MIN_QUOTE_VOLUME_USDT = 2_000_000
 BTC_SYMBOL = "BTC/USDT"
 BTC_REGIME_MIN_STRENGTH = 60
+# BTC artık hard-reject filtresi değildir. Yalnızca risk/leverage katsayısıdır.
+BTC_RISK_FACTOR_ALIGNED = 1.00
+BTC_RISK_FACTOR_NEUTRAL = 0.85
+BTC_RISK_FACTOR_OPPOSING = 0.65
 CORRELATION_MAX_ALLOWED = 0.85        # Açık pozisyonlarla bu korelasyonun üzerindeki adaylar elenir
 
 # ------------------------------------------------------------
@@ -140,6 +144,56 @@ COOLDOWN_HOURS = 4
 COOLDOWN_MS = COOLDOWN_HOURS * 60 * 60 * 1000
 
 FUNDING_SKIP_THRESHOLD = 0.0015
+
+# ------------------------------------------------------------
+# SIGNAL REJECTION / OPPORTUNITY FUNNEL DIAGNOSTICS
+# ------------------------------------------------------------
+DIAGNOSTIC_KEYS = [
+    "scanned", "invalid_symbol", "cooldown", "already_position", "data_missing",
+    "anomaly", "trend_neutral", "trend_weak", "momentum_conflict", "htf_conflict",
+    "funding", "no_setup", "pullback_unhealthy", "no_15m_reversal", "no_breakout",
+    "entry_chase", "invalid_atr", "setup_score_low", "trigger_score_low",
+    "trigger_confirmations", "expected_move", "btc_risk_adjusted", "pattern_none",
+    "pattern_BULL_FLAG", "pattern_BEAR_FLAG", "pattern_TOBO", "pattern_OBO",
+    "pattern_breakout", "pattern_rejected", "candidate_ready", "final_confirmation_rejected",
+    "opened"
+]
+signal_diagnostics = {k: 0 for k in DIAGNOSTIC_KEYS}
+
+
+def reset_signal_diagnostics():
+    for key in DIAGNOSTIC_KEYS:
+        signal_diagnostics[key] = 0
+
+
+def diag_inc(reason, amount=1):
+    signal_diagnostics[reason] = signal_diagnostics.get(reason, 0) + amount
+
+
+def log_signal_diagnostics():
+    logger.info("=" * 70)
+    logger.info("[HC DIAGNOSTICS] Opportunity Funnel")
+    logger.info("tarandı=%s | aday_hazır=%s | açılan=%s",
+                signal_diagnostics.get("scanned", 0),
+                signal_diagnostics.get("candidate_ready", 0),
+                signal_diagnostics.get("opened", 0))
+    logger.info("[HC DIAGNOSTICS] Pattern: BULL_FLAG=%s | BEAR_FLAG=%s | TOBO=%s | OBO=%s | pattern_breakout=%s",
+                signal_diagnostics.get("pattern_BULL_FLAG", 0),
+                signal_diagnostics.get("pattern_BEAR_FLAG", 0),
+                signal_diagnostics.get("pattern_TOBO", 0),
+                signal_diagnostics.get("pattern_OBO", 0),
+                signal_diagnostics.get("pattern_breakout", 0))
+    logger.info("[HC DIAGNOSTICS] Red nedenleri: no_setup=%s | trend_weak=%s | momentum_conflict=%s | htf_conflict=%s | funding=%s | no_breakout=%s | entry_chase=%s | setup_low=%s | trigger_low=%s | confirmations=%s | expected_move=%s",
+                signal_diagnostics.get("no_setup", 0), signal_diagnostics.get("trend_weak", 0),
+                signal_diagnostics.get("momentum_conflict", 0), signal_diagnostics.get("htf_conflict", 0),
+                signal_diagnostics.get("funding", 0), signal_diagnostics.get("no_breakout", 0),
+                signal_diagnostics.get("entry_chase", 0), signal_diagnostics.get("setup_score_low", 0),
+                signal_diagnostics.get("trigger_score_low", 0), signal_diagnostics.get("trigger_confirmations", 0),
+                signal_diagnostics.get("expected_move", 0))
+    logger.info("[HC DIAGNOSTICS] Final confirmation reject=%s | BTC risk-adjusted=%s",
+                signal_diagnostics.get("final_confirmation_rejected", 0),
+                signal_diagnostics.get("btc_risk_adjusted", 0))
+    logger.info("=" * 70)
 
 # ------------------------------------------------------------
 # Komisyon (tahmini net ROI hesaplaması için)  (YENİ)
@@ -1345,38 +1399,54 @@ def analyze_high_conviction(symbol, btc_regime=None):
     for tf in ["4h", "1h", "15m", "5m"]:
         df = fetch_ohlcv_closed(symbol, tf)
         if df is None:
+            diag_inc("data_missing")
             return None
         tf_data[tf] = enrich_dataframe(df)
 
     if detect_anomaly(tf_data["15m"]):
+        diag_inc("anomaly")
         return None
 
     trend4h = timeframe_trend(tf_data["4h"])
     trend1h = timeframe_trend(tf_data["1h"])
     mom1h = momentum_analysis(tf_data["1h"])
 
-    if trend1h["direction"] == "neutral" or trend1h["strength"] < 30:
+    if trend1h["direction"] == "neutral":
+        diag_inc("trend_neutral")
+        return None
+    if trend1h["strength"] < 30:
+        diag_inc("trend_weak")
         return None
     direction = trend1h["direction"]
     if mom1h["direction"] != "neutral" and mom1h["direction"] != direction and mom1h["strength"] >= 55:
+        diag_inc("momentum_conflict")
         return None
 
     setup_type = "continuation"
     if trend4h["direction"] != "neutral" and trend4h["direction"] != direction:
         if trend4h["strength"] >= 68:
+            diag_inc("htf_conflict")
             return None
         setup_type = "reversal"
 
+    # BTC artık işlem yönünü hard-reject etmez. Güçlü BTC rejimi yalnızca
+    # risk katsayısını ve dolayısıyla kullanılabilecek kaldıraç miktarını etkiler.
+    # Böylece BTC neutral iken bağımsız altcoin breakout/pattern fırsatları kaçmaz.
+    btc_risk_factor = BTC_RISK_FACTOR_NEUTRAL
+    btc_alignment = "neutral"
     if btc_regime and symbol != BTC_SYMBOL:
-        if (btc_regime["direction"] != "neutral" and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
-                and btc_regime["direction"] != direction):
-            return None
-    market_regime_ok = not (btc_regime and btc_regime["direction"] != "neutral"
-                            and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
-                            and btc_regime["direction"] != direction)
+        if btc_regime["direction"] == direction and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH:
+            btc_risk_factor = BTC_RISK_FACTOR_ALIGNED
+            btc_alignment = "aligned"
+        elif btc_regime["direction"] != "neutral" and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH:
+            btc_risk_factor = BTC_RISK_FACTOR_OPPOSING
+            btc_alignment = "opposing"
+            diag_inc("btc_risk_adjusted")
+    market_regime_ok = True
 
     funding = get_funding(symbol)
     if abs(funding) >= FUNDING_SKIP_THRESHOLD:
+        diag_inc("funding")
         return None
 
     # --------------------------------------------------------
@@ -1387,14 +1457,20 @@ def analyze_high_conviction(symbol, btc_regime=None):
     pattern = detect_chart_patterns(tf_data["15m"], direction)
 
     pattern_setup = bool(pattern.get("detected"))
+    if pattern_setup:
+        diag_inc("pattern_" + str(pattern.get("type")))
+    else:
+        diag_inc("pattern_none")
     valid_setup = pullback_quality.get("healthy") or pattern_setup
     if not valid_setup:
+        diag_inc("no_setup")
         return None
 
     momentum_reversal_15m = detect_momentum_reversal(tf_data["15m"], direction)
     # Patternlerde klasik 15M reversal zorunlu değil; patternin yapısı zaten
     # setup teyidini sağlıyor. Yine de mevcut momentum yönü güçlü şekilde tersse reddet.
     if not momentum_reversal_15m and not pattern_setup:
+        diag_inc("no_15m_reversal")
         return None
 
     # --------------------------------------------------------
@@ -1423,10 +1499,12 @@ def analyze_high_conviction(symbol, btc_regime=None):
             breakout_result = confirm_breakout_retest(tf_data["5m"], level, direction)
         breakout_type = breakout_result.get("type")
     elif pattern_breakout["confirmed"]:
+        diag_inc("pattern_breakout")
         level = pattern["break_level"]
         breakout_result = pattern_breakout
         breakout_type = pattern_breakout.get("type")
     else:
+        diag_inc("no_breakout")
         return None
 
     current_5m = tf_data["5m"].iloc[-1]
@@ -1436,10 +1514,12 @@ def analyze_high_conviction(symbol, btc_regime=None):
     volume_ratio = safe_float(current_5m["volume_ratio"], 1)
 
     if level is None or atr_val <= 0:
+        diag_inc("invalid_atr")
         return None
     distance_atr = abs(price - level) / atr_val
     atr_position_ok = distance_atr <= MAX_ENTRY_CHASE_ATR
     if not atr_position_ok:
+        diag_inc("entry_chase")
         return None
 
     # --------------------------------------------------------
@@ -1452,8 +1532,16 @@ def analyze_high_conviction(symbol, btc_regime=None):
         setup_score = max(setup_score, pattern.get("score", 0))
         setup_breakdown["chart_pattern"] = pattern.get("score", 0)
 
+    # BTC uyumu artık hard filter değil; yalnızca setup kalitesine küçük bir
+    # ağırlık verir. Neutral piyasada puan kırılmaz.
+    btc_setup_adjustment = 3 if btc_alignment == "aligned" else (-5 if btc_alignment == "opposing" else 0)
+    setup_score = clamp(setup_score + btc_setup_adjustment, 0, 100)
+    setup_breakdown["btc_risk_factor"] = btc_risk_factor
+    setup_breakdown["btc_adjustment"] = btc_setup_adjustment
+
     min_setup = PATTERN_MIN_SCORE if pattern_setup else (MIN_SETUP_SCORE + (3 if setup_type == "reversal" else 0))
     if setup_score < min_setup:
+        diag_inc("setup_score_low")
         return None
 
     trigger_score, trigger_breakdown, confirmations = calculate_trigger_score(
@@ -1468,19 +1556,25 @@ def analyze_high_conviction(symbol, btc_regime=None):
 
     min_trigger = PATTERN_MIN_TRIGGER_SCORE if pattern_setup else (MIN_TRIGGER_SCORE + (3 if setup_type == "reversal" else 0))
     if trigger_score < min_trigger:
+        diag_inc("trigger_score_low")
         return None
 
     # Klasik pullbackta 2 teyit yerine 1 güçlü trigger yeterli olabilir;
     # pattern breakoutunda ise breakout + en az bir momentum/RSI teyidi gerekir.
     if pattern_setup:
         if confirmations < 1 or not (momentum_accel.get("accelerating") or rsi_turning):
+            diag_inc("trigger_confirmations")
             return None
     elif confirmations < 1:
+        diag_inc("trigger_confirmations")
         return None
 
     leverage = calculate_leverage(setup_score, trigger_score, atr_pct)
+    if btc_risk_factor < 1.0:
+        leverage = max(MIN_LEVERAGE, int(math.floor(leverage * btc_risk_factor)))
     expected_move = calculate_expected_move(tf_data["1h"], direction, price, leverage)
     if not expected_move["sufficient"]:
+        diag_inc("expected_move")
         return None
 
     return {
@@ -1501,6 +1595,8 @@ def analyze_high_conviction(symbol, btc_regime=None):
         "structure_level": level,
         "leverage": leverage,
         "funding": funding,
+        "btc_risk_factor": btc_risk_factor,
+        "btc_alignment": btc_alignment,
         "expected_move": expected_move,
         "pullback_quality": pullback_quality,
         "trend4h": trend4h,
@@ -2056,7 +2152,7 @@ def open_position(candidate):
         "DRY RUN" if DRY_RUN else "REAL", direction.upper(), symbol,
         entry_price, stop_info["stop_price"], leverage, MARGIN_PER_TRADE,
         candidate["setup_score"], candidate["trigger_score"],
-        candidate["setup_type"], candidate["breakout_type"], candidate.get("chart_pattern")
+        candidate["setup_type"], candidate["breakout_type"], candidate.get("chart_pattern"), candidate.get("btc_risk_factor", 1.0)
     )
 
     return True
@@ -2492,6 +2588,7 @@ def final_entry_confirmation(candidate):
     try:
         df5 = fetch_ohlcv_closed(symbol, "5m", 100)
         if df5 is None:
+            diag_inc("data_missing")
             return False
 
         df5 = enrich_dataframe(df5)
@@ -2514,14 +2611,17 @@ def final_entry_confirmation(candidate):
             breakout_result = confirm_pattern_breakout(df5, pattern_stub, direction)
         else:
             logger.info("[ENTRY RED] %s yapı/pattern kırılımı artık geçerli değil.", symbol)
+            diag_inc("no_breakout")
             return False
 
         if not breakout_result["confirmed"]:
             logger.info("[ENTRY RED] %s breakout/pattern teyidi artık geçerli değil.", symbol)
+            diag_inc("no_breakout")
             return False
 
         if is_entry_chasing(df5, direction, level):
             logger.info("[ENTRY RED] %s fiyat kırılımdan çok uzaklaşmış (chase).", symbol)
+            diag_inc("entry_chase")
             return False
 
         # SMART TRIGGER: SETUP gevşek kalabilir; FIRE aşamasında en az bir
@@ -2555,6 +2655,7 @@ def final_entry_confirmation(candidate):
                 "[ENTRY RED] %s smart trigger zayıf | momentum=%s rsi=%s ema=%s",
                 symbol, momentum_accel_live.get("accelerating"), rsi_live_turn, ema_live_ok
             )
+            diag_inc("trigger_confirmations")
             return False
 
         # Breakout candle'ın bir önceki kapanışa göre gerçekten ivme ürettiğini
@@ -2567,11 +2668,13 @@ def final_entry_confirmation(candidate):
             price_accel_ok = last_close < prev_close
         if not price_accel_ok:
             logger.info("[ENTRY RED] %s breakout sonrası fiyat ivmesi yok.", symbol)
+            diag_inc("trigger_confirmations")
             return False
 
         funding = get_funding(symbol)
         if abs(funding) >= FUNDING_SKIP_THRESHOLD:
             logger.info("[ENTRY RED] %s funding aşırı.", symbol)
+            diag_inc("funding")
             return False
 
         return True
@@ -2589,11 +2692,15 @@ def analyze_candidates(symbols, btc_regime=None):
     candidates = []
 
     for symbol in symbols:
+        diag_inc("scanned")
         if not symbol_is_valid(symbol):
+            diag_inc("invalid_symbol")
             continue
         if is_on_cooldown(symbol):
+            diag_inc("cooldown")
             continue
         if has_local_symbol(symbol):
+            diag_inc("already_position")
             continue
 
         try:
@@ -2601,6 +2708,7 @@ def analyze_candidates(symbols, btc_regime=None):
 
             if result:
                 candidates.append(result)
+                diag_inc("candidate_ready")
 
                 logger.info(
                     "[HC] %s | %s | setup=%.1f | trigger=%.1f | confirm=%s | tip=%s/%s | pattern=%s | "
@@ -2639,10 +2747,10 @@ def try_open_from_candidates(candidates):
 
         logger.info(
             "[HC TEYİT DENENİYOR] %s | yön=%s | setup=%.1f | trigger=%.1f | "
-            "yapı_seviyesi=%s | tip=%s/%s | pattern=%s",
+            "yapı_seviyesi=%s | tip=%s/%s | pattern=%s | BTC_risk=%.2f",
             candidate["symbol"], candidate["direction"], candidate["setup_score"],
             candidate["trigger_score"], candidate["structure_level"],
-            candidate["setup_type"], candidate["breakout_type"], candidate.get("chart_pattern")
+            candidate["setup_type"], candidate["breakout_type"], candidate.get("chart_pattern"), candidate.get("btc_risk_factor", 1.0)
         )
 
         if final_entry_confirmation(candidate):
@@ -2655,7 +2763,9 @@ def try_open_from_candidates(candidates):
 
             if open_position(candidate):
                 opened_any = True
+                diag_inc("opened")
         else:
+            diag_inc("final_confirmation_rejected")
             logger.info("[HC RED] %s son teyidi geçemedi, sıradaki adaya geçiliyor.", candidate["symbol"])
 
     if not opened_any:
@@ -2717,6 +2827,7 @@ def analysis_cycle():
         logger.info("[HC] Uygun setup/trigger bulunamadı.")
 
     last_successful_analysis = datetime.now(timezone.utc).isoformat()
+    log_signal_diagnostics()
 
     logger.info("BOT ANALİZ BİTTİ")
     logger.info("=" * 70)
