@@ -104,6 +104,9 @@ FLAG_MIN_IMPULSE_ATR = 1.5   # Erken çıkış için gereken ters sinyal sayıs�
 INITIAL_STOP_ATR_MULTIPLIER = 1.8
 TRAILING_ATR_MULTIPLIER = 1.5
 MAX_ENTRY_CHASE_ATR = 1.8             # Kırılımdan bu kadar ATR uzaklaşmışsa artık "geç kalınmış" sayılır
+EARLY_TRIGGER_MAX_ATR = 1.20          # Breakout öncesi erken giriş için yapıya maksimum mesafe
+EARLY_TRIGGER_MIN_CONFIRMATIONS = 2   # Momentum/RSI/EMA/micro-structure içinden gereken teyit
+EARLY_TRIGGER_MIN_SCORE = 58           # Erken girişte klasik breakout skoru yerine daha düşük eşik
 
 # ------------------------------------------------------------
 # Aday sayısı / Likidite / BTC rejimi
@@ -1409,6 +1412,56 @@ def calculate_setup_score(direction, trend4h, trend1h, pullback_quality, atr_pct
 # TRIGGER SCORE  (5M giriş zamanlaması kalitesi)
 # ============================================================
 
+def evaluate_early_trigger(df5, direction, level):
+    """Breakout kapanmadan hemen önce başlayan hareketi yakalar.
+    Amaç breakout şartını körlemesine kaldırmak değil; fiyat yapıya yakınken
+    momentumun gerçekten dönmeye başladığı erken fazı kontrollü biçimde yakalamaktır.
+    En az iki bağımsız teyit gerekir ve fiyat yapıya 1.20 ATR'den fazla uzak olamaz.
+    """
+    try:
+        current = df5.iloc[-1]
+        atr = safe_float(current.get("atr"))
+        price = safe_float(current.get("close"))
+        if atr <= 0 or price <= 0 or level is None:
+            return {"eligible": False, "score": 0, "confirmations": 0, "distance_atr": None, "reasons": []}
+        distance_atr = abs(price - level) / atr
+        if distance_atr > EARLY_TRIGGER_MAX_ATR:
+            return {"eligible": False, "score": 0, "confirmations": 0, "distance_atr": distance_atr, "reasons": ["yapıdan uzak"]}
+
+        momentum = calculate_momentum_acceleration(df5, direction)
+        rsi = df5["rsi"].tail(4).values if "rsi" in df5.columns else []
+        rsi_turn = bool(len(rsi) >= 2 and ((rsi[-1] > rsi[-2]) if direction == "long" else (rsi[-1] < rsi[-2])))
+        ema9 = safe_float(current.get("ema9_slope"))
+        ema21 = safe_float(current.get("ema21_slope"))
+        ema_ok = ((ema9 > 0 and ema21 >= -abs(ema9) * 0.5) if direction == "long" else
+                  (ema9 < 0 and ema21 <= abs(ema9) * 0.5))
+        body = safe_float(current.get("close")) - safe_float(current.get("open"))
+        candle_ok = body > 0 if direction == "long" else body < 0
+
+        checks = {
+            "momentum": bool(momentum.get("accelerating")),
+            "rsi": rsi_turn,
+            "ema": ema_ok,
+            "candle": candle_ok,
+        }
+        confirmations = sum(checks.values())
+        score = 0
+        score += 30 if checks["momentum"] else 0
+        score += 22 if checks["rsi"] else 0
+        score += 16 if checks["ema"] else 0
+        score += 12 if checks["candle"] else 0
+        score += max(0, 20 - (distance_atr / EARLY_TRIGGER_MAX_ATR) * 20)
+        eligible = confirmations >= EARLY_TRIGGER_MIN_CONFIRMATIONS and score >= EARLY_TRIGGER_MIN_SCORE
+        reasons = [k for k, v in checks.items() if v]
+        return {"eligible": eligible, "score": round(clamp(score, 0, 100), 2),
+                "confirmations": confirmations, "distance_atr": distance_atr,
+                "reasons": reasons, "momentum": momentum, "rsi_turn": rsi_turn,
+                "ema_ok": ema_ok, "candle_ok": candle_ok}
+    except Exception as e:
+        logger.debug("early trigger değerlendirme hatası: %s", e)
+        return {"eligible": False, "score": 0, "confirmations": 0, "distance_atr": None, "reasons": []}
+
+
 def calculate_trigger_score(momentum_accel, rsi_turning, ema_slope_ok, structure_break, breakout_result, atr_position_ok):
     score = 0
     breakdown = {}
@@ -1581,9 +1634,20 @@ def analyze_high_conviction(symbol, btc_regime=None):
         breakout_result = pattern_breakout
         breakout_type = pattern_breakout.get("type")
     else:
-        diag_inc("no_breakout")
-        diag_reject(symbol, "no_breakout", "micro_structure/pattern breakout yok")
-        return None
+        # Breakout henüz kapanışla teyit edilmemişse erken momentum tetikleyicisini dene.
+        # Bu yol yalnızca setup geçerli, fiyat yapıya yakın ve en az iki bağımsız
+        # dönüş teyidi mevcut olduğunda devreye girer.
+        early = evaluate_early_trigger(tf_data["5m"], direction,
+                                       pattern.get("break_level") if pattern_setup and pattern.get("break_level") else structure_break.get("level"))
+        if early.get("eligible"):
+            level = pattern.get("break_level") if pattern_setup and pattern.get("break_level") else structure_break.get("level")
+            breakout_result = {"confirmed": True, "type": "early_momentum", "reasons": early.get("reasons", [])}
+            breakout_type = "early_momentum"
+            diag_stage(symbol, "EARLY_TRIGGER_OK", f"score={early['score']:.1f} confirm={early['confirmations']} distance_atr={early.get('distance_atr', 0):.2f} reasons={early.get('reasons', [])}")
+        else:
+            diag_inc("no_breakout")
+            diag_reject(symbol, "no_breakout", "micro_structure/pattern breakout yok; early trigger da yetersiz")
+            return None
 
     if breakout_result.get("confirmed"):
         diag_inc("breakout_confirmed")
@@ -2709,9 +2773,16 @@ def final_entry_confirmation(candidate):
         funding = get_funding(symbol)
 
         if not breakout_result.get("confirmed"):
-            reason = "BREAKOUT"
-            diag_inc("final_confirmation")
-            diag_inc("final_reason_breakout")
+            early = evaluate_early_trigger(df5, direction, level) if candidate.get("breakout_type") == "early_momentum" else {"eligible": False}
+            if early.get("eligible"):
+                breakout_result = {"confirmed": True, "type": "early_momentum", "reasons": early.get("reasons", [])}
+                diag_stage(symbol, "FINAL_EARLY_TRIGGER_OK", f"score={early['score']:.1f} confirm={early['confirmations']} distance_atr={early.get('distance_atr', 0):.2f}")
+            else:
+                reason = "BREAKOUT"
+                diag_inc("final_confirmation")
+                diag_inc("final_reason_breakout")
+        if not breakout_result.get("confirmed"):
+            pass
         elif is_entry_chasing(df5, direction, level):
             reason = "CHASE"
             diag_inc("final_confirmation")
