@@ -1778,14 +1778,15 @@ def close_real_position(key, reason, exit_price):
 
 def position_monitor_loop():
     while running:
-        time.sleep(POSITION_MONITOR_INTERVAL)
+       time.sleep(POSITION_MONITOR_INTERVAL)
         positions = get_local_positions()
         if not positions:
             continue
         sync_real_positions()
         for key, pos in positions.items():
             try:
-                price = fetch_current_price_fast(pos["symbol"])
+                # fetch_current_price_fast yerine fetch_current_price kullanılıyor
+                price = fetch_current_price(pos["symbol"])
                 if price <= 0:
                     continue
                 should_close, reason = should_close_position(pos, price)
