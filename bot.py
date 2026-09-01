@@ -16,27 +16,58 @@ from flask import Flask, jsonify
 # BINANCE FUTURES EARLY-MOMENTUM BOT
 # ============================================================
 #
-# GAINERS  : ilk 25
-# LOSERS   : ilk 25
+# COIN HAVUZU:
+#
+# GAINERS  : 10 - 35. sıralar
+# LOSERS   : 10 - 35. sıralar
 # VOLUME   : ilk 25
 #
 # BTC / XAU hariç
 #
-# Maksimum:
-#   2 açık pozisyon
+# Amaç:
+#   Hareket çok uzadıktan sonra kovalamak yerine
+#   hareketin başlangıcını / teyit aşamasını yakalamak.
+#
+# TEKNİK YAPI:
+#
+#   1m + 5m + 15m + 1h
+#   EMA
+#   RSI
+#   MACD
+#   ADX
+#   Bollinger
+#   ATR
+#   Volume
+#   ROC
+#   Ichimoku
+#   Fibonacci
+#   StochRSI
+#   Elder-Ray
+#   Breakout
+#   Breakout + Retest
+#   Score acceleration
+#   Momentum acceleration
+#   Move position
+#   Trend maturity
+#   Exhaustion detection
+#
+# POZİSYON:
+#
+#   Maksimum 2 açık pozisyon
 #   10 USDT margin / pozisyon
 #   maksimum 5x
+#   ISOLATED
+#   LONG / SHORT
 #
-# LONG / SHORT
+# YÖNETİM:
 #
-# 1m + 5m + 15m + 1h teyit
+#   Sürekli position monitor
+#   ATR trailing stop
+#   Momentum trailing
+#   Dynamic target ROI
+#   Hourly report
 #
-# ATR + momentum trailing stop
-#
-# DRY_RUN = TRUE
-#
-# EKLENDİ:
-#   SAATLİK İŞLEM ÖZET RAPORU
+# CRON YOKTUR.
 #
 # ============================================================
 
@@ -45,18 +76,38 @@ from flask import Flask, jsonify
 # CONFIG
 # ============================================================
 
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+DRY_RUN = os.getenv(
+    "DRY_RUN",
+    "true"
+).lower() == "true"
 
-API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+API_KEY = os.getenv(
+    "BINANCE_API_KEY",
+    ""
+)
+
+API_SECRET = os.getenv(
+    "BINANCE_API_SECRET",
+    ""
+)
+
+
+# TIMEFRAMES
 
 TIMEFRAME_FAST = "1m"
 TIMEFRAME_ENTRY = "5m"
 TIMEFRAME_CONFIRM = "15m"
 TIMEFRAME_TREND = "1h"
 
+
+# LOOP
+
 SCAN_INTERVAL = 20
+
 POSITION_MONITOR_INTERVAL = 1.0
+
+
+# POSITION
 
 MARGIN_PER_POSITION = 10.0
 
@@ -65,20 +116,42 @@ MIN_LEVERAGE = 2
 
 MAX_POSITIONS = 2
 
+
+# BASE SCORE
+
 MIN_LONG_SCORE = 72
 MIN_SHORT_SCORE = 72
 
 EARLY_ENTRY_SCORE = 76
 
+
+# FUNDING
+
 MAX_ABS_FUNDING = 0.0015
 
+
+# COOLDOWN
+
 COOLDOWN_MINUTES = 60
+
+
+# MARKET FILTERS
 
 MIN_QUOTE_VOLUME = 2_000_000
 
 MAX_SPREAD_PERCENT = 0.15
 
+
+# ATR
+
+MIN_ATR_PERCENT = 0.08
+MAX_ATR_PERCENT = 8.0
+
+
+# TRAILING
+
 MIN_PROFIT_TO_TRAIL = 0.004
+
 HARD_STOP_ATR = 1.8
 
 TRAIL_ATR_MULTIPLIER = 1.35
@@ -88,30 +161,93 @@ TRAIL_LEVEL_1 = 0.008
 TRAIL_LEVEL_2 = 0.015
 TRAIL_LEVEL_3 = 0.025
 
+
+# EMERGENCY
+
 EMERGENCY_REVERSE_THRESHOLD = 0.007
+
+
+# CORRELATION
 
 MAX_CORRELATED_SIDE = 2
 
+
+# CACHE
+
 OHLCV_CACHE_SECONDS = 12
+
+
+# DETAILED ANALYSIS
 
 MAX_DETAILED_CANDIDATES = 45
 
-LIST_LIMIT = 25
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ============================================================
+# COIN LIST SETTINGS
+# ============================================================
+
+# GAINERS:
+# 10. sıradan 35. sıraya kadar
+GAINER_START_RANK = 10
+GAINER_END_RANK = 35
+
+
+# LOSERS:
+# 10. sıradan 35. sıraya kadar
+LOSER_START_RANK = 10
+LOSER_END_RANK = 35
+
+
+# 24H VOLUME:
+# İlk 25 aynı kalıyor.
+VOLUME_LIMIT = 25
 
 
 # ============================================================
-# HOURLY REPORT SETTINGS
+# SCORE HISTORY
 # ============================================================
 
-# Rapor tam saat başlarında yazılır.
+SCORE_HISTORY_LENGTH = 6
+
+MOMENTUM_HISTORY_LENGTH = 6
+
+SIGNAL_HISTORY_TTL = 6 * 60 * 60
+
+
+# ============================================================
+# EARLY ENTRY SETTINGS
+# ============================================================
+
+EARLY_SCORE_MIN = 68
+
+EARLY_ACCELERATION_MIN = 2.5
+
+EARLY_MOMENTUM_ACCELERATION_MIN = 0.8
+
+EARLY_CONFIRMATION_SCORE = 4
+
+
+# ============================================================
+# EXHAUSTION SETTINGS
+# ============================================================
+
+EXHAUSTION_SCORE_PENALTY = 14
+
+MATURE_TREND_PENALTY = 6
+
+LATE_MOVE_POSITION = 0.82
+
+VERY_LATE_MOVE_POSITION = 0.90
+
+
+# ============================================================
+# HOURLY REPORT
+# ============================================================
+
 HOURLY_REPORT_ENABLED = True
 
-# Kaç işlem geçmişte tutulacak
 MAX_TRADE_HISTORY = 1000
 
-# Raporun saat başına ne kadar yakın çalışacağı
 HOURLY_REPORT_INTERVAL = 5
 
 
@@ -119,12 +255,23 @@ HOURLY_REPORT_INTERVAL = 5
 # LOGGING
 # ============================================================
 
+LOG_LEVEL = os.getenv(
+    "LOG_LEVEL",
+    "INFO"
+).upper()
+
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO
+    ),
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("EARLY_MOMENTUM_BOT")
+logger = logging.getLogger(
+    "EARLY_MOMENTUM_BOT"
+)
 
 
 # ============================================================
@@ -141,9 +288,7 @@ app = Flask(__name__)
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
-
     "enableRateLimit": True,
-
     "options": {
         "defaultType": "future",
         "adjustForTimeDifference": True,
@@ -169,17 +314,40 @@ last_scan_time = None
 
 last_hourly_report_hour = None
 
-bot_started_at = datetime.now(timezone.utc).isoformat()
+bot_started_at = (
+    datetime.now(
+        timezone.utc
+    ).isoformat()
+)
 
+
+# ============================================================
+# SCORE / MOMENTUM HISTORY
+# ============================================================
+
+score_history = {}
+
+momentum_history = {}
+
+signal_state_lock = threading.RLock()
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
 
 stats = {
+
     "scans": 0,
+
     "signals": 0,
 
     "simulated_entries": 0,
+
     "simulated_exits": 0,
 
     "wins": 0,
+
     "losses": 0,
 
     "total_realized_pnl": 0.0,
@@ -195,38 +363,78 @@ stats = {
 # ============================================================
 
 def now_utc():
-    return datetime.now(timezone.utc)
+
+    return datetime.now(
+        timezone.utc
+    )
 
 
-def safe_float(value, default=0.0):
+def safe_float(
+    value,
+    default=0.0
+):
+
     try:
+
         if value is None:
             return default
 
-        return float(value)
+        value = float(value)
+
+        if not math.isfinite(value):
+            return default
+
+        return value
 
     except Exception:
+
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def clamp(
+    value,
+    low,
+    high
+):
+
+    return max(
+        low,
+        min(
+            high,
+            value
+        )
+    )
 
 
-def pct_change(a, b):
+def pct_change(
+    a,
+    b
+):
 
     if not a:
         return 0.0
 
-    return ((b - a) / a) * 100.0
+    return (
+        (b - a)
+        /
+        a
+    ) * 100.0
 
 
-def symbol_clean(symbol):
+def symbol_clean(
+    symbol
+):
 
     return (
         symbol
-        .replace("/", "")
-        .replace(":USDT", "")
+        .replace(
+            "/",
+            ""
+        )
+        .replace(
+            ":USDT",
+            ""
+        )
     )
 
 
@@ -234,7 +442,10 @@ def symbol_clean(symbol):
 # DURATION
 # ============================================================
 
-def calculate_duration_seconds(opened_at, closed_at):
+def calculate_duration_seconds(
+    opened_at,
+    closed_at
+):
 
     try:
 
@@ -248,7 +459,9 @@ def calculate_duration_seconds(opened_at, closed_at):
 
         return max(
             0,
-            (end - start).total_seconds()
+            (
+                end - start
+            ).total_seconds()
         )
 
     except Exception:
@@ -256,20 +469,31 @@ def calculate_duration_seconds(opened_at, closed_at):
         return 0
 
 
-def format_duration(seconds):
+def format_duration(
+    seconds
+):
 
-    seconds = int(max(0, seconds))
+    seconds = int(
+        max(
+            0,
+            seconds
+        )
+    )
 
     days = seconds // 86400
+
     seconds %= 86400
 
     hours = seconds // 3600
+
     seconds %= 3600
 
     minutes = seconds // 60
+
     seconds %= 60
 
     if days > 0:
+
         return (
             f"{days}g "
             f"{hours}s "
@@ -277,6 +501,7 @@ def format_duration(seconds):
         )
 
     if hours > 0:
+
         return (
             f"{hours}s "
             f"{minutes}dk "
@@ -284,6 +509,7 @@ def format_duration(seconds):
         )
 
     if minutes > 0:
+
         return (
             f"{minutes}dk "
             f"{seconds}sn"
@@ -296,7 +522,10 @@ def format_duration(seconds):
 # SYMBOL FILTER
 # ============================================================
 
-def valid_symbol(symbol, market=None):
+def valid_symbol(
+    symbol,
+    market=None
+):
 
     try:
 
@@ -309,20 +538,29 @@ def valid_symbol(symbol, market=None):
             return False
 
         banned = [
+
             "BTC/USDT",
+
             "XAU/USDT",
+
             "XAUT/USDT",
+
             "BTCDOM",
+
             "UP/",
+
             "DOWN/",
+
             "BULL/",
+
             "BEAR/",
+
             "_",
         ]
 
-        for x in banned:
+        for item in banned:
 
-            if x in s:
+            if item in s:
                 return False
 
         if market:
@@ -404,7 +642,9 @@ def get_futures_tickers():
             )
 
             last = safe_float(
-                ticker.get("last")
+                ticker.get(
+                    "last"
+                )
             )
 
             percentage = safe_float(
@@ -414,11 +654,15 @@ def get_futures_tickers():
             )
 
             bid = safe_float(
-                ticker.get("bid")
+                ticker.get(
+                    "bid"
+                )
             )
 
             ask = safe_float(
-                ticker.get("ask")
+                ticker.get(
+                    "ask"
+                )
             )
 
             if last <= 0:
@@ -432,31 +676,65 @@ def get_futures_tickers():
             if bid > 0 and ask > 0:
 
                 spread = (
-                    (ask - bid)
+                    (
+                        ask - bid
+                    )
                     /
-                    ((ask + bid) / 2)
+                    (
+                        (ask + bid) / 2
+                    )
                 ) * 100
 
-            if spread > MAX_SPREAD_PERCENT:
+            if (
+                spread
+                >
+                MAX_SPREAD_PERCENT
+            ):
                 continue
 
             result[symbol] = {
-                "symbol": symbol,
-                "last": last,
-                "percentage": percentage,
-                "quoteVolume": quote_volume,
-                "bid": bid,
-                "ask": ask,
-                "spread": spread,
-                "high": safe_float(
-                    ticker.get("high")
-                ),
-                "low": safe_float(
-                    ticker.get("low")
-                ),
-                "open": safe_float(
-                    ticker.get("open")
-                ),
+
+                "symbol":
+                    symbol,
+
+                "last":
+                    last,
+
+                "percentage":
+                    percentage,
+
+                "quoteVolume":
+                    quote_volume,
+
+                "bid":
+                    bid,
+
+                "ask":
+                    ask,
+
+                "spread":
+                    spread,
+
+                "high":
+                    safe_float(
+                        ticker.get(
+                            "high"
+                        )
+                    ),
+
+                "low":
+                    safe_float(
+                        ticker.get(
+                            "low"
+                        )
+                    ),
+
+                "open":
+                    safe_float(
+                        ticker.get(
+                            "open"
+                        )
+                    ),
             }
 
         return result
@@ -475,7 +753,9 @@ def get_futures_tickers():
 # RANK LISTS
 # ============================================================
 
-def build_rank_lists(tickers):
+def build_rank_lists(
+    tickers
+):
 
     data = list(
         tickers.values()
@@ -483,22 +763,55 @@ def build_rank_lists(tickers):
 
     gainers = sorted(
         data,
-        key=lambda x: x["percentage"],
+        key=lambda x:
+            x["percentage"],
         reverse=True
-    )[:LIST_LIMIT]
+    )
 
     losers = sorted(
         data,
-        key=lambda x: x["percentage"]
-    )[:LIST_LIMIT]
+        key=lambda x:
+            x["percentage"]
+    )
 
     volumes = sorted(
         data,
-        key=lambda x: x["quoteVolume"],
+        key=lambda x:
+            x["quoteVolume"],
         reverse=True
-    )[:LIST_LIMIT]
+    )
 
-    return gainers, losers, volumes
+    # --------------------------------------------------------
+    # ÖNEMLİ:
+    #
+    # Gainers ilk 25 DEĞİL.
+    # 10 - 35 arası.
+    #
+    # Losers ilk 25 DEĞİL.
+    # 10 - 35 arası.
+    #
+    # Volume ilk 25 olarak kalıyor.
+    # --------------------------------------------------------
+
+    gainers = gainers[
+        GAINER_START_RANK - 1:
+        GAINER_END_RANK
+    ]
+
+    losers = losers[
+        LOSER_START_RANK - 1:
+        LOSER_END_RANK
+    ]
+
+    volumes = volumes[
+        :VOLUME_LIMIT
+    ]
+
+    return (
+        gainers,
+        losers,
+        volumes
+    )
 
 
 # ============================================================
@@ -513,29 +826,49 @@ def build_candidate_pool(
 
     candidates = {}
 
-    def add(items, source):
+    def add(
+        items,
+        source,
+        rank_offset
+    ):
 
-        for rank, item in enumerate(
+        for index, item in enumerate(
             items,
-            start=1
+            start=rank_offset
         ):
 
-            symbol = item["symbol"]
+            symbol = item[
+                "symbol"
+            ]
 
             if symbol not in candidates:
 
                 candidates[symbol] = {
-                    "symbol": symbol,
-                    "sources": [],
-                    "gainer_rank": None,
-                    "loser_rank": None,
-                    "volume_rank": None,
-                    "ticker": item,
+
+                    "symbol":
+                        symbol,
+
+                    "sources":
+                        [],
+
+                    "gainer_rank":
+                        None,
+
+                    "loser_rank":
+                        None,
+
+                    "volume_rank":
+                        None,
+
+                    "ticker":
+                        item,
                 }
 
             candidates[
                 symbol
-            ]["sources"].append(
+            ][
+                "sources"
+            ].append(
                 source
             )
 
@@ -543,33 +876,42 @@ def build_candidate_pool(
 
                 candidates[
                     symbol
-                ]["gainer_rank"] = rank
+                ][
+                    "gainer_rank"
+                ] = index
 
             elif source == "LOSER":
 
                 candidates[
                     symbol
-                ]["loser_rank"] = rank
+                ][
+                    "loser_rank"
+                ] = index
 
             elif source == "VOLUME":
 
                 candidates[
                     symbol
-                ]["volume_rank"] = rank
+                ][
+                    "volume_rank"
+                ] = index
 
     add(
         gainers,
-        "GAINER"
+        "GAINER",
+        GAINER_START_RANK
     )
 
     add(
         losers,
-        "LOSER"
+        "LOSER",
+        LOSER_START_RANK
     )
 
     add(
         volumes,
-        "VOLUME"
+        "VOLUME",
+        1
     )
 
     return candidates
@@ -582,7 +924,7 @@ def build_candidate_pool(
 def fetch_ohlcv_cached(
     symbol,
     timeframe,
-    limit=160
+    limit=260
 ):
 
     key = (
@@ -658,7 +1000,9 @@ def fetch_ohlcv_cached(
             )
         )
 
-        ohlcv_cache[key] = (
+        ohlcv_cache[
+            key
+        ] = (
             current,
             df
         )
@@ -747,21 +1091,25 @@ def atr(
 ):
 
     high = df["high"]
+
     low = df["low"]
+
     close = df["close"]
 
-    previous_close = (
-        close.shift(1)
+    previous_close = close.shift(
+        1
     )
 
     tr = pd.concat(
         [
             high - low,
+
             (
                 high
                 -
                 previous_close
             ).abs(),
+
             (
                 low
                 -
@@ -769,7 +1117,9 @@ def atr(
             ).abs(),
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return tr.ewm(
         alpha=1 / period,
@@ -778,7 +1128,9 @@ def atr(
     ).mean()
 
 
-def macd(series):
+def macd(
+    series
+):
 
     fast = ema(
         series,
@@ -798,7 +1150,9 @@ def macd(series):
     )
 
     histogram = (
-        line - signal
+        line
+        -
+        signal
     )
 
     return (
@@ -816,13 +1170,17 @@ def bollinger(
 
     mid = (
         series
-        .rolling(period)
+        .rolling(
+            period
+        )
         .mean()
     )
 
     std = (
         series
-        .rolling(period)
+        .rolling(
+            period
+        )
         .std()
     )
 
@@ -851,23 +1209,20 @@ def adx(
 ):
 
     high = df["high"]
+
     low = df["low"]
+
     close = df["close"]
 
     up_move = high.diff()
+
     down_move = -low.diff()
 
     plus_dm = np.where(
         (
-            up_move
-            >
-            down_move
-        )
-        &
-        (
-            up_move
-            >
-            0
+            (up_move > down_move)
+            &
+            (up_move > 0)
         ),
         up_move,
         0
@@ -875,15 +1230,9 @@ def adx(
 
     minus_dm = np.where(
         (
-            down_move
-            >
-            up_move
-        )
-        &
-        (
-            down_move
-            >
-            0
+            (down_move > up_move)
+            &
+            (down_move > 0)
         ),
         down_move,
         0
@@ -910,7 +1259,9 @@ def adx(
             tr3
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     atr_val = tr.ewm(
         alpha=1 / period,
@@ -923,12 +1274,10 @@ def adx(
         pd.Series(
             plus_dm,
             index=df.index
-        )
-        .ewm(
+        ).ewm(
             alpha=1 / period,
             adjust=False
-        )
-        .mean()
+        ).mean()
         /
         atr_val
     )
@@ -939,12 +1288,10 @@ def adx(
         pd.Series(
             minus_dm,
             index=df.index
-        )
-        .ewm(
+        ).ewm(
             alpha=1 / period,
             adjust=False
-        )
-        .mean()
+        ).mean()
         /
         atr_val
     )
@@ -975,19 +1322,620 @@ def adx(
 
 
 # ============================================================
+# ICHIMOKU
+# ============================================================
+
+def calculate_ichimoku(
+    df
+):
+
+    high = df["high"]
+
+    low = df["low"]
+
+    conversion_high = (
+        high
+        .rolling(9)
+        .max()
+    )
+
+    conversion_low = (
+        low
+        .rolling(9)
+        .min()
+    )
+
+    base_high = (
+        high
+        .rolling(26)
+        .max()
+    )
+
+    base_low = (
+        low
+        .rolling(26)
+        .min()
+    )
+
+    span_b_high = (
+        high
+        .rolling(52)
+        .max()
+    )
+
+    span_b_low = (
+        low
+        .rolling(52)
+        .min()
+    )
+
+    tenkan = (
+        conversion_high
+        +
+        conversion_low
+    ) / 2
+
+    kijun = (
+        base_high
+        +
+        base_low
+    ) / 2
+
+    span_a = (
+        (
+            tenkan
+            +
+            kijun
+        ) / 2
+    ).shift(26)
+
+    span_b = (
+        (
+            span_b_high
+            +
+            span_b_low
+        ) / 2
+    ).shift(26)
+
+    return (
+        tenkan,
+        kijun,
+        span_a,
+        span_b
+    )
+
+
+# ============================================================
+# STOCH RSI
+# ============================================================
+
+def calculate_stoch_rsi(
+    rsi_series,
+    period=14,
+    smooth_k=3,
+    smooth_d=3
+):
+
+    lowest = (
+        rsi_series
+        .rolling(
+            period
+        )
+        .min()
+    )
+
+    highest = (
+        rsi_series
+        .rolling(
+            period
+        )
+        .max()
+    )
+
+    denominator = (
+        highest
+        -
+        lowest
+    ).replace(
+        0,
+        np.nan
+    )
+
+    stoch = (
+        (
+            rsi_series
+            -
+            lowest
+        )
+        /
+        denominator
+    ) * 100
+
+    k = (
+        stoch
+        .rolling(
+            smooth_k
+        )
+        .mean()
+    )
+
+    d = (
+        k
+        .rolling(
+            smooth_d
+        )
+        .mean()
+    )
+
+    return (
+        stoch.fillna(50),
+        k.fillna(50),
+        d.fillna(50)
+    )
+
+
+# ============================================================
+# ELDER RAY
+# ============================================================
+
+def calculate_elder_ray(
+    df
+):
+
+    ema13 = ema(
+        df["close"],
+        13
+    )
+
+    bull_power = (
+        df["high"]
+        -
+        ema13
+    )
+
+    bear_power = (
+        df["low"]
+        -
+        ema13
+    )
+
+    return (
+        bull_power,
+        bear_power
+    )
+
+
+# ============================================================
+# FIBONACCI
+# ============================================================
+
+def calculate_fibonacci(
+    df,
+    lookback=100
+):
+
+    data = df.tail(
+        lookback
+    )
+
+    swing_high = safe_float(
+        data["high"].max()
+    )
+
+    swing_low = safe_float(
+        data["low"].min()
+    )
+
+    if (
+        swing_high <= 0
+        or
+        swing_low <= 0
+        or
+        swing_high <= swing_low
+    ):
+
+        return {
+
+            "swing_high":
+                swing_high,
+
+            "swing_low":
+                swing_low,
+
+            "range":
+                0.0,
+
+            "position":
+                0.5,
+
+            "fib382":
+                swing_high,
+
+            "fib500":
+                swing_high,
+
+            "fib618":
+                swing_high,
+
+            "fib786":
+                swing_high,
+        }
+
+    price = safe_float(
+        df["close"].iloc[-1]
+    )
+
+    move_range = (
+        swing_high
+        -
+        swing_low
+    )
+
+    position = (
+        price
+        -
+        swing_low
+    ) / move_range
+
+    fib382 = (
+        swing_high
+        -
+        move_range * 0.382
+    )
+
+    fib500 = (
+        swing_high
+        -
+        move_range * 0.500
+    )
+
+    fib618 = (
+        swing_high
+        -
+        move_range * 0.618
+    )
+
+    fib786 = (
+        swing_high
+        -
+        move_range * 0.786
+    )
+
+    return {
+
+        "swing_high":
+            swing_high,
+
+        "swing_low":
+            swing_low,
+
+        "range":
+            move_range,
+
+        "position":
+            clamp(
+                position,
+                0,
+                1
+            ),
+
+        "fib382":
+            fib382,
+
+        "fib500":
+            fib500,
+
+        "fib618":
+            fib618,
+
+        "fib786":
+            fib786,
+    }
+
+
+# ============================================================
+# BREAKOUT / RETEST
+# ============================================================
+
+def calculate_breakout_state(
+    df
+):
+
+    if len(df) < 25:
+
+        return {
+
+            "bull_breakout":
+                False,
+
+            "bear_breakout":
+                False,
+
+            "bull_retest":
+                False,
+
+            "bear_retest":
+                False,
+
+            "breakout_strength":
+                0.0,
+
+            "breakout_level":
+                0.0,
+        }
+
+    current = df.iloc[-1]
+
+    previous = df.iloc[-2]
+
+    high20 = safe_float(
+        current["high20"]
+    )
+
+    low20 = safe_float(
+        current["low20"]
+    )
+
+    bull_breakout = (
+        high20 > 0
+        and
+        current["close"]
+        >
+        high20
+    )
+
+    bear_breakout = (
+        low20 > 0
+        and
+        current["close"]
+        <
+        low20
+    )
+
+    bull_retest = False
+
+    bear_retest = False
+
+    breakout_level = 0.0
+
+    # --------------------------------------------------------
+    # Bullish breakout
+    # --------------------------------------------------------
+
+    if high20 > 0:
+
+        recent_breakout = (
+            df["close"]
+            .iloc[-6:-2]
+            >
+            df["high20"]
+            .iloc[-6:-2]
+        ).any()
+
+        if recent_breakout:
+
+            tolerance = (
+                current["atr"]
+                * 0.65
+            )
+
+            bull_retest = (
+                current["low"]
+                <=
+                high20
+                +
+                tolerance
+                and
+                current["close"]
+                >
+                high20
+            )
+
+            if bull_retest:
+
+                breakout_level = high20
+
+    # --------------------------------------------------------
+    # Bearish breakout
+    # --------------------------------------------------------
+
+    if low20 > 0:
+
+        recent_breakdown = (
+            df["close"]
+            .iloc[-6:-2]
+            <
+            df["low20"]
+            .iloc[-6:-2]
+        ).any()
+
+        if recent_breakdown:
+
+            tolerance = (
+                current["atr"]
+                * 0.65
+            )
+
+            bear_retest = (
+                current["high"]
+                >=
+                low20
+                -
+                tolerance
+                and
+                current["close"]
+                <
+                low20
+            )
+
+            if bear_retest:
+
+                breakout_level = low20
+
+    body_ratio = safe_float(
+        current["body_ratio"]
+    )
+
+    volume_ratio = safe_float(
+        current["volume_ratio"],
+        1.0
+    )
+
+    breakout_strength = clamp(
+        (
+            body_ratio * 0.5
+            +
+            min(
+                volume_ratio / 2,
+                1.0
+            ) * 0.5
+        ),
+        0,
+        1
+    )
+
+    return {
+
+        "bull_breakout":
+            bull_breakout,
+
+        "bear_breakout":
+            bear_breakout,
+
+        "bull_retest":
+            bull_retest,
+
+        "bear_retest":
+            bear_retest,
+
+        "breakout_strength":
+            breakout_strength,
+
+        "breakout_level":
+            breakout_level,
+
+        "previous_close":
+            safe_float(
+                previous["close"]
+            ),
+    }
+
+
+# ============================================================
+# TREND MATURITY
+# ============================================================
+
+def calculate_trend_maturity(
+    df,
+    side
+):
+
+    if len(df) < 40:
+
+        return 0
+
+    recent = df.tail(
+        40
+    )
+
+    count = 0
+
+    for _, row in recent.iloc[::-1].iterrows():
+
+        price = safe_float(
+            row["close"]
+        )
+
+        ema21 = safe_float(
+            row["ema21"]
+        )
+
+        ema50 = safe_float(
+            row["ema50"]
+        )
+
+        span_a = safe_float(
+            row["ichimoku_span_a"],
+            np.nan
+        )
+
+        span_b = safe_float(
+            row["ichimoku_span_b"],
+            np.nan
+        )
+
+        cloud_top = max(
+            span_a,
+            span_b
+        )
+
+        cloud_bottom = min(
+            span_a,
+            span_b
+        )
+
+        if not math.isfinite(
+            cloud_top
+        ):
+            break
+
+        if not math.isfinite(
+            cloud_bottom
+        ):
+            break
+
+        if side == "LONG":
+
+            aligned = (
+                price > cloud_top
+                and
+                ema21 > ema50
+            )
+
+        else:
+
+            aligned = (
+                price < cloud_bottom
+                and
+                ema21 < ema50
+            )
+
+        if aligned:
+
+            count += 1
+
+        else:
+
+            break
+
+    return int(
+        clamp(
+            count,
+            0,
+            40
+        )
+    )
+
+
+# ============================================================
 # INDICATOR FRAME
 # ============================================================
 
-def calculate_indicators(df):
+def calculate_indicators(
+    df
+):
 
     if (
         df is None
         or
         len(df) < 80
     ):
+
         return None
 
     x = df.copy()
+
+    # EMA
 
     x["ema9"] = ema(
         x["close"],
@@ -1009,11 +1957,19 @@ def calculate_indicators(df):
         200
     )
 
+    # RSI
+
     x["rsi"] = rsi(
         x["close"]
     )
 
-    x["atr"] = atr(x)
+    # ATR
+
+    x["atr"] = atr(
+        x
+    )
+
+    # MACD
 
     (
         macd_line,
@@ -1024,10 +1980,18 @@ def calculate_indicators(df):
     )
 
     x["macd"] = macd_line
+
     x["macd_signal"] = macd_signal
+
     x["macd_hist"] = macd_hist
 
-    x["adx"] = adx(x)
+    # ADX
+
+    x["adx"] = adx(
+        x
+    )
+
+    # Bollinger
 
     (
         bb_mid,
@@ -1038,8 +2002,12 @@ def calculate_indicators(df):
     )
 
     x["bb_mid"] = bb_mid
+
     x["bb_upper"] = bb_upper
+
     x["bb_lower"] = bb_lower
+
+    # Volume
 
     x["volume_ma20"] = (
         x["volume"]
@@ -1057,6 +2025,8 @@ def calculate_indicators(df):
         )
     )
 
+    # ROC
+
     x["roc5"] = (
         x["close"]
         .pct_change(5)
@@ -1068,6 +2038,14 @@ def calculate_indicators(df):
         .pct_change(10)
         * 100
     )
+
+    x["roc20"] = (
+        x["close"]
+        .pct_change(20)
+        * 100
+    )
+
+    # Breakout levels
 
     x["high20"] = (
         x["high"]
@@ -1097,6 +2075,8 @@ def calculate_indicators(df):
         .shift(1)
     )
 
+    # Candle
+
     x["range"] = (
         x["high"]
         -
@@ -1119,6 +2099,8 @@ def calculate_indicators(df):
         )
     )
 
+    # Bollinger width
+
     x["bb_width"] = (
         (
             x["bb_upper"]
@@ -1133,6 +2115,128 @@ def calculate_indicators(df):
         )
     )
 
+    # --------------------------------------------------------
+    # ICHIMOKU
+    # --------------------------------------------------------
+
+    (
+        tenkan,
+        kijun,
+        span_a,
+        span_b
+    ) = calculate_ichimoku(
+        x
+    )
+
+    x[
+        "ichimoku_tenkan"
+    ] = tenkan
+
+    x[
+        "ichimoku_kijun"
+    ] = kijun
+
+    x[
+        "ichimoku_span_a"
+    ] = span_a
+
+    x[
+        "ichimoku_span_b"
+    ] = span_b
+
+    x[
+        "ichimoku_cloud_top"
+    ] = pd.concat(
+        [
+            span_a,
+            span_b
+        ],
+        axis=1
+    ).max(
+        axis=1
+    )
+
+    x[
+        "ichimoku_cloud_bottom"
+    ] = pd.concat(
+        [
+            span_a,
+            span_b
+        ],
+        axis=1
+    ).min(
+        axis=1
+    )
+
+    # --------------------------------------------------------
+    # STOCH RSI
+    # --------------------------------------------------------
+
+    (
+        stoch_rsi,
+        stoch_k,
+        stoch_d
+    ) = calculate_stoch_rsi(
+        x["rsi"]
+    )
+
+    x["stoch_rsi"] = stoch_rsi
+
+    x["stoch_k"] = stoch_k
+
+    x["stoch_d"] = stoch_d
+
+    # --------------------------------------------------------
+    # ELDER RAY
+    # --------------------------------------------------------
+
+    (
+        bull_power,
+        bear_power
+    ) = calculate_elder_ray(
+        x
+    )
+
+    x["bull_power"] = bull_power
+
+    x["bear_power"] = bear_power
+
+    # --------------------------------------------------------
+    # MOMENTUM DERIVATIVES
+    # --------------------------------------------------------
+
+    x[
+        "roc5_acceleration"
+    ] = (
+        x["roc5"]
+        -
+        x["roc5"].shift(1)
+    )
+
+    x[
+        "macd_acceleration"
+    ] = (
+        x["macd_hist"]
+        -
+        x["macd_hist"].shift(1)
+    )
+
+    x[
+        "rsi_acceleration"
+    ] = (
+        x["rsi"]
+        -
+        x["rsi"].shift(1)
+    )
+
+    x[
+        "volume_acceleration"
+    ] = (
+        x["volume_ratio"]
+        -
+        x["volume_ratio"].shift(1)
+    )
+
     return x
 
 
@@ -1140,49 +2244,448 @@ def calculate_indicators(df):
 # CANDLE QUALITY
 # ============================================================
 
-def bullish_reversal(df):
+def bullish_reversal(
+    df
+):
 
     if len(df) < 3:
         return False
 
     a = df.iloc[-2]
+
     b = df.iloc[-1]
 
     return (
+
         a["close"]
         <
         a["open"]
+
         and
+
         b["close"]
         >
         b["open"]
+
         and
+
         b["close"]
         >
         a["open"]
     )
 
 
-def bearish_reversal(df):
+def bearish_reversal(
+    df
+):
 
     if len(df) < 3:
         return False
 
     a = df.iloc[-2]
+
     b = df.iloc[-1]
 
     return (
+
         a["close"]
         >
         a["open"]
+
         and
+
         b["close"]
         <
         b["open"]
+
         and
+
         b["close"]
         <
         a["open"]
+    )
+
+
+# ============================================================
+# SIGNAL MOMENTUM
+# ============================================================
+
+def calculate_momentum_metric(
+    df
+):
+
+    a = df.iloc[-1]
+
+    values = [
+
+        safe_float(
+            a["roc5"]
+        ),
+
+        safe_float(
+            a["roc10"]
+        ) / 2,
+
+        safe_float(
+            a["macd_hist"]
+        ),
+
+        safe_float(
+            a["rsi_acceleration"]
+        ) / 10,
+
+        safe_float(
+            a["volume_acceleration"]
+        ),
+    ]
+
+    return float(
+        np.nanmean(
+            values
+        )
+    )
+
+
+# ============================================================
+# SCORE HISTORY
+# ============================================================
+
+def update_signal_history(
+    symbol,
+    side,
+    score,
+    momentum
+):
+
+    key = (
+        symbol,
+        side
+    )
+
+    current_time = time.time()
+
+    with signal_state_lock:
+
+        if key not in score_history:
+
+            score_history[key] = []
+
+        if key not in momentum_history:
+
+            momentum_history[key] = []
+
+        score_history[
+            key
+        ].append(
+            (
+                current_time,
+                float(score)
+            )
+        )
+
+        momentum_history[
+            key
+        ].append(
+            (
+                current_time,
+                float(momentum)
+            )
+        )
+
+        score_history[
+            key
+        ] = [
+            x
+            for x in score_history[key]
+            if (
+                current_time - x[0]
+            )
+            <= SIGNAL_HISTORY_TTL
+        ][
+            -SCORE_HISTORY_LENGTH:
+        ]
+
+        momentum_history[
+            key
+        ] = [
+            x
+            for x in momentum_history[key]
+            if (
+                current_time - x[0]
+            )
+            <= SIGNAL_HISTORY_TTL
+        ][
+            -MOMENTUM_HISTORY_LENGTH:
+        ]
+
+        scores = [
+            x[1]
+            for x in score_history[key]
+        ]
+
+        momentums = [
+            x[1]
+            for x in momentum_history[key]
+        ]
+
+        if len(scores) >= 2:
+
+            score_acceleration = (
+                scores[-1]
+                -
+                scores[-2]
+            )
+
+        else:
+
+            score_acceleration = 0.0
+
+        if len(scores) >= 3:
+
+            score_velocity = (
+                (
+                    scores[-1]
+                    -
+                    scores[-2]
+                )
+                -
+                (
+                    scores[-2]
+                    -
+                    scores[-3]
+                )
+            )
+
+        else:
+
+            score_velocity = 0.0
+
+        if len(momentums) >= 2:
+
+            momentum_acceleration = (
+                momentums[-1]
+                -
+                momentums[-2]
+            )
+
+        else:
+
+            momentum_acceleration = 0.0
+
+        return {
+
+            "score_history":
+                scores[-5:],
+
+            "momentum_history":
+                momentums[-5:],
+
+            "score_acceleration":
+                score_acceleration,
+
+            "score_velocity":
+                score_velocity,
+
+            "momentum_acceleration":
+                momentum_acceleration,
+        }
+
+
+# ============================================================
+# ICHIMOKU STATE
+# ============================================================
+
+def get_ichimoku_state(
+    df,
+    side
+):
+
+    a = df.iloc[-1]
+
+    price = safe_float(
+        a["close"]
+    )
+
+    tenkan = safe_float(
+        a["ichimoku_tenkan"],
+        np.nan
+    )
+
+    kijun = safe_float(
+        a["ichimoku_kijun"],
+        np.nan
+    )
+
+    span_a = safe_float(
+        a["ichimoku_span_a"],
+        np.nan
+    )
+
+    span_b = safe_float(
+        a["ichimoku_span_b"],
+        np.nan
+    )
+
+    if not all(
+        math.isfinite(x)
+        for x in [
+            tenkan,
+            kijun,
+            span_a,
+            span_b
+        ]
+    ):
+
+        return {
+
+            "trend":
+                "NEUTRAL",
+
+            "strength":
+                0,
+
+            "above_cloud":
+                False,
+
+            "below_cloud":
+                False,
+        }
+
+    cloud_top = max(
+        span_a,
+        span_b
+    )
+
+    cloud_bottom = min(
+        span_a,
+        span_b
+    )
+
+    above_cloud = (
+        price
+        >
+        cloud_top
+    )
+
+    below_cloud = (
+        price
+        <
+        cloud_bottom
+    )
+
+    if (
+        above_cloud
+        and
+        tenkan > kijun
+        and
+        span_a > span_b
+    ):
+
+        trend = "BULLISH"
+
+        strength = 3
+
+    elif (
+        below_cloud
+        and
+        tenkan < kijun
+        and
+        span_a < span_b
+    ):
+
+        trend = "BEARISH"
+
+        strength = 3
+
+    elif above_cloud:
+
+        trend = "BULLISH"
+
+        strength = 2
+
+    elif below_cloud:
+
+        trend = "BEARISH"
+
+        strength = 2
+
+    else:
+
+        trend = "NEUTRAL"
+
+        strength = 0
+
+    return {
+
+        "trend":
+            trend,
+
+        "strength":
+            strength,
+
+        "above_cloud":
+            above_cloud,
+
+        "below_cloud":
+            below_cloud,
+
+        "tenkan":
+            tenkan,
+
+        "kijun":
+            kijun,
+
+        "cloud_top":
+            cloud_top,
+
+        "cloud_bottom":
+            cloud_bottom,
+    }
+
+
+# ============================================================
+# MOVE POSITION
+# ============================================================
+
+def calculate_move_position(
+    df,
+    lookback=50
+):
+
+    data = df.tail(
+        lookback
+    )
+
+    high = safe_float(
+        data["high"].max()
+    )
+
+    low = safe_float(
+        data["low"].min()
+    )
+
+    close = safe_float(
+        df["close"].iloc[-1]
+    )
+
+    if (
+        high <= low
+        or
+        low <= 0
+    ):
+
+        return 0.5
+
+    return clamp(
+        (
+            close - low
+        )
+        /
+        (
+            high - low
+        ),
+        0,
+        1
     )
 
 
@@ -1198,90 +2701,155 @@ def score_long(
 ):
 
     score = 0
+
     reasons = []
 
     a = df1.iloc[-1]
+
     b = df5.iloc[-1]
+
     c = df15.iloc[-1]
+
     d = df1h.iloc[-1]
 
+    # --------------------------------------------------------
     # 1H
+    # --------------------------------------------------------
+
     if d["ema21"] > d["ema50"]:
+
         score += 8
+
         reasons.append(
             "1H EMA21>EMA50"
         )
 
     if d["close"] > d["ema50"]:
+
         score += 6
+
         reasons.append(
             "1H above EMA50"
         )
 
     if d["ema9"] > d["ema21"]:
+
         score += 4
+
         reasons.append(
             "1H short trend up"
         )
 
+    if (
+        d["close"]
+        >
+        d["ema200"]
+    ):
+
+        score += 3
+
+        reasons.append(
+            "1H above EMA200"
+        )
+
+    if d["adx"] > 18:
+
+        score += 3
+
+        reasons.append(
+            "1H ADX"
+        )
+
+    # --------------------------------------------------------
     # 15M
+    # --------------------------------------------------------
+
     if c["ema9"] > c["ema21"]:
+
         score += 7
+
         reasons.append(
             "15M EMA9>EMA21"
         )
 
     if c["close"] > c["ema21"]:
+
         score += 4
+
         reasons.append(
             "15M above EMA21"
         )
 
     if c["rsi"] > 52:
+
         score += 4
+
         reasons.append(
             "15M RSI bullish"
         )
 
     if c["macd_hist"] > 0:
+
         score += 4
+
         reasons.append(
             "15M MACD positive"
         )
 
     if c["adx"] > 18:
+
         score += 4
+
         reasons.append(
             "15M ADX"
         )
 
+    # --------------------------------------------------------
     # 5M
+    # --------------------------------------------------------
+
     if b["ema9"] > b["ema21"]:
+
         score += 7
+
         reasons.append(
             "5M EMA bullish"
         )
 
     if b["close"] > b["ema9"]:
+
         score += 3
+
         reasons.append(
             "5M above EMA9"
         )
 
     if b["rsi"] > 52:
+
         score += 4
+
         reasons.append(
             "5M RSI"
         )
 
-    if 52 <= b["rsi"] <= 72:
+    if (
+        52
+        <=
+        b["rsi"]
+        <=
+        72
+    ):
+
         score += 3
+
         reasons.append(
             "5M RSI optimal"
         )
 
     if b["macd_hist"] > 0:
+
         score += 5
+
         reasons.append(
             "5M MACD"
         )
@@ -1289,85 +2857,369 @@ def score_long(
     if (
         b["macd_hist"]
         >
-        df5["macd_hist"].iloc[-2]
+        df5[
+            "macd_hist"
+        ].iloc[-2]
     ):
+
         score += 3
+
         reasons.append(
             "MACD accelerating"
         )
 
+    # --------------------------------------------------------
     # Volume
-    if b["volume_ratio"] >= 1.30:
+    # --------------------------------------------------------
+
+    if (
+        b["volume_ratio"]
+        >=
+        1.30
+    ):
+
         score += 6
+
         reasons.append(
             "Volume expansion"
         )
 
-    elif b["volume_ratio"] >= 1.10:
+    elif (
+        b["volume_ratio"]
+        >=
+        1.10
+    ):
+
         score += 3
+
         reasons.append(
             "Volume improving"
         )
 
+    # --------------------------------------------------------
     # Breakout
-    if b["close"] > b["high20"]:
+    # --------------------------------------------------------
+
+    if (
+        b["close"]
+        >
+        b["high20"]
+    ):
+
         score += 8
+
         reasons.append(
             "20 candle breakout"
         )
 
-    elif b["high"] > b["high20"]:
+    elif (
+        b["high"]
+        >
+        b["high20"]
+    ):
+
         score += 4
+
         reasons.append(
             "Breakout attempt"
         )
 
+    # --------------------------------------------------------
     # Early momentum
-    if 0.15 <= b["roc5"] <= 2.5:
+    # --------------------------------------------------------
+
+    if (
+        0.15
+        <=
+        b["roc5"]
+        <=
+        2.5
+    ):
+
         score += 4
+
         reasons.append(
             "Early ROC"
         )
 
     if b["roc10"] > 0:
+
         score += 3
+
         reasons.append(
             "ROC10 positive"
         )
 
-    if bullish_reversal(df5):
+    if bullish_reversal(
+        df5
+    ):
+
         score += 6
+
         reasons.append(
             "Bullish reversal"
         )
 
+    # --------------------------------------------------------
     # 1M
+    # --------------------------------------------------------
+
     if a["ema9"] > a["ema21"]:
+
         score += 4
+
         reasons.append(
             "1M momentum"
         )
 
     if a["macd_hist"] > 0:
+
         score += 3
+
         reasons.append(
             "1M MACD"
         )
 
+    # --------------------------------------------------------
+    # ICHIMOKU
+    # --------------------------------------------------------
+
+    ichi = get_ichimoku_state(
+        df15,
+        "LONG"
+    )
+
+    if (
+        ichi["trend"]
+        ==
+        "BULLISH"
+    ):
+
+        score += 8
+
+        reasons.append(
+            "Ichimoku bullish"
+        )
+
+    elif (
+        ichi["above_cloud"]
+    ):
+
+        score += 4
+
+        reasons.append(
+            "Price above Ichimoku cloud"
+        )
+
+    if (
+        b["ichimoku_tenkan"]
+        >
+        b["ichimoku_kijun"]
+    ):
+
+        score += 3
+
+        reasons.append(
+            "5M Tenkan>Kijun"
+        )
+
+    # --------------------------------------------------------
+    # Stoch RSI
+    # --------------------------------------------------------
+
+    if (
+        b["stoch_k"]
+        >
+        b["stoch_d"]
+    ):
+
+        score += 3
+
+        reasons.append(
+            "StochRSI bullish cross"
+        )
+
+    if (
+        15
+        <=
+        b["stoch_k"]
+        <=
+        75
+    ):
+
+        score += 2
+
+        reasons.append(
+            "StochRSI healthy"
+        )
+
+    # --------------------------------------------------------
+    # Elder Ray
+    # --------------------------------------------------------
+
+    if (
+        b["bull_power"]
+        >
+        0
+    ):
+
+        score += 3
+
+        reasons.append(
+            "Elder Bull Power"
+        )
+
+    if (
+        b["bull_power"]
+        >
+        df5[
+            "bull_power"
+        ].iloc[-2]
+    ):
+
+        score += 2
+
+        reasons.append(
+            "Bull Power accelerating"
+        )
+
+    # --------------------------------------------------------
+    # Fibonacci
+    # --------------------------------------------------------
+
+    fib = calculate_fibonacci(
+        df5
+    )
+
+    fib_position = fib[
+        "position"
+    ]
+
+    if (
+        0.35
+        <=
+        fib_position
+        <=
+        0.72
+    ):
+
+        score += 4
+
+        reasons.append(
+            "Fibonacci healthy zone"
+        )
+
+    # --------------------------------------------------------
+    # Breakout + Retest
+    # --------------------------------------------------------
+
+    breakout = (
+        calculate_breakout_state(
+            df5
+        )
+    )
+
+    if breakout[
+        "bull_retest"
+    ]:
+
+        score += 10
+
+        reasons.append(
+            "Bull breakout retest"
+        )
+
+    elif breakout[
+        "bull_breakout"
+    ]:
+
+        score += 6
+
+        reasons.append(
+            "Confirmed bull breakout"
+        )
+
+    # --------------------------------------------------------
+    # Move position
+    # --------------------------------------------------------
+
+    move_position = (
+        calculate_move_position(
+            df5,
+            50
+        )
+    )
+
+    if (
+        0.25
+        <=
+        move_position
+        <=
+        0.68
+    ):
+
+        score += 5
+
+        reasons.append(
+            "Early move position"
+        )
+
+    elif (
+        move_position
+        <=
+        0.80
+    ):
+
+        score += 1
+
+    # --------------------------------------------------------
     # Overextension
+    # --------------------------------------------------------
+
     if b["rsi"] > 78:
+
         score -= 10
+
         reasons.append(
             "Overbought penalty"
         )
 
     if c["rsi"] > 78:
+
         score -= 8
+
         reasons.append(
             "15M overbought"
         )
 
-    return score, reasons
+    if (
+        move_position
+        >=
+        LATE_MOVE_POSITION
+    ):
+
+        score -= 7
+
+        reasons.append(
+            "Late move penalty"
+        )
+
+    if (
+        move_position
+        >=
+        VERY_LATE_MOVE_POSITION
+    ):
+
+        score -= 8
+
+        reasons.append(
+            "Very late move penalty"
+        )
+
+    return (
+        score,
+        reasons
+    )
 
 
 # ============================================================
@@ -1382,90 +3234,155 @@ def score_short(
 ):
 
     score = 0
+
     reasons = []
 
     a = df1.iloc[-1]
+
     b = df5.iloc[-1]
+
     c = df15.iloc[-1]
+
     d = df1h.iloc[-1]
 
+    # --------------------------------------------------------
     # 1H
+    # --------------------------------------------------------
+
     if d["ema21"] < d["ema50"]:
+
         score += 8
+
         reasons.append(
             "1H EMA21<EMA50"
         )
 
     if d["close"] < d["ema50"]:
+
         score += 6
+
         reasons.append(
             "1H below EMA50"
         )
 
     if d["ema9"] < d["ema21"]:
+
         score += 4
+
         reasons.append(
             "1H short trend down"
         )
 
+    if (
+        d["close"]
+        <
+        d["ema200"]
+    ):
+
+        score += 3
+
+        reasons.append(
+            "1H below EMA200"
+        )
+
+    if d["adx"] > 18:
+
+        score += 3
+
+        reasons.append(
+            "1H ADX"
+        )
+
+    # --------------------------------------------------------
     # 15M
+    # --------------------------------------------------------
+
     if c["ema9"] < c["ema21"]:
+
         score += 7
+
         reasons.append(
             "15M EMA bearish"
         )
 
     if c["close"] < c["ema21"]:
+
         score += 4
+
         reasons.append(
             "15M below EMA21"
         )
 
     if c["rsi"] < 48:
+
         score += 4
+
         reasons.append(
             "15M RSI bearish"
         )
 
     if c["macd_hist"] < 0:
+
         score += 4
+
         reasons.append(
             "15M MACD negative"
         )
 
     if c["adx"] > 18:
+
         score += 4
+
         reasons.append(
             "15M ADX"
         )
 
+    # --------------------------------------------------------
     # 5M
+    # --------------------------------------------------------
+
     if b["ema9"] < b["ema21"]:
+
         score += 7
+
         reasons.append(
             "5M EMA bearish"
         )
 
     if b["close"] < b["ema9"]:
+
         score += 3
+
         reasons.append(
             "5M below EMA9"
         )
 
     if b["rsi"] < 48:
+
         score += 4
+
         reasons.append(
             "5M RSI"
         )
 
-    if 28 <= b["rsi"] <= 48:
+    if (
+        28
+        <=
+        b["rsi"]
+        <=
+        48
+    ):
+
         score += 3
+
         reasons.append(
             "5M RSI optimal"
         )
 
     if b["macd_hist"] < 0:
+
         score += 5
+
         reasons.append(
             "5M MACD"
         )
@@ -1473,92 +3390,380 @@ def score_short(
     if (
         b["macd_hist"]
         <
-        df5["macd_hist"].iloc[-2]
+        df5[
+            "macd_hist"
+        ].iloc[-2]
     ):
+
         score += 3
+
         reasons.append(
             "MACD accelerating down"
         )
 
+    # --------------------------------------------------------
     # Volume
-    if b["volume_ratio"] >= 1.30:
+    # --------------------------------------------------------
+
+    if (
+        b["volume_ratio"]
+        >=
+        1.30
+    ):
+
         score += 6
+
         reasons.append(
             "Volume expansion"
         )
 
-    elif b["volume_ratio"] >= 1.10:
+    elif (
+        b["volume_ratio"]
+        >=
+        1.10
+    ):
+
         score += 3
+
         reasons.append(
             "Volume improving"
         )
 
+    # --------------------------------------------------------
     # Breakdown
-    if b["close"] < b["low20"]:
+    # --------------------------------------------------------
+
+    if (
+        b["close"]
+        <
+        b["low20"]
+    ):
+
         score += 8
+
         reasons.append(
             "20 candle breakdown"
         )
 
-    elif b["low"] < b["low20"]:
+    elif (
+        b["low"]
+        <
+        b["low20"]
+    ):
+
         score += 4
+
         reasons.append(
             "Breakdown attempt"
         )
 
+    # --------------------------------------------------------
     # Momentum
-    if -2.5 <= b["roc5"] <= -0.15:
+    # --------------------------------------------------------
+
+    if (
+        -2.5
+        <=
+        b["roc5"]
+        <=
+        -0.15
+    ):
+
         score += 4
+
         reasons.append(
             "Early negative ROC"
         )
 
     if b["roc10"] < 0:
+
         score += 3
+
         reasons.append(
             "ROC10 negative"
         )
 
-    if bearish_reversal(df5):
+    if bearish_reversal(
+        df5
+    ):
+
         score += 6
+
         reasons.append(
             "Bearish reversal"
         )
 
+    # --------------------------------------------------------
     # 1M
+    # --------------------------------------------------------
+
     if a["ema9"] < a["ema21"]:
+
         score += 4
+
         reasons.append(
             "1M momentum"
         )
 
     if a["macd_hist"] < 0:
+
         score += 3
+
         reasons.append(
             "1M MACD"
         )
 
+    # --------------------------------------------------------
+    # ICHIMOKU
+    # --------------------------------------------------------
+
+    ichi = get_ichimoku_state(
+        df15,
+        "SHORT"
+    )
+
+    if (
+        ichi["trend"]
+        ==
+        "BEARISH"
+    ):
+
+        score += 8
+
+        reasons.append(
+            "Ichimoku bearish"
+        )
+
+    elif (
+        ichi["below_cloud"]
+    ):
+
+        score += 4
+
+        reasons.append(
+            "Price below Ichimoku cloud"
+        )
+
+    if (
+        b["ichimoku_tenkan"]
+        <
+        b["ichimoku_kijun"]
+    ):
+
+        score += 3
+
+        reasons.append(
+            "5M Tenkan<Kijun"
+        )
+
+    # --------------------------------------------------------
+    # Stoch RSI
+    # --------------------------------------------------------
+
+    if (
+        b["stoch_k"]
+        <
+        b["stoch_d"]
+    ):
+
+        score += 3
+
+        reasons.append(
+            "StochRSI bearish cross"
+        )
+
+    if (
+        25
+        <=
+        b["stoch_k"]
+        <=
+        85
+    ):
+
+        score += 2
+
+        reasons.append(
+            "StochRSI healthy"
+        )
+
+    # --------------------------------------------------------
+    # Elder Ray
+    # --------------------------------------------------------
+
+    if (
+        b["bear_power"]
+        <
+        0
+    ):
+
+        score += 3
+
+        reasons.append(
+            "Elder Bear Power"
+        )
+
+    if (
+        b["bear_power"]
+        <
+        df5[
+            "bear_power"
+        ].iloc[-2]
+    ):
+
+        score += 2
+
+        reasons.append(
+            "Bear Power accelerating"
+        )
+
+    # --------------------------------------------------------
+    # Fibonacci
+    # --------------------------------------------------------
+
+    fib = calculate_fibonacci(
+        df5
+    )
+
+    fib_position = fib[
+        "position"
+    ]
+
+    if (
+        0.28
+        <=
+        fib_position
+        <=
+        0.65
+    ):
+
+        score += 4
+
+        reasons.append(
+            "Fibonacci short zone"
+        )
+
+    # --------------------------------------------------------
+    # Breakout + Retest
+    # --------------------------------------------------------
+
+    breakout = (
+        calculate_breakout_state(
+            df5
+        )
+    )
+
+    if breakout[
+        "bear_retest"
+    ]:
+
+        score += 10
+
+        reasons.append(
+            "Bear breakdown retest"
+        )
+
+    elif breakout[
+        "bear_breakout"
+    ]:
+
+        score += 6
+
+        reasons.append(
+            "Confirmed bear breakdown"
+        )
+
+    # --------------------------------------------------------
+    # Move position
+    # --------------------------------------------------------
+
+    move_position = (
+        calculate_move_position(
+            df5,
+            50
+        )
+    )
+
+    if (
+        0.32
+        <=
+        move_position
+        <=
+        0.75
+    ):
+
+        score += 5
+
+        reasons.append(
+            "Early short move position"
+        )
+
+    elif (
+        move_position
+        >=
+        0.20
+    ):
+
+        score += 1
+
+    # --------------------------------------------------------
     # Oversold
+    # --------------------------------------------------------
+
     if b["rsi"] < 22:
+
         score -= 10
+
         reasons.append(
             "Oversold penalty"
         )
 
     if c["rsi"] < 22:
+
         score -= 8
+
         reasons.append(
             "15M oversold"
         )
 
-    return score, reasons
+    if (
+        move_position
+        <=
+        1 -
+        LATE_MOVE_POSITION
+    ):
+
+        score -= 7
+
+        reasons.append(
+            "Late downside move penalty"
+        )
+
+    if (
+        move_position
+        <=
+        1 -
+        VERY_LATE_MOVE_POSITION
+    ):
+
+        score -= 8
+
+        reasons.append(
+            "Very late downside move penalty"
+        )
+
+    return (
+        score,
+        reasons
+    )
 
 
 # ============================================================
 # FUNDING
 # ============================================================
 
-def get_funding(symbol):
+def get_funding(
+    symbol
+):
 
     try:
 
@@ -1585,11 +3790,15 @@ def preliminary_score(
     candidate
 ):
 
-    ticker = candidate["ticker"]
+    ticker = candidate[
+        "ticker"
+    ]
 
     score = 0
 
-    pct = ticker["percentage"]
+    pct = ticker[
+        "percentage"
+    ]
 
     volume = ticker[
         "quoteVolume"
@@ -1600,30 +3809,39 @@ def preliminary_score(
     ]
 
     if "GAINER" in sources:
+
         score += 8
 
     if "LOSER" in sources:
+
         score += 8
 
     if "VOLUME" in sources:
+
         score += 8
 
     if abs(pct) >= 3:
+
         score += 10
 
     elif abs(pct) >= 2:
+
         score += 7
 
     elif abs(pct) >= 1:
+
         score += 4
 
     if volume >= 100_000_000:
+
         score += 8
 
     elif volume >= 50_000_000:
+
         score += 6
 
     elif volume >= 20_000_000:
+
         score += 4
 
     return score
@@ -1633,13 +3851,16 @@ def preliminary_score(
 # COOLDOWN
 # ============================================================
 
-def is_cooldown(symbol):
+def is_cooldown(
+    symbol
+):
 
     t = cooldowns.get(
         symbol
     )
 
     if not t:
+
         return False
 
     return (
@@ -1649,7 +3870,9 @@ def is_cooldown(symbol):
     )
 
 
-def set_cooldown(symbol):
+def set_cooldown(
+    symbol
+):
 
     cooldowns[
         symbol
@@ -1677,13 +3900,16 @@ def current_position_count():
 # SIDE COUNT
 # ============================================================
 
-def side_count(side):
+def side_count(
+    side
+):
 
     with state_lock:
 
         return sum(
             1
-            for p in positions.values()
+            for p
+            in positions.values()
             if p["side"] == side
         )
 
@@ -1700,21 +3926,27 @@ def choose_leverage(
     leverage = 3
 
     if score >= 88:
+
         leverage = 5
 
     elif score >= 82:
+
         leverage = 4
 
     elif score >= 76:
+
         leverage = 3
 
     else:
+
         leverage = 2
 
     if atr_percent >= 2.5:
+
         leverage -= 1
 
     if atr_percent >= 4:
+
         leverage -= 1
 
     leverage = int(
@@ -1729,6 +3961,81 @@ def choose_leverage(
 
 
 # ============================================================
+# TARGET ROI
+# ============================================================
+
+def calculate_target_roi(
+    score,
+    atr_percent,
+    move_position=0.5,
+    score_acceleration=0.0,
+    breakout_quality=0.0
+):
+
+    target = 0.012
+
+    if score >= 92:
+
+        target = 0.032
+
+    elif score >= 88:
+
+        target = 0.030
+
+    elif score >= 84:
+
+        target = 0.026
+
+    elif score >= 80:
+
+        target = 0.022
+
+    elif score >= 76:
+
+        target = 0.017
+
+    elif score >= 72:
+
+        target = 0.014
+
+    # High volatility gives room
+
+    if atr_percent >= 2.5:
+
+        target += 0.004
+
+    if atr_percent >= 4:
+
+        target += 0.004
+
+    # Strong acceleration
+
+    if score_acceleration >= 4:
+
+        target += 0.002
+
+    # Strong breakout/retest
+
+    if breakout_quality >= 0.75:
+
+        target += 0.002
+
+    # Late move should NOT get a huge target
+
+    if move_position >= 0.85:
+
+        target -= 0.003
+
+    target = clamp(
+        target,
+        0.010,
+        0.040
+    )
+
+    return target
+
+
+# ============================================================
 # CAN OPEN
 # ============================================================
 
@@ -1740,20 +4047,28 @@ def can_open_position(
     with state_lock:
 
         if symbol in positions:
+
             return False
 
-        if (
-            len(positions)
-            >=
-            MAX_POSITIONS
-        ):
+        if len(
+            positions
+        ) >= MAX_POSITIONS:
+
             return False
 
+        current_side_count = sum(
+            1
+            for p
+            in positions.values()
+            if p["side"] == side
+        )
+
         if (
-            side_count(side)
+            current_side_count
             >=
             MAX_CORRELATED_SIDE
         ):
+
             return False
 
     return True
@@ -1796,47 +4111,6 @@ def calculate_quantity(
 
 
 # ============================================================
-# TARGET ROI
-# ============================================================
-#
-# Bu "hedef" sabit TP emri değildir.
-# Trailing sisteminin beklenen minimum kâr hedefidir.
-#
-# Raporlarda hangi hedefle açıldığını görmek için
-# pozisyon içine kaydedilir.
-# ============================================================
-
-def calculate_target_roi(
-    score,
-    atr_percent
-):
-
-    # Minimum hedef
-    target = 0.012
-
-    if score >= 90:
-        target = 0.030
-
-    elif score >= 85:
-        target = 0.025
-
-    elif score >= 80:
-        target = 0.020
-
-    elif score >= 76:
-        target = 0.015
-
-    # Çok volatil piyasada hedefi artır
-    if atr_percent >= 2.5:
-        target += 0.005
-
-    if atr_percent >= 4:
-        target += 0.005
-
-    return target
-
-
-# ============================================================
 # DRY RUN OPEN
 # ============================================================
 
@@ -1848,7 +4122,8 @@ def dry_run_open(
     reasons,
     atr_value,
     leverage,
-    target_roi
+    target_roi,
+    metadata=None
 ):
 
     quantity = calculate_quantity(
@@ -1864,6 +4139,7 @@ def dry_run_open(
     )
 
     if quantity <= 0:
+
         return False
 
     if side == "LONG":
@@ -1891,55 +4167,78 @@ def dry_run_open(
         .isoformat()
     )
 
+    metadata = (
+        metadata
+        or {}
+    )
+
     position = {
 
-        "symbol": symbol,
+        "symbol":
+            symbol,
 
-        "side": side,
+        "side":
+            side,
 
-        "entry": price,
+        "entry":
+            price,
 
-        "current_price": price,
+        "current_price":
+            price,
 
-        "margin": MARGIN_PER_POSITION,
+        "margin":
+            MARGIN_PER_POSITION,
 
-        "leverage": leverage,
+        "leverage":
+            leverage,
 
-        "notional": notional,
+        "notional":
+            notional,
 
-        "quantity": quantity,
+        "quantity":
+            quantity,
 
-        "score": score,
+        "score":
+            score,
 
-        "entry_reason": reasons,
+        "entry_reason":
+            reasons,
 
-        "atr": atr_value,
+        "atr":
+            atr_value,
 
-        "highest": price,
+        "highest":
+            price,
 
-        "lowest": price,
+        "lowest":
+            price,
 
-        "stop_price": stop_price,
+        "stop_price":
+            stop_price,
 
-        "initial_stop": stop_price,
+        "initial_stop":
+            stop_price,
 
-        "trailing_active": False,
+        "trailing_active":
+            False,
 
-        "unrealized_pnl": 0.0,
+        "unrealized_pnl":
+            0.0,
 
-        "unrealized_roi": 0.0,
+        "unrealized_roi":
+            0.0,
 
-        "opened_at": opened_at,
+        "opened_at":
+            opened_at,
 
-        "last_update": opened_at,
+        "last_update":
+            opened_at,
 
-        "peak_roi": 0.0,
+        "peak_roi":
+            0.0,
 
-        # ----------------------------------------------------
-        # RAPORLAMA
-        # ----------------------------------------------------
-
-        "target_roi": target_roi,
+        "target_roi":
+            target_roi,
 
         "target_roi_percent":
             target_roi * 100,
@@ -1949,6 +4248,48 @@ def dry_run_open(
 
         "entry_notional":
             notional,
+
+        "score_acceleration":
+            metadata.get(
+                "score_acceleration",
+                0
+            ),
+
+        "score_velocity":
+            metadata.get(
+                "score_velocity",
+                0
+            ),
+
+        "momentum_acceleration":
+            metadata.get(
+                "momentum_acceleration",
+                0
+            ),
+
+        "move_position":
+            metadata.get(
+                "move_position",
+                0.5
+            ),
+
+        "trend_maturity":
+            metadata.get(
+                "trend_maturity",
+                0
+            ),
+
+        "breakout_type":
+            metadata.get(
+                "breakout_type",
+                "NONE"
+            ),
+
+        "entry_mode":
+            metadata.get(
+                "entry_mode",
+                "NORMAL"
+            ),
     }
 
     with state_lock:
@@ -1970,7 +4311,7 @@ def dry_run_open(
         "price=%.8f | score=%s | "
         "lev=%sx | margin=$%.2f | "
         "notional=$%.2f | qty=%s | "
-        "TARGET ROI=%.2f%%",
+        "TARGET ROI=%.2f%% | mode=%s",
         side,
         symbol,
         price,
@@ -1979,13 +4320,31 @@ def dry_run_open(
         MARGIN_PER_POSITION,
         notional,
         quantity,
-        target_roi * 100
+        target_roi * 100,
+        position["entry_mode"]
+    )
+
+    logger.warning(
+        "ENTRY TIMING | %s | "
+        "score_acc=%.2f | "
+        "score_vel=%.2f | "
+        "mom_acc=%.3f | "
+        "move_pos=%.2f | "
+        "maturity=%s | "
+        "breakout=%s",
+        symbol,
+        position["score_acceleration"],
+        position["score_velocity"],
+        position["momentum_acceleration"],
+        position["move_position"],
+        position["trend_maturity"],
+        position["breakout_type"]
     )
 
     logger.warning(
         "ENTRY REASONS | %s",
         " | ".join(
-            reasons[:15]
+            reasons[:20]
         )
     )
 
@@ -2004,7 +4363,8 @@ def live_open_position(
     reasons,
     atr_value,
     leverage,
-    target_roi
+    target_roi,
+    metadata=None
 ):
 
     if DRY_RUN:
@@ -2017,10 +4377,15 @@ def live_open_position(
             reasons,
             atr_value,
             leverage,
-            target_roi
+            target_roi,
+            metadata
         )
 
     try:
+
+        # ----------------------------------------------------
+        # ISOLATED
+        # ----------------------------------------------------
 
         try:
 
@@ -2036,6 +4401,10 @@ def live_open_position(
                 e
             )
 
+        # ----------------------------------------------------
+        # LEVERAGE
+        # ----------------------------------------------------
+
         exchange.set_leverage(
             leverage,
             symbol
@@ -2048,6 +4417,7 @@ def live_open_position(
         )
 
         if quantity <= 0:
+
             return False
 
         order_side = (
@@ -2095,35 +4465,51 @@ def live_open_position(
                 HARD_STOP_ATR
             )
 
+        metadata = (
+            metadata
+            or {}
+        )
+
         position = {
 
-            "symbol": symbol,
+            "symbol":
+                symbol,
 
-            "side": side,
+            "side":
+                side,
 
-            "entry": price,
+            "entry":
+                price,
 
-            "current_price": price,
+            "current_price":
+                price,
 
             "margin":
                 MARGIN_PER_POSITION,
 
-            "leverage": leverage,
+            "leverage":
+                leverage,
 
             "notional":
                 quantity * price,
 
-            "quantity": quantity,
+            "quantity":
+                quantity,
 
-            "score": score,
+            "score":
+                score,
 
-            "entry_reason": reasons,
+            "entry_reason":
+                reasons,
 
-            "atr": atr_value,
+            "atr":
+                atr_value,
 
-            "highest": price,
+            "highest":
+                price,
 
-            "lowest": price,
+            "lowest":
+                price,
 
             "stop_price":
                 initial_stop,
@@ -2160,6 +4546,48 @@ def live_open_position(
 
             "entry_notional":
                 quantity * price,
+
+            "score_acceleration":
+                metadata.get(
+                    "score_acceleration",
+                    0
+                ),
+
+            "score_velocity":
+                metadata.get(
+                    "score_velocity",
+                    0
+                ),
+
+            "momentum_acceleration":
+                metadata.get(
+                    "momentum_acceleration",
+                    0
+                ),
+
+            "move_position":
+                metadata.get(
+                    "move_position",
+                    0.5
+                ),
+
+            "trend_maturity":
+                metadata.get(
+                    "trend_maturity",
+                    0
+                ),
+
+            "breakout_type":
+                metadata.get(
+                    "breakout_type",
+                    "NONE"
+                ),
+
+            "entry_mode":
+                metadata.get(
+                    "entry_mode",
+                    "NORMAL"
+                ),
         }
 
         with state_lock:
@@ -2232,7 +4660,10 @@ def calculate_pnl(
         roi
     )
 
-    return pnl, roi
+    return (
+        pnl,
+        roi
+    )
 
 
 # ============================================================
@@ -2284,7 +4715,9 @@ def update_trailing_stop(
         position[
             "highest"
         ] = max(
-            position["highest"],
+            position[
+                "highest"
+            ],
             current_price
         )
 
@@ -2303,23 +4736,29 @@ def update_trailing_stop(
         ]:
 
             if roi >= TRAIL_LEVEL_3:
+
                 multiplier = (
                     TRAIL_ATR_TIGHT
                 )
 
             elif roi >= TRAIL_LEVEL_2:
+
                 multiplier = 1.20
 
             elif roi >= TRAIL_LEVEL_1:
+
                 multiplier = 1.30
 
             else:
+
                 multiplier = (
                     TRAIL_ATR_MULTIPLIER
                 )
 
             trailing_stop = (
-                position["highest"]
+                position[
+                    "highest"
+                ]
                 -
                 atr_value
                 *
@@ -2340,7 +4779,9 @@ def update_trailing_stop(
         position[
             "lowest"
         ] = min(
-            position["lowest"],
+            position[
+                "lowest"
+            ],
             current_price
         )
 
@@ -2359,23 +4800,29 @@ def update_trailing_stop(
         ]:
 
             if roi >= TRAIL_LEVEL_3:
+
                 multiplier = (
                     TRAIL_ATR_TIGHT
                 )
 
             elif roi >= TRAIL_LEVEL_2:
+
                 multiplier = 1.20
 
             elif roi >= TRAIL_LEVEL_1:
+
                 multiplier = 1.30
 
             else:
+
                 multiplier = (
                     TRAIL_ATR_MULTIPLIER
                 )
 
             trailing_stop = (
-                position["lowest"]
+                position[
+                    "lowest"
+                ]
                 +
                 atr_value
                 *
@@ -2414,9 +4861,13 @@ def save_closed_trade(
         .isoformat()
     )
 
-    duration = calculate_duration_seconds(
-        position["opened_at"],
-        closed_at
+    duration = (
+        calculate_duration_seconds(
+            position[
+                "opened_at"
+            ],
+            closed_at
+        )
     )
 
     pnl, roi = calculate_pnl(
@@ -2488,6 +4939,42 @@ def save_closed_trade(
                 0
             ),
 
+        "score_acceleration":
+            position.get(
+                "score_acceleration",
+                0
+            ),
+
+        "momentum_acceleration":
+            position.get(
+                "momentum_acceleration",
+                0
+            ),
+
+        "move_position":
+            position.get(
+                "move_position",
+                0.5
+            ),
+
+        "trend_maturity":
+            position.get(
+                "trend_maturity",
+                0
+            ),
+
+        "breakout_type":
+            position.get(
+                "breakout_type",
+                "NONE"
+            ),
+
+        "entry_mode":
+            position.get(
+                "entry_mode",
+                "NORMAL"
+            ),
+
         "peak_roi":
             position.get(
                 "peak_roi",
@@ -2501,7 +4988,9 @@ def save_closed_trade(
             ) * 100,
 
         "opened_at":
-            position["opened_at"],
+            position[
+                "opened_at"
+            ],
 
         "closed_at":
             closed_at,
@@ -2538,11 +5027,15 @@ def save_closed_trade(
 
     if pnl >= 0:
 
-        stats["wins"] += 1
+        stats[
+            "wins"
+        ] += 1
 
     else:
 
-        stats["losses"] += 1
+        stats[
+            "losses"
+        ] += 1
 
     return trade
 
@@ -2563,13 +5056,12 @@ def dry_run_close(
         )
 
         if not position:
+
             return
 
-        exit_price = (
-            position[
-                "current_price"
-            ]
-        )
+        exit_price = position[
+            "current_price"
+        ]
 
         trade = save_closed_trade(
             position,
@@ -2587,7 +5079,9 @@ def dry_run_close(
 
     stats[
         "total_realized_pnl"
-    ] += trade["pnl"]
+    ] += trade[
+        "pnl"
+    ]
 
     set_cooldown(
         symbol
@@ -2602,9 +5096,15 @@ def dry_run_close(
         symbol,
         trade["exit_price"],
         trade["pnl"],
-        trade["realized_roi_percent"],
-        trade["target_roi_percent"],
-        trade["duration"],
+        trade[
+            "realized_roi_percent"
+        ],
+        trade[
+            "target_roi_percent"
+        ],
+        trade[
+            "duration"
+        ],
         reason
     )
 
@@ -2634,6 +5134,7 @@ def live_close(
         )
 
     if not position:
+
         return
 
     try:
@@ -2657,15 +5158,14 @@ def live_close(
             ],
             None,
             {
-                "reduceOnly": True
+                "reduceOnly":
+                    True
             }
         )
 
-        exit_price = (
-            position[
-                "current_price"
-            ]
-        )
+        exit_price = position[
+            "current_price"
+        ]
 
         trade = save_closed_trade(
             position,
@@ -2682,7 +5182,9 @@ def live_close(
 
         stats[
             "total_realized_pnl"
-        ] += trade["pnl"]
+        ] += trade[
+            "pnl"
+        ]
 
         set_cooldown(
             symbol
@@ -2739,10 +5241,8 @@ def position_monitor():
 
                 continue
 
-            tickers = (
-                exchange.fetch_tickers(
-                    symbols
-                )
+            tickers = exchange.fetch_tickers(
+                symbols
             )
 
             for symbol in symbols:
@@ -2752,6 +5252,7 @@ def position_monitor():
                 )
 
                 if not ticker:
+
                     continue
 
                 price = safe_float(
@@ -2761,6 +5262,7 @@ def position_monitor():
                 )
 
                 if price <= 0:
+
                     continue
 
                 with state_lock:
@@ -2770,6 +5272,7 @@ def position_monitor():
                     )
 
                     if not position:
+
                         continue
 
                     update_trailing_stop(
@@ -2777,40 +5280,71 @@ def position_monitor():
                         price
                     )
 
-                    stop_price = (
-                        position[
-                            "stop_price"
-                        ]
+                    stop_price = position[
+                        "stop_price"
+                    ]
+
+                    side = position[
+                        "side"
+                    ]
+
+                    roi = position[
+                        "unrealized_roi"
+                    ]
+
+                    trailing = position[
+                        "trailing_active"
+                    ]
+
+                    target_roi = position[
+                        "target_roi"
+                    ]
+
+                # ------------------------------------------------
+                # TARGET ROI
+                #
+                # Target ROI artık gerçekten çıkışta kullanılıyor.
+                # ------------------------------------------------
+
+                target_hit = (
+                    roi
+                    >=
+                    target_roi
+                )
+
+                if target_hit:
+
+                    live_close(
+                        symbol,
+                        "TARGET_ROI"
                     )
 
-                    side = (
-                        position[
-                            "side"
-                        ]
-                    )
+                    continue
 
-                    roi = (
-                        position[
-                            "unrealized_roi"
-                        ]
-                    )
-
-                    trailing = (
-                        position[
-                            "trailing_active"
-                        ]
-                    )
+                # ------------------------------------------------
+                # STOP
+                # ------------------------------------------------
 
                 stop_hit = False
 
                 if side == "LONG":
 
-                    if price <= stop_price:
+                    if (
+                        price
+                        <=
+                        stop_price
+                    ):
+
                         stop_hit = True
 
                 else:
 
-                    if price >= stop_price:
+                    if (
+                        price
+                        >=
+                        stop_price
+                    ):
+
                         stop_hit = True
 
                 if stop_hit:
@@ -2826,21 +5360,17 @@ def position_monitor():
                     "POSITION | %s | %s | "
                     "entry=%.8f | price=%.8f | "
                     "ROI=%.2f%% | PNL=$%.3f | "
-                    "target=%.2f%% | "
-                    "stop=%.8f | trail=%s",
+                    "target=%.2f%% | stop=%.8f | "
+                    "trail=%s",
                     side,
                     symbol,
-                    position[
-                        "entry"
-                    ],
+                    position["entry"],
                     price,
                     roi * 100,
                     position[
                         "unrealized_pnl"
                     ],
-                    position[
-                        "target_roi"
-                    ] * 100,
+                    target_roi * 100,
                     stop_price,
                     trailing
                 )
@@ -2866,8 +5396,7 @@ def generate_hourly_report():
     report_time = now_utc()
 
     current_hour_start = (
-        report_time
-        .replace(
+        report_time.replace(
             minute=0,
             second=0,
             microsecond=0
@@ -2877,7 +5406,9 @@ def generate_hourly_report():
     previous_hour_start = (
         current_hour_start
         -
-        timedelta(hours=1)
+        timedelta(
+            hours=1
+        )
     )
 
     previous_hour_end = (
@@ -2892,12 +5423,9 @@ def generate_hourly_report():
 
         open_positions_snapshot = [
             dict(p)
-            for p in positions.values()
+            for p
+            in positions.values()
         ]
-
-    # --------------------------------------------------------
-    # SON SAATTE KAPANANLAR
-    # --------------------------------------------------------
 
     hourly_trades = []
 
@@ -2906,7 +5434,9 @@ def generate_hourly_report():
         try:
 
             closed_at = datetime.fromisoformat(
-                trade["closed_at"]
+                trade[
+                    "closed_at"
+                ]
             )
 
             if (
@@ -2925,11 +5455,8 @@ def generate_hourly_report():
 
             continue
 
-    # --------------------------------------------------------
-    # RAPOR
-    # --------------------------------------------------------
-
     logger.warning("")
+
     logger.warning(
         "╔══════════════════════════════════════════════════════════════════════╗"
     )
@@ -2966,13 +5493,11 @@ def generate_hourly_report():
 
     logger.warning(
         "Açık işlem   : %s / %s",
-        len(open_positions_snapshot),
+        len(
+            open_positions_snapshot
+        ),
         MAX_POSITIONS
     )
-
-    # --------------------------------------------------------
-    # SAATLİK ÖZET
-    # --------------------------------------------------------
 
     hourly_count = len(
         hourly_trades
@@ -2980,7 +5505,8 @@ def generate_hourly_report():
 
     hourly_wins = sum(
         1
-        for t in hourly_trades
+        for t
+        in hourly_trades
         if t["pnl"] >= 0
     )
 
@@ -2992,12 +5518,14 @@ def generate_hourly_report():
 
     hourly_pnl = sum(
         t["pnl"]
-        for t in hourly_trades
+        for t
+        in hourly_trades
     )
 
     hourly_volume = sum(
         t["notional"]
-        for t in hourly_trades
+        for t
+        in hourly_trades
     )
 
     if hourly_count > 0:
@@ -3010,10 +5538,9 @@ def generate_hourly_report():
 
         avg_hourly_roi = (
             sum(
-                t[
-                    "realized_roi"
-                ]
-                for t in hourly_trades
+                t["realized_roi"]
+                for t
+                in hourly_trades
             )
             /
             hourly_count
@@ -3024,7 +5551,8 @@ def generate_hourly_report():
                 t[
                     "duration_seconds"
                 ]
-                for t in hourly_trades
+                for t
+                in hourly_trades
             )
             /
             hourly_count
@@ -3033,36 +5561,39 @@ def generate_hourly_report():
     else:
 
         hourly_win_rate = 0.0
+
         avg_hourly_roi = 0.0
+
         avg_duration = 0.0
 
     logger.warning("")
+
     logger.warning(
         "SAATLİK ÖZET"
     )
 
     logger.warning(
-        "İşlem sayısı      : %s",
+        "İşlem sayısı       : %s",
         hourly_count
     )
 
     logger.warning(
-        "Kazanan           : %s",
+        "Kazanan            : %s",
         hourly_wins
     )
 
     logger.warning(
-        "Kaybeden          : %s",
+        "Kaybeden           : %s",
         hourly_losses
     )
 
     logger.warning(
-        "Win rate          : %.2f%%",
+        "Win rate           : %.2f%%",
         hourly_win_rate
     )
 
     logger.warning(
-        "Saatlik PNL       : $%.4f",
+        "Saatlik PNL        : $%.4f",
         hourly_pnl
     )
 
@@ -3072,22 +5603,19 @@ def generate_hourly_report():
     )
 
     logger.warning(
-        "Ortalama ROI      : %.2f%%",
+        "Ortalama ROI       : %.2f%%",
         avg_hourly_roi
     )
 
     logger.warning(
-        "Ortalama süre     : %s",
+        "Ortalama süre      : %s",
         format_duration(
             avg_duration
         )
     )
 
-    # --------------------------------------------------------
-    # İŞLEM DETAYLARI
-    # --------------------------------------------------------
-
     logger.warning("")
+
     logger.warning(
         "SON SAATTE KAPANAN İŞLEMLER"
     )
@@ -3111,9 +5639,7 @@ def generate_hourly_report():
                 else "ZARAR"
             )
 
-            logger.warning(
-                ""
-            )
+            logger.warning("")
 
             logger.warning(
                 "[%s] %s",
@@ -3158,17 +5684,23 @@ def generate_hourly_report():
 
             logger.warning(
                 "Hedef ROI         : %.2f%%",
-                trade["target_roi_percent"]
+                trade[
+                    "target_roi_percent"
+                ]
             )
 
             logger.warning(
                 "Gerçekleşen ROI   : %.2f%%",
-                trade["realized_roi_percent"]
+                trade[
+                    "realized_roi_percent"
+                ]
             )
 
             logger.warning(
                 "En yüksek ROI     : %.2f%%",
-                trade["peak_roi_percent"]
+                trade[
+                    "peak_roi_percent"
+                ]
             )
 
             logger.warning(
@@ -3187,6 +5719,54 @@ def generate_hourly_report():
             )
 
             logger.warning(
+                "Score acceleration: %.2f",
+                trade.get(
+                    "score_acceleration",
+                    0
+                )
+            )
+
+            logger.warning(
+                "Momentum accel.   : %.3f",
+                trade.get(
+                    "momentum_acceleration",
+                    0
+                )
+            )
+
+            logger.warning(
+                "Move position     : %.2f",
+                trade.get(
+                    "move_position",
+                    0.5
+                )
+            )
+
+            logger.warning(
+                "Trend maturity    : %s",
+                trade.get(
+                    "trend_maturity",
+                    0
+                )
+            )
+
+            logger.warning(
+                "Breakout          : %s",
+                trade.get(
+                    "breakout_type",
+                    "NONE"
+                )
+            )
+
+            logger.warning(
+                "Entry mode        : %s",
+                trade.get(
+                    "entry_mode",
+                    "NORMAL"
+                )
+            )
+
+            logger.warning(
                 "Kapanış nedeni    : %s",
                 trade["exit_reason"]
             )
@@ -3201,11 +5781,8 @@ def generate_hourly_report():
                 trade["closed_at"]
             )
 
-    # --------------------------------------------------------
-    # HALEN AÇIK POZİSYONLAR
-    # --------------------------------------------------------
-
     logger.warning("")
+
     logger.warning(
         "HALEN AÇIK POZİSYONLAR"
     )
@@ -3220,19 +5797,19 @@ def generate_hourly_report():
 
         for p in open_positions_snapshot:
 
-            current_pnl = (
-                p["unrealized_pnl"]
-            )
+            current_pnl = p[
+                "unrealized_pnl"
+            ]
 
             current_roi = (
-                p["unrealized_roi"]
+                p[
+                    "unrealized_roi"
+                ]
                 *
                 100
             )
 
-            logger.warning(
-                ""
-            )
+            logger.warning("")
 
             logger.warning(
                 "Coin            : %s",
@@ -3266,8 +5843,9 @@ def generate_hourly_report():
 
             logger.warning(
                 "Hedef ROI       : %.2f%%",
-                p["target_roi"]
-                * 100
+                p[
+                    "target_roi"
+                ] * 100
             )
 
             logger.warning(
@@ -3282,16 +5860,66 @@ def generate_hourly_report():
 
             logger.warning(
                 "Peak ROI        : %.2f%%",
-                p["peak_roi"] * 100
+                p[
+                    "peak_roi"
+                ] * 100
             )
 
             logger.warning(
-                "Trailing aktif  : %s",
+                "Score accel.     : %.2f",
+                p.get(
+                    "score_acceleration",
+                    0
+                )
+            )
+
+            logger.warning(
+                "Momentum accel.  : %.3f",
+                p.get(
+                    "momentum_acceleration",
+                    0
+                )
+            )
+
+            logger.warning(
+                "Move position    : %.2f",
+                p.get(
+                    "move_position",
+                    0.5
+                )
+            )
+
+            logger.warning(
+                "Trend maturity   : %s",
+                p.get(
+                    "trend_maturity",
+                    0
+                )
+            )
+
+            logger.warning(
+                "Breakout         : %s",
+                p.get(
+                    "breakout_type",
+                    "NONE"
+                )
+            )
+
+            logger.warning(
+                "Entry mode       : %s",
+                p.get(
+                    "entry_mode",
+                    "NORMAL"
+                )
+            )
+
+            logger.warning(
+                "Trailing aktif   : %s",
                 p["trailing_active"]
             )
 
             logger.warning(
-                "Stop            : %.10f",
+                "Stop             : %.10f",
                 p["stop_price"]
             )
 
@@ -3300,7 +5928,9 @@ def generate_hourly_report():
             )
 
             open_duration = (
-                report_time - opened
+                report_time
+                -
+                opened
             ).total_seconds()
 
             logger.warning(
@@ -3339,9 +5969,11 @@ def generate_hourly_report():
     else:
 
         total_win_rate = 0.0
+
         avg_trade_duration = 0.0
 
     logger.warning("")
+
     logger.warning(
         "TOPLAM BOT İSTATİSTİĞİ"
     )
@@ -3444,8 +6076,6 @@ def hourly_report_loop():
                 )
             )
 
-            # İlk çalışmada mevcut saati kaydet.
-            # Bot başlar başlamaz geçmiş saat raporu üretmez.
             if (
                 last_hourly_report_hour
                 is None
@@ -3502,6 +6132,7 @@ def analyze_symbol(
     if is_cooldown(
         symbol
     ):
+
         return None
 
     ticker = candidate[
@@ -3526,28 +6157,32 @@ def analyze_symbol(
 
         return None
 
+    # --------------------------------------------------------
+    # EMA200 için yeterli veri.
+    # --------------------------------------------------------
+
     df1 = fetch_ohlcv_cached(
         symbol,
         TIMEFRAME_FAST,
-        120
+        260
     )
 
     df5 = fetch_ohlcv_cached(
         symbol,
         TIMEFRAME_ENTRY,
-        160
+        260
     )
 
     df15 = fetch_ohlcv_cached(
         symbol,
         TIMEFRAME_CONFIRM,
-        160
+        260
     )
 
     df1h = fetch_ohlcv_cached(
         symbol,
         TIMEFRAME_TREND,
-        160
+        260
     )
 
     if any(
@@ -3559,6 +6194,7 @@ def analyze_symbol(
             df1h
         ]
     ):
+
         return None
 
     df1 = calculate_indicators(
@@ -3586,6 +6222,7 @@ def analyze_symbol(
             df1h
         ]
     ):
+
         return None
 
     price = safe_float(
@@ -3593,7 +6230,9 @@ def analyze_symbol(
     )
 
     atr_value = safe_float(
-        df5["atr"].iloc[-1]
+        df5[
+            "atr"
+        ].iloc[-1]
     )
 
     if (
@@ -3601,6 +6240,7 @@ def analyze_symbol(
         or
         atr_value <= 0
     ):
+
         return None
 
     atr_percent = (
@@ -3609,11 +6249,25 @@ def analyze_symbol(
         price
     ) * 100
 
-    if atr_percent < 0.08:
+    if (
+        atr_percent
+        <
+        MIN_ATR_PERCENT
+    ):
+
         return None
 
-    if atr_percent > 8:
+    if (
+        atr_percent
+        >
+        MAX_ATR_PERCENT
+    ):
+
         return None
+
+    # --------------------------------------------------------
+    # RAW SCORES
+    # --------------------------------------------------------
 
     long_score, long_reasons = (
         score_long(
@@ -3633,72 +6287,640 @@ def analyze_symbol(
         )
     )
 
-    side = None
-    score = 0
-    reasons = []
+    # --------------------------------------------------------
+    # Determine preliminary side
+    # --------------------------------------------------------
 
     if (
         long_score
-        >=
-        MIN_LONG_SCORE
-        and
-        long_score
         >
-        short_score + 5
+        short_score
     ):
 
-        side = "LONG"
+        preliminary_side = "LONG"
 
-        score = long_score
-
-        reasons = long_reasons
+        preliminary_score_value = (
+            long_score
+        )
 
     elif (
         short_score
-        >=
-        MIN_SHORT_SCORE
-        and
-        short_score
         >
-        long_score + 5
+        long_score
     ):
 
-        side = "SHORT"
+        preliminary_side = "SHORT"
 
-        score = short_score
-
-        reasons = short_reasons
+        preliminary_score_value = (
+            short_score
+        )
 
     else:
 
         return None
 
-    if side == "LONG":
+    # --------------------------------------------------------
+    # Momentum metric
+    # --------------------------------------------------------
 
-        if ticker[
-            "percentage"
-        ] < -5:
+    momentum_metric = (
+        calculate_momentum_metric(
+            df5
+        )
+    )
+
+    history = (
+        update_signal_history(
+            symbol,
+            preliminary_side,
+            preliminary_score_value,
+            momentum_metric
+        )
+    )
+
+    score_acceleration = (
+        history[
+            "score_acceleration"
+        ]
+    )
+
+    score_velocity = (
+        history[
+            "score_velocity"
+        ]
+    )
+
+    momentum_acceleration = (
+        history[
+            "momentum_acceleration"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Current move position
+    # --------------------------------------------------------
+
+    move_position = (
+        calculate_move_position(
+            df5,
+            50
+        )
+    )
+
+    # --------------------------------------------------------
+    # Trend maturity
+    # --------------------------------------------------------
+
+    trend_maturity = (
+        calculate_trend_maturity(
+            df15,
+            preliminary_side
+        )
+    )
+
+    # --------------------------------------------------------
+    # Ichimoku
+    # --------------------------------------------------------
+
+    ichi = get_ichimoku_state(
+        df15,
+        preliminary_side
+    )
+
+    # --------------------------------------------------------
+    # Breakout
+    # --------------------------------------------------------
+
+    breakout = (
+        calculate_breakout_state(
+            df5
+        )
+    )
+
+    breakout_type = "NONE"
+
+    breakout_quality = (
+        breakout[
+            "breakout_strength"
+        ]
+    )
+
+    if preliminary_side == "LONG":
+
+        if breakout[
+            "bull_retest"
+        ]:
+
+            breakout_type = (
+                "BULL_RETEST"
+            )
+
+        elif breakout[
+            "bull_breakout"
+        ]:
+
+            breakout_type = (
+                "BULL_BREAKOUT"
+            )
+
+    else:
+
+        if breakout[
+            "bear_retest"
+        ]:
+
+            breakout_type = (
+                "BEAR_RETEST"
+            )
+
+        elif breakout[
+            "bear_breakout"
+        ]:
+
+            breakout_type = (
+                "BEAR_BREAKOUT"
+            )
+
+    # --------------------------------------------------------
+    # FIB
+    # --------------------------------------------------------
+
+    fib = calculate_fibonacci(
+        df5
+    )
+
+    # --------------------------------------------------------
+    # Dynamic score adjustment
+    #
+    # Amaç:
+    #
+    # 80 -> 78 -> 75
+    # gibi zayıflayan sinyali aşağı çekmek.
+    #
+    # 58 -> 64 -> 71 -> 75
+    # gibi hızlanan sinyale erken giriş
+    # avantajı sağlamak.
+    # --------------------------------------------------------
+
+    adjusted_score = (
+        preliminary_score_value
+    )
+
+    dynamic_reasons = []
+
+    # --------------------------------------------------------
+    # Score acceleration
+    # --------------------------------------------------------
+
+    if score_acceleration >= 5:
+
+        adjusted_score += 5
+
+        dynamic_reasons.append(
+            "Score strongly accelerating"
+        )
+
+    elif score_acceleration >= 2.5:
+
+        adjusted_score += 3
+
+        dynamic_reasons.append(
+            "Score accelerating"
+        )
+
+    elif score_acceleration <= -5:
+
+        adjusted_score -= 6
+
+        dynamic_reasons.append(
+            "Score collapsing"
+        )
+
+    elif score_acceleration <= -2.5:
+
+        adjusted_score -= 3
+
+        dynamic_reasons.append(
+            "Score weakening"
+        )
+
+    # --------------------------------------------------------
+    # Score velocity
+    # --------------------------------------------------------
+
+    if score_velocity >= 3:
+
+        adjusted_score += 3
+
+        dynamic_reasons.append(
+            "Score velocity positive"
+        )
+
+    elif score_velocity <= -3:
+
+        adjusted_score -= 4
+
+        dynamic_reasons.append(
+            "Score velocity negative"
+        )
+
+    # --------------------------------------------------------
+    # Momentum acceleration
+    # --------------------------------------------------------
+
+    if momentum_acceleration >= 1.0:
+
+        adjusted_score += 5
+
+        dynamic_reasons.append(
+            "Momentum strongly accelerating"
+        )
+
+    elif momentum_acceleration >= 0.4:
+
+        adjusted_score += 3
+
+        dynamic_reasons.append(
+            "Momentum accelerating"
+        )
+
+    elif momentum_acceleration <= -1.0:
+
+        adjusted_score -= 5
+
+        dynamic_reasons.append(
+            "Momentum strongly weakening"
+        )
+
+    elif momentum_acceleration <= -0.4:
+
+        adjusted_score -= 3
+
+        dynamic_reasons.append(
+            "Momentum weakening"
+        )
+
+    # --------------------------------------------------------
+    # Trend maturity
+    #
+    # Trend ne kadar uzun sürüyorsa,
+    # yeni giriş için avantajı azalıyor.
+    #
+    # Ancak trend tamamen cezalandırılmıyor.
+    # --------------------------------------------------------
+
+    if trend_maturity >= 20:
+
+        adjusted_score -= MATURE_TREND_PENALTY
+
+        dynamic_reasons.append(
+            "Mature trend penalty"
+        )
+
+    elif trend_maturity >= 12:
+
+        adjusted_score -= 3
+
+        dynamic_reasons.append(
+            "Trend maturity warning"
+        )
+
+    # --------------------------------------------------------
+    # Late move
+    # --------------------------------------------------------
+
+    if preliminary_side == "LONG":
+
+        if move_position >= 0.90:
+
+            adjusted_score -= (
+                EXHAUSTION_SCORE_PENALTY
+            )
+
+            dynamic_reasons.append(
+                "Long move exhausted"
+            )
+
+        elif move_position >= 0.82:
+
+            adjusted_score -= 7
+
+            dynamic_reasons.append(
+                "Long move late"
+            )
+
+    else:
+
+        if move_position <= 0.10:
+
+            adjusted_score -= (
+                EXHAUSTION_SCORE_PENALTY
+            )
+
+            dynamic_reasons.append(
+                "Short move exhausted"
+            )
+
+        elif move_position <= 0.18:
+
+            adjusted_score -= 7
+
+            dynamic_reasons.append(
+                "Short move late"
+            )
+
+    # --------------------------------------------------------
+    # Early strengthening bonus
+    #
+    # Raw score henüz 72/76 seviyesinde değilse bile:
+    #
+    #   score acceleration
+    #   momentum acceleration
+    #   breakout/retest
+    #   healthy move position
+    #
+    # birlikte güçlüyse erken giriş yolu açılabilir.
+    # --------------------------------------------------------
+
+    early_strength = 0
+
+    if (
+        score_acceleration
+        >=
+        EARLY_ACCELERATION_MIN
+    ):
+
+        early_strength += 2
+
+    if (
+        momentum_acceleration
+        >=
+        EARLY_MOMENTUM_ACCELERATION_MIN
+    ):
+
+        early_strength += 2
+
+    if (
+        breakout_type
+        in
+        (
+            "BULL_RETEST",
+            "BEAR_RETEST"
+        )
+    ):
+
+        early_strength += 2
+
+    elif (
+        breakout_type
+        in
+        (
+            "BULL_BREAKOUT",
+            "BEAR_BREAKOUT"
+        )
+    ):
+
+        early_strength += 1
+
+    if (
+        0.20
+        <=
+        move_position
+        <=
+        0.78
+    ):
+
+        early_strength += 1
+
+    if (
+        preliminary_side == "LONG"
+        and
+        ichi["trend"]
+        ==
+        "BULLISH"
+    ):
+
+        early_strength += 1
+
+    if (
+        preliminary_side == "SHORT"
+        and
+        ichi["trend"]
+        ==
+        "BEARISH"
+    ):
+
+        early_strength += 1
+
+    if early_strength >= 5:
+
+        adjusted_score += 4
+
+        dynamic_reasons.append(
+            "Early strengthening bonus"
+        )
+
+    # --------------------------------------------------------
+    # Side determination after dynamic score
+    # --------------------------------------------------------
+
+    if preliminary_side == "LONG":
+
+        final_score = int(
+            adjusted_score
+        )
+
+        reasons = (
+            long_reasons
+            +
+            dynamic_reasons
+        )
+
+        competing_score = (
+            short_score
+        )
+
+    else:
+
+        final_score = int(
+            adjusted_score
+        )
+
+        reasons = (
+            short_reasons
+            +
+            dynamic_reasons
+        )
+
+        competing_score = (
+            long_score
+        )
+
+    # --------------------------------------------------------
+    # Minimum directional advantage
+    # --------------------------------------------------------
+
+    if (
+        final_score
+        <
+        EARLY_SCORE_MIN
+    ):
+
+        return None
+
+    if (
+        final_score
+        <=
+        competing_score + 4
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # 24h directional sanity check
+    # --------------------------------------------------------
+
+    if preliminary_side == "LONG":
+
+        if (
+            ticker[
+                "percentage"
+            ]
+            <
+            -5
+        ):
 
             return None
 
     else:
 
-        if ticker[
-            "percentage"
-        ] > 5:
+        if (
+            ticker[
+                "percentage"
+            ]
+            >
+            5
+        ):
 
             return None
 
+    # --------------------------------------------------------
+    # Exhaustion hard filter
+    # --------------------------------------------------------
+
+    if preliminary_side == "LONG":
+
+        if (
+            move_position >= 0.94
+            and
+            score_acceleration <= 0
+        ):
+
+            logger.info(
+                "EXHAUSTION SKIP | %s | LONG | "
+                "move_pos=%.2f | score_acc=%.2f",
+                symbol,
+                move_position,
+                score_acceleration
+            )
+
+            return None
+
+    else:
+
+        if (
+            move_position <= 0.06
+            and
+            score_acceleration <= 0
+        ):
+
+            logger.info(
+                "EXHAUSTION SKIP | %s | SHORT | "
+                "move_pos=%.2f | score_acc=%.2f",
+                symbol,
+                move_position,
+                score_acceleration
+            )
+
+            return None
+
+    # --------------------------------------------------------
+    # Early mode
+    # --------------------------------------------------------
+
+    entry_mode = "NORMAL"
+
+    if (
+        preliminary_score_value
+        <
+        EARLY_ENTRY_SCORE
+        and
+        final_score
+        >=
+        EARLY_SCORE_MIN
+        and
+        early_strength
+        >=
+        5
+    ):
+
+        entry_mode = "EARLY_CONFIRMATION"
+
+    # --------------------------------------------------------
+    # Leverage
+    # --------------------------------------------------------
+
     leverage = choose_leverage(
-        score,
+        final_score,
         atr_percent
     )
 
+    # --------------------------------------------------------
+    # Target ROI
+    # --------------------------------------------------------
+
     target_roi = (
         calculate_target_roi(
-            score,
-            atr_percent
+            final_score,
+            atr_percent,
+            move_position,
+            score_acceleration,
+            breakout_quality
         )
+    )
+
+    # --------------------------------------------------------
+    # Breakout reason
+    # --------------------------------------------------------
+
+    if breakout_type != "NONE":
+
+        reasons.append(
+            f"BREAKOUT={breakout_type}"
+        )
+
+    reasons.append(
+        f"ScoreAccel={score_acceleration:.2f}"
+    )
+
+    reasons.append(
+        f"MomentumAccel={momentum_acceleration:.3f}"
+    )
+
+    reasons.append(
+        f"MovePos={move_position:.2f}"
+    )
+
+    reasons.append(
+        f"TrendMaturity={trend_maturity}"
+    )
+
+    reasons.append(
+        f"FibPos={fib['position']:.2f}"
+    )
+
+    reasons.append(
+        f"EntryMode={entry_mode}"
     )
 
     return {
@@ -3707,10 +6929,13 @@ def analyze_symbol(
             symbol,
 
         "side":
-            side,
+            preliminary_side,
 
         "score":
-            score,
+            final_score,
+
+        "raw_score":
+            preliminary_score_value,
 
         "price":
             price,
@@ -3753,6 +6978,41 @@ def analyze_symbol(
             candidate[
                 "sources"
             ],
+
+        "score_acceleration":
+            score_acceleration,
+
+        "score_velocity":
+            score_velocity,
+
+        "momentum_acceleration":
+            momentum_acceleration,
+
+        "move_position":
+            move_position,
+
+        "trend_maturity":
+            trend_maturity,
+
+        "ichimoku_trend":
+            ichi["trend"],
+
+        "breakout_type":
+            breakout_type,
+
+        "breakout_quality":
+            breakout_quality,
+
+        "fib_position":
+            fib[
+                "position"
+            ],
+
+        "early_strength":
+            early_strength,
+
+        "entry_mode":
+            entry_mode,
     }
 
 
@@ -3815,17 +7075,31 @@ def find_best_signal(
                     "SIGNAL CANDIDATE | "
                     "%s | %s | "
                     "score=%s | "
+                    "raw=%s | "
                     "24h=%.2f%% | "
                     "ATR=%.2f%% | "
+                    "score_acc=%.2f | "
+                    "mom_acc=%.3f | "
+                    "move=%.2f | "
                     "target=%.2f%%",
                     result["side"],
                     result["symbol"],
                     result["score"],
+                    result["raw_score"],
                     result[
                         "ticker_percentage"
                     ],
                     result[
                         "atr_percent"
+                    ],
+                    result[
+                        "score_acceleration"
+                    ],
+                    result[
+                        "momentum_acceleration"
+                    ],
+                    result[
+                        "move_position"
                     ],
                     result[
                         "target_roi"
@@ -3848,7 +7122,15 @@ def find_best_signal(
 
     results.sort(
         key=lambda x:
-            x["score"],
+            (
+                x["score"],
+                x[
+                    "score_acceleration"
+                ],
+                x[
+                    "momentum_acceleration"
+                ]
+            ),
         reverse=True
     )
 
@@ -3875,32 +7157,153 @@ def final_entry_validation(
         symbol,
         side
     ):
+
         return False
 
-    if (
+    # --------------------------------------------------------
+    # Normal threshold
+    # --------------------------------------------------------
+
+    score_ok = (
         signal["score"]
-        <
+        >=
         EARLY_ENTRY_SCORE
+    )
+
+    # --------------------------------------------------------
+    # Early confirmation path
+    # --------------------------------------------------------
+
+    early_ok = (
+
+        signal["score"]
+        >=
+        EARLY_SCORE_MIN
+
+        and
+
+        signal[
+            "score_acceleration"
+        ]
+        >=
+        EARLY_ACCELERATION_MIN
+
+        and
+
+        signal[
+            "momentum_acceleration"
+        ]
+        >=
+        EARLY_MOMENTUM_ACCELERATION_MIN
+
+        and
+
+        signal[
+            "early_strength"
+        ]
+        >=
+        EARLY_CONFIRMATION_SCORE
+
+        and
+
+        signal[
+            "move_position"
+        ]
+        >=
+        0.10
+
+        and
+
+        signal[
+            "move_position"
+        ]
+        <=
+        0.90
+    )
+
+    if not (
+        score_ok
+        or
+        early_ok
     ):
+
         return False
 
+    # --------------------------------------------------------
+    # Funding
+    # --------------------------------------------------------
+
     if (
-        abs(signal["funding"])
+        abs(
+            signal["funding"]
+        )
         >=
         MAX_ABS_FUNDING
     ):
+
         return False
 
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
+
     if not (
-        0.08
+        MIN_ATR_PERCENT
         <=
         signal[
             "atr_percent"
         ]
         <=
-        8
+        MAX_ATR_PERCENT
     ):
+
         return False
+
+    # --------------------------------------------------------
+    # Exhaustion protection
+    # --------------------------------------------------------
+
+    if (
+        signal["move_position"]
+        >=
+        0.92
+        and
+        signal[
+            "score_acceleration"
+        ]
+        <=
+        0
+    ):
+
+        logger.info(
+            "ENTRY SKIP EXHAUSTION | %s",
+            symbol
+        )
+
+        return False
+
+    if (
+        signal["move_position"]
+        <=
+        0.08
+        and
+        signal[
+            "score_acceleration"
+        ]
+        <=
+        0
+    ):
+
+        logger.info(
+            "ENTRY SKIP EXHAUSTION | %s",
+            symbol
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # Fresh ticker
+    # --------------------------------------------------------
 
     try:
 
@@ -3915,6 +7318,7 @@ def final_entry_validation(
         )
 
         if fresh_price <= 0:
+
             return False
 
         original = signal[
@@ -3931,7 +7335,26 @@ def final_entry_validation(
             original
         )
 
-        if move > 0.012:
+        # ----------------------------------------------------
+        # Normal girişte %1.2 fiyat kaçışı.
+        #
+        # Erken confirmation'da biraz daha sıkı:
+        # hareket gerçekten kaçıyorsa kovalamıyoruz.
+        # ----------------------------------------------------
+
+        max_move = 0.012
+
+        if (
+            signal[
+                "entry_mode"
+            ]
+            ==
+            "EARLY_CONFIRMATION"
+        ):
+
+            max_move = 0.009
+
+        if move > max_move:
 
             logger.info(
                 "ENTRY SKIP | %s | "
@@ -3967,25 +7390,106 @@ def execute_signal(
         >=
         MAX_POSITIONS
     ):
+
         return False
 
     if not final_entry_validation(
         signal
     ):
+
         return False
 
     logger.warning(
         "ENTRY CONFIRMED | %s | %s | "
-        "score=%s | leverage=%sx | "
+        "score=%s | raw=%s | "
+        "mode=%s | leverage=%sx | "
         "target ROI=%.2f%%",
         signal["side"],
         signal["symbol"],
         signal["score"],
+        signal["raw_score"],
+        signal["entry_mode"],
         signal["leverage"],
         signal["target_roi"] * 100
     )
 
+    logger.warning(
+        "ENTRY QUALITY | %s | "
+        "score_acc=%.2f | "
+        "score_vel=%.2f | "
+        "momentum_acc=%.3f | "
+        "move=%.2f | "
+        "maturity=%s | "
+        "ichi=%s | "
+        "breakout=%s | "
+        "fib=%.2f",
+        signal["symbol"],
+        signal[
+            "score_acceleration"
+        ],
+        signal[
+            "score_velocity"
+        ],
+        signal[
+            "momentum_acceleration"
+        ],
+        signal[
+            "move_position"
+        ],
+        signal[
+            "trend_maturity"
+        ],
+        signal[
+            "ichimoku_trend"
+        ],
+        signal[
+            "breakout_type"
+        ],
+        signal[
+            "fib_position"
+        ]
+    )
+
+    metadata = {
+
+        "score_acceleration":
+            signal[
+                "score_acceleration"
+            ],
+
+        "score_velocity":
+            signal[
+                "score_velocity"
+            ],
+
+        "momentum_acceleration":
+            signal[
+                "momentum_acceleration"
+            ],
+
+        "move_position":
+            signal[
+                "move_position"
+            ],
+
+        "trend_maturity":
+            signal[
+                "trend_maturity"
+            ],
+
+        "breakout_type":
+            signal[
+                "breakout_type"
+            ],
+
+        "entry_mode":
+            signal[
+                "entry_mode"
+            ],
+    }
+
     return live_open_position(
+
         symbol=signal[
             "symbol"
         ],
@@ -4016,7 +7520,9 @@ def execute_signal(
 
         target_roi=signal[
             "target_roi"
-        ]
+        ],
+
+        metadata=metadata
     )
 
 
@@ -4073,7 +7579,7 @@ def scan_cycle():
     )
 
     logger.info(
-        "GAINERS: %s",
+        "GAINERS [10-35]: %s",
         [
             x["symbol"]
             for x in gainers
@@ -4081,7 +7587,7 @@ def scan_cycle():
     )
 
     logger.info(
-        "LOSERS: %s",
+        "LOSERS [10-35]: %s",
         [
             x["symbol"]
             for x in losers
@@ -4089,7 +7595,7 @@ def scan_cycle():
     )
 
     logger.info(
-        "VOLUME: %s",
+        "VOLUME [1-25]: %s",
         [
             x["symbol"]
             for x in volumes
@@ -4145,19 +7651,40 @@ def scan_cycle():
 
         logger.info(
             "TOP SIGNAL | %s | %s | "
-            "score=%s | "
+            "score=%s | raw=%s | "
             "24h=%.2f%% | "
             "ATR=%.2f%% | "
+            "score_acc=%.2f | "
+            "mom_acc=%.3f | "
+            "move=%.2f | "
+            "breakout=%s | "
+            "mode=%s | "
             "target=%.2f%% | "
             "sources=%s",
             signal["side"],
             signal["symbol"],
             signal["score"],
+            signal["raw_score"],
             signal[
                 "ticker_percentage"
             ],
             signal[
                 "atr_percent"
+            ],
+            signal[
+                "score_acceleration"
+            ],
+            signal[
+                "momentum_acceleration"
+            ],
+            signal[
+                "move_position"
+            ],
+            signal[
+                "breakout_type"
+            ],
+            signal[
+                "entry_mode"
             ],
             signal[
                 "target_roi"
@@ -4174,6 +7701,7 @@ def scan_cycle():
             >=
             MAX_POSITIONS
         ):
+
             break
 
         if execute_signal(
@@ -4226,11 +7754,56 @@ def bot_loop():
     )
 
     logger.warning(
-        "Gainers / Losers / Volume = "
-        "%s / %s / %s",
-        LIST_LIMIT,
-        LIST_LIMIT,
-        LIST_LIMIT
+        "GAINERS = %s-%s",
+        GAINER_START_RANK,
+        GAINER_END_RANK
+    )
+
+    logger.warning(
+        "LOSERS = %s-%s",
+        LOSER_START_RANK,
+        LOSER_END_RANK
+    )
+
+    logger.warning(
+        "VOLUME = first %s",
+        VOLUME_LIMIT
+    )
+
+    logger.warning(
+        "Ichimoku = ENABLED"
+    )
+
+    logger.warning(
+        "Fibonacci = ENABLED"
+    )
+
+    logger.warning(
+        "StochRSI = ENABLED"
+    )
+
+    logger.warning(
+        "Elder-Ray = ENABLED"
+    )
+
+    logger.warning(
+        "Score acceleration = ENABLED"
+    )
+
+    logger.warning(
+        "Momentum acceleration = ENABLED"
+    )
+
+    logger.warning(
+        "Breakout/Retest = ENABLED"
+    )
+
+    logger.warning(
+        "Early entry = ENABLED"
+    )
+
+    logger.warning(
+        "Exhaustion filter = ENABLED"
     )
 
     logger.warning(
@@ -4314,6 +7887,15 @@ def home():
         "max_leverage":
             MAX_LEVERAGE,
 
+        "gainer_range":
+            f"{GAINER_START_RANK}-{GAINER_END_RANK}",
+
+        "loser_range":
+            f"{LOSER_START_RANK}-{LOSER_END_RANK}",
+
+        "volume_range":
+            f"1-{VOLUME_LIMIT}",
+
         "last_scan":
             last_scan_time,
 
@@ -4345,10 +7927,14 @@ def status():
             ] = {
 
                 "side":
-                    position["side"],
+                    position[
+                        "side"
+                    ],
 
                 "entry":
-                    position["entry"],
+                    position[
+                        "entry"
+                    ],
 
                 "current":
                     position[
@@ -4356,16 +7942,24 @@ def status():
                     ],
 
                 "score":
-                    position["score"],
+                    position[
+                        "score"
+                    ],
 
                 "leverage":
-                    position["leverage"],
+                    position[
+                        "leverage"
+                    ],
 
                 "margin":
-                    position["margin"],
+                    position[
+                        "margin"
+                    ],
 
                 "notional":
-                    position["notional"],
+                    position[
+                        "notional"
+                    ],
 
                 "pnl":
                     position[
@@ -4397,6 +7991,48 @@ def status():
                         "peak_roi"
                     ] * 100,
 
+                "score_acceleration":
+                    position.get(
+                        "score_acceleration",
+                        0
+                    ),
+
+                "score_velocity":
+                    position.get(
+                        "score_velocity",
+                        0
+                    ),
+
+                "momentum_acceleration":
+                    position.get(
+                        "momentum_acceleration",
+                        0
+                    ),
+
+                "move_position":
+                    position.get(
+                        "move_position",
+                        0.5
+                    ),
+
+                "trend_maturity":
+                    position.get(
+                        "trend_maturity",
+                        0
+                    ),
+
+                "breakout_type":
+                    position.get(
+                        "breakout_type",
+                        "NONE"
+                    ),
+
+                "entry_mode":
+                    position.get(
+                        "entry_mode",
+                        "NORMAL"
+                    ),
+
                 "opened_at":
                     position[
                         "opened_at"
@@ -4425,6 +8061,7 @@ def status():
 
         "last_scan":
             last_scan_time,
+
     })
 
 
@@ -4476,7 +8113,7 @@ def health():
 def start_background_bot():
 
     # --------------------------------------------------------
-    # POZİSYON MONITOR
+    # POSITION MONITOR
     # --------------------------------------------------------
 
     monitor = threading.Thread(
