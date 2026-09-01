@@ -86,6 +86,14 @@ MIN_TRIGGER_SCORE = 68
 MIN_BREAKOUT_VOLUME_RATIO = 1.10
 REQUIRED_REVERSAL_CONFIRMATIONS = 2
 
+# Smart trigger: setup gevşek, gerçek entry teyidi akıllı
+SMART_TRIGGER_MIN_CONFIRMATIONS = 1
+SMART_TRIGGER_PATTERN_MIN_CONFIRMATIONS = 1
+BREAKOUT_BODY_RATIO_MIN = 0.30
+BREAKOUT_ATR_MIN = 0.08
+RETEST_VOLUME_MIN = 0.95
+MOMENTUM_LOOKBACK = 4
+
 # Daha esnek giriş: pattern breakoutları, klasik pullback kadar katı olmayan
 # ama yine de breakout + momentum/volume teyidi isteyen ikinci fırsat yolu.
 PATTERN_MIN_SCORE = 62
@@ -1061,10 +1069,14 @@ def confirm_breakout(df, level, direction):
         meaningful = (level - close) >= atr_val * 0.15
 
     volume_ok = volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO
-    body_ok = body_ratio >= 0.35  # zayıf/fitilli mumları ele
+    body_ok = body_ratio >= BREAKOUT_BODY_RATIO_MIN  # biraz daha esnek, yine de wick-only kırılımı ele
 
     if body_breaks and meaningful and volume_ok and body_ok:
         return {"confirmed": True, "type": "aggressive_breakout"}
+    # Akıllı trigger için hacim biraz zayıfsa fakat breakout + mum yapısı + momentum
+    # birlikte güçlü ise de adayın retest/trigger yoluna geçmesine izin ver.
+    if body_breaks and meaningful and body_ok and volume_ratio >= RETEST_VOLUME_MIN:
+        return {"confirmed": True, "type": "aggressive_breakout_soft_volume"}
 
     return {"confirmed": False, "type": None}
 
@@ -1084,15 +1096,15 @@ def confirm_breakout_retest(df, level, direction):
     prev_macd_hist = safe_float(df.iloc[-2]["macd_hist"])
 
     if direction == "long":
-        retested = last3["low"].min() <= level * 1.005
+        retested = last3["low"].min() <= level * 1.006
         held = last3["close"].iloc[-1] > level
         momentum_resumed = macd_hist > prev_macd_hist
     else:
-        retested = last3["high"].max() >= level * 0.995
+        retested = last3["high"].max() >= level * 0.994
         held = last3["close"].iloc[-1] < level
         momentum_resumed = macd_hist < prev_macd_hist
 
-    if retested and held and momentum_resumed and volume_ratio >= 1.0:
+    if retested and held and momentum_resumed and volume_ratio >= RETEST_VOLUME_MIN:
         return {"confirmed": True, "type": "confirmed_retest"}
 
     return {"confirmed": False, "type": None}
@@ -2485,19 +2497,21 @@ def final_entry_confirmation(candidate):
         df5 = enrich_dataframe(df5)
 
         structure_break = detect_micro_structure_break(df5, direction)
-        pattern = detect_chart_patterns(df5, direction) if candidate.get("chart_pattern") else {"detected": False}
+        pattern_type = candidate.get("chart_pattern")
+        pattern_level = safe_float(candidate.get("structure_level"))
 
         if structure_break["broken"]:
             level = structure_break["level"]
             breakout_result = confirm_breakout(df5, level, direction)
             if not breakout_result["confirmed"]:
                 breakout_result = confirm_breakout_retest(df5, level, direction)
-            if not breakout_result["confirmed"] and pattern.get("detected"):
-                level = pattern.get("break_level")
-                breakout_result = confirm_pattern_breakout(df5, pattern, direction)
-        elif pattern.get("detected"):
-            level = pattern.get("break_level")
-            breakout_result = confirm_pattern_breakout(df5, pattern, direction)
+        elif pattern_type and pattern_level > 0:
+            # Aday üretiminde bulunan pattern seviyesi korunur. 5m'de patterni
+            # yeniden keşfetmek yerine aynı neckline/flag seviyesinin kırılımını
+            # doğruluyoruz; böylece pattern kayması yanlış giriş üretmez.
+            level = pattern_level
+            pattern_stub = {"detected": True, "type": pattern_type, "break_level": level}
+            breakout_result = confirm_pattern_breakout(df5, pattern_stub, direction)
         else:
             logger.info("[ENTRY RED] %s yapı/pattern kırılımı artık geçerli değil.", symbol)
             return False
@@ -2508,6 +2522,51 @@ def final_entry_confirmation(candidate):
 
         if is_entry_chasing(df5, direction, level):
             logger.info("[ENTRY RED] %s fiyat kırılımdan çok uzaklaşmış (chase).", symbol)
+            return False
+
+        # SMART TRIGGER: SETUP gevşek kalabilir; FIRE aşamasında en az bir
+        # gerçek momentum dönüş teyidi zorunlu. Böylece yalnızca formasyon
+        # bulunduğu için agresif breakout ile pozisyon açılması engellenir.
+        momentum_accel_live = calculate_momentum_acceleration(df5, direction)
+        rsi_live = df5["rsi"].tail(MOMENTUM_LOOKBACK).values
+        if direction == "long":
+            rsi_live_turn = bool(rsi_live[-1] > rsi_live[0] and rsi_live[-1] >= rsi_live[-2])
+        else:
+            rsi_live_turn = bool(rsi_live[-1] < rsi_live[0] and rsi_live[-1] <= rsi_live[-2])
+
+        ema9_live = safe_float(df5.iloc[-1]["ema9_slope"])
+        ema21_live = safe_float(df5.iloc[-1]["ema21_slope"])
+        ema_live_ok = ((ema9_live > 0 and ema21_live >= -abs(ema9_live) * 0.75)
+                       if direction == "long" else
+                       (ema9_live < 0 and ema21_live <= abs(ema9_live) * 0.75))
+
+        momentum_confirmations = sum([
+            bool(momentum_accel_live.get("accelerating")),
+            rsi_live_turn,
+            ema_live_ok,
+        ])
+
+        # Pattern breakoutlarında breakout zaten yapısal teyittir; buna ek
+        # olarak en az bir momentum teyidi isteriz. Klasik continuation'da
+        # da aynı minimum korunur. Bu, eski 2/3 katı trigger şartından daha
+        # esnek ama salt pattern -> entry geçişinden daha güvenlidir.
+        if momentum_confirmations < SMART_TRIGGER_MIN_CONFIRMATIONS:
+            logger.info(
+                "[ENTRY RED] %s smart trigger zayıf | momentum=%s rsi=%s ema=%s",
+                symbol, momentum_accel_live.get("accelerating"), rsi_live_turn, ema_live_ok
+            )
+            return False
+
+        # Breakout candle'ın bir önceki kapanışa göre gerçekten ivme ürettiğini
+        # de kontrol et. Çok küçük/kararsız kırılımlarda bekle.
+        prev_close = safe_float(df5.iloc[-2]["close"])
+        last_close = safe_float(df5.iloc[-1]["close"])
+        if direction == "long":
+            price_accel_ok = last_close > prev_close
+        else:
+            price_accel_ok = last_close < prev_close
+        if not price_accel_ok:
+            logger.info("[ENTRY RED] %s breakout sonrası fiyat ivmesi yok.", symbol)
             return False
 
         funding = get_funding(symbol)
