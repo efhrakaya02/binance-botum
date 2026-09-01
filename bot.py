@@ -1779,8 +1779,8 @@ def close_real_position(key, reason, exit_price):
 def position_monitor_loop():
     while running:
        time.sleep(POSITION_MONITOR_INTERVAL)
-        positions = get_local_positions()
-        if not positions:
+       positions = get_local_positions()
+       if not positions:
             continue
         sync_real_positions()
         for key, pos in positions.items():
