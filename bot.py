@@ -1502,6 +1502,10 @@ def fetch_current_price(symbol):
     ticker = safe_call(exchange.fetch_ticker, symbol)
     return safe_float(ticker.get("last"))
 
+# DÜZELTME: Hata veren fetch_current_price_fast fonksiyonu eklendi
+def fetch_current_price_fast(symbol):
+    return fetch_current_price(symbol)
+
 def calculate_amount(margin, leverage, price):
     notional = margin * leverage
     return notional / price
@@ -1518,6 +1522,13 @@ def place_stop_market_order(symbol, position_side, amount, stop_price):
     except Exception as e:
         logger.error("%s FAILSAFE STOP emri yerleştirilemedi: %s", symbol, e)
         return None
+
+# DÜZELTME: Eksik olan cancel_stop_order fonksiyonu eklendi
+def cancel_stop_order(symbol, order_id):
+    try:
+        safe_call(exchange.cancel_order, order_id, symbol)
+    except Exception as e:
+        logger.warning("%s stop emri iptal edilemedi (%s): %s", symbol, order_id, e)
 
 def write_trade_journal(entry):
     logger.warning("[JOURNAL] %s", json.dumps(entry, default=str, ensure_ascii=False))
@@ -1778,15 +1789,14 @@ def close_real_position(key, reason, exit_price):
 
 def position_monitor_loop():
     while running:
-       time.sleep(POSITION_MONITOR_INTERVAL)
-       positions = get_local_positions()
-       if not positions:
+        time.sleep(POSITION_MONITOR_INTERVAL)
+        positions = get_local_positions()
+        if not positions:
             continue
         sync_real_positions()
         for key, pos in positions.items():
             try:
-                # fetch_current_price_fast yerine fetch_current_price kullanılıyor
-                price = fetch_current_price(pos["symbol"])
+                price = fetch_current_price_fast(pos["symbol"])
                 if price <= 0:
                     continue
                 should_close, reason = should_close_position(pos, price)
