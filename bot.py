@@ -2,6 +2,7 @@ import os
 import time
 import math
 import gc
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -13,29 +14,36 @@ from flask import Flask, jsonify
 
 
 # ============================================================
-# BINANCE FUTURES MOMENTUM BOT V2
+# BINANCE FUTURES — HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3
 # ============================================================
 #
-# ANA MANTIK
+# STRATEJİ ÖZETİ
 # ------------------------------------------------------------
-# - Cron YOK
-# - Bot kendi başına sürekli çalışır
-# - Binance Futures
-# - ISOLATED margin
-# - Gainers Top 25 + Losers Top 25
-# - 5m / 15m / 1h / 4h analiz
-# - Trend + momentum + hacim + fiyat yapısı
-# - Entry timing confirmation
-# - Scalp: dinamik hedef + ATR trailing
-# - Opportunity: geniş hedef + ATR trailing
-# - Hedef %75 görüldüğünde kâr kilitleme
-# - Güçlü trend devam ederse TP sonrası pozisyonu taşıma
-# - Momentum/trend bozulmasında erken çıkış
-# - Başlangıç SL <= TP'nin %60'ı
-# - Maksimum 1 Scalp + 1 Opportunity
-# - Maksimum toplam 2 pozisyon
-# - Ayrı pozisyon monitor thread
+# Eski SCALP / OPPORTUNITY ayrımı kaldırıldı. Tek strateji:
 #
+#   MARKET REGIME -> TREND -> PULLBACK -> PULLBACK EXHAUSTION ->
+#   MOMENTUM REVERSAL -> MOMENTUM ACCELERATION -> MICRO STRUCTURE
+#   BREAK -> BREAKOUT CONFIRMATION -> VOLUME CONFIRMATION ->
+#   CANDLE CLOSE -> EXPECTED MOVE -> ENTRY
+#
+# Giriş motoru dört kavramsal aşamadan oluşur:
+#   SETUP (aday)  -> WATCH (pullback bitiyor mu) ->
+#   ARM (momentum dönüyor mu) -> FIRE (yapı kırılımı + hacim + mum
+#   kapanışı teyidiyle giriş)
+#
+# SETUP_SCORE (4H/1H/15M zemin kalitesi) ve TRIGGER_SCORE (5M giriş
+# zamanlaması kalitesi) ayrı ayrı hesaplanır; ikisi de eşiği geçmeden
+# işlem açılmaz.
+#
+# Pozisyon açıldıktan sonra: ATR + yapı bazlı dinamik stop, hedefin
+# (min +%10 ROI) %75'inde kâr kilitleme + ATR trailing (asla pozisyon
+# aleyhine gevşetilmez), gerçek bir trend/momentum/yapı çöküşü
+# olmadıkça küçük kârla erken kapatma yapılmaz.
+#
+# KORUNAN ALTYAPI: ccxt/Binance Futures bağlantısı, OHLCV/indikatör
+# hesaplama, logging, DRY_RUN, thread/monitor iskeleti, native
+# STOP_MARKET failsafe, funding kontrolleri, BTC rejim mantığı,
+# env variable tabanlı config yaklaşımı.
 # ============================================================
 
 
@@ -52,101 +60,96 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 PORT = int(os.getenv("PORT", "8080"))
 
 # ------------------------------------------------------------
-# Pozisyon
+# Pozisyon parametreleri  (YENİ — tek strateji)
 # ------------------------------------------------------------
 
-SCALP_ENABLED = True
-OPPORTUNITY_ENABLED = True
-
-SCALP_MARGIN = 10.0
-OPPORTUNITY_MARGIN = 15.0
-
-MAX_SCALP_POSITIONS = 1
-MAX_OPPORTUNITY_POSITIONS = 1
-MAX_TOTAL_POSITIONS = 2
-
-MIN_LEVERAGE = 3
-MAX_LEVERAGE = 5
+MARGIN_PER_TRADE = 10.0     # Her işlem sabit ~10 USDT margin kullanır
+MAX_LEVERAGE = 5             # Kaldıraç ASLA bunu geçmez (1x-5x arası dinamik)
+MIN_LEVERAGE = 1
+MAX_OPEN_POSITIONS = 3       # Aynı anda en fazla 3 açık pozisyon
 
 # ------------------------------------------------------------
-# Skorlar
+# Hedef / Kâr Kilitleme / Risk  (YENİ)
 # ------------------------------------------------------------
 
-SCALP_MIN_SCORE = 68
-OPPORTUNITY_MIN_SCORE = 70
+MIN_TARGET_ROI = 10.0                 # İlk kâr milestone'u (%), kapanış tetiği DEĞİL
+PROFIT_LOCK_TRIGGER_RATIO = 0.75      # Hedefin %75'inde kâr kilitleme + trailing aktifleşir
+MAX_LOSS_TO_TARGET_RATIO = 0.50       # Maksimum zarar, hedefin %50'sini geçemez (1:2 R/R tabanı)
 
 # ------------------------------------------------------------
-# Risk
+# Setup / Trigger skorları  (YENİ)
 # ------------------------------------------------------------
 
-MAX_LOSS_TO_TARGET_RATIO = 0.60
+MIN_SETUP_SCORE = 75
+MIN_TRIGGER_SCORE = 75
 
-# Maksimum başlangıç SL
-MIN_SCALP_TP_PCT = 1.20
-MAX_SCALP_TP_PCT = 5.00
-
-MIN_OPP_TP_PCT = 2.00
-MAX_OPP_TP_PCT = 10.00
+MIN_BREAKOUT_VOLUME_RATIO = 1.15
+REQUIRED_REVERSAL_CONFIRMATIONS = 2   # Erken çıkış için gereken ters sinyal sayısı (trend/momentum/yapı)
 
 # ------------------------------------------------------------
-# Monitor
+# ATR bazlı stop / trailing  (YENİ)
 # ------------------------------------------------------------
 
-POSITION_MONITOR_INTERVAL = 1.0
-ANALYSIS_INTERVAL = 300
-NO_SIGNAL_INTERVAL = 60
-
-# Dynamic ATR stop / profit lock
-ATR_STOP_MULTIPLIER_SCALP = 1.60
-ATR_STOP_MULTIPLIER_OPPORTUNITY = 2.20
-ATR_REFRESH_INTERVAL_MS = 15_000
-PROFIT_LOCK_TRIGGER = 0.75
-PROFIT_LOCK_RATIO = 0.60
-TAKER_FEE_RATE = float(os.getenv("TAKER_FEE_RATE", "0.0004"))
-NET_PROFIT_BUFFER_ROI = float(os.getenv("NET_PROFIT_BUFFER_ROI", "0.20"))
+INITIAL_STOP_ATR_MULTIPLIER = 1.8
+TRAILING_ATR_MULTIPLIER = 1.5
+MAX_ENTRY_CHASE_ATR = 1.8             # Kırılımdan bu kadar ATR uzaklaşmışsa artık "geç kalınmış" sayılır
 
 # ------------------------------------------------------------
-# Aday sayısı / Likidite / BTC rejimi (YENİ)
+# Aday sayısı / Likidite / BTC rejimi
 # ------------------------------------------------------------
 
 TOP_N_CANDIDATES = 5
 MIN_QUOTE_VOLUME_USDT = 2_000_000
 BTC_SYMBOL = "BTC/USDT"
 BTC_REGIME_MIN_STRENGTH = 60
+CORRELATION_MAX_ALLOWED = 0.85        # Açık pozisyonlarla bu korelasyonun üzerindeki adaylar elenir
 
 # ------------------------------------------------------------
-# Cooldown
+# Monitor / Döngü
+# ------------------------------------------------------------
+
+POSITION_MONITOR_INTERVAL = 1.0
+ANALYSIS_INTERVAL = 300
+NO_SIGNAL_INTERVAL = 60
+LIVE_CHECK_INTERVAL_MS = 15000
+
+# ------------------------------------------------------------
+# Cooldown / Funding
 # ------------------------------------------------------------
 
 COOLDOWN_HOURS = 4
 COOLDOWN_MS = COOLDOWN_HOURS * 60 * 60 * 1000
 
-# ------------------------------------------------------------
-# Funding
-# ------------------------------------------------------------
-
 FUNDING_SKIP_THRESHOLD = 0.0015
 
 # ------------------------------------------------------------
-# Binance
+# Komisyon (tahmini net ROI hesaplaması için)  (YENİ)
+# ------------------------------------------------------------
+
+TAKER_FEE_PCT = 0.05   # Binance Futures taker ~%0.05 (giriş+çıkış, entry+exit ayrı ayrı uygulanır)
+
+# ------------------------------------------------------------
+# Binance / Teknik eşikler
 # ------------------------------------------------------------
 
 OHLCV_LIMIT = 250
 
-# ------------------------------------------------------------
-# Technical thresholds
-# ------------------------------------------------------------
-
 ADX_STRONG = 25
 ADX_VERY_STRONG = 35
 
-RSI_LONG_MIN = 52
-RSI_LONG_MAX = 72
-
-RSI_SHORT_MIN = 28
-RSI_SHORT_MAX = 48
-
 VOLUME_CONFIRMATION = 1.15
+
+# ------------------------------------------------------------
+# Failsafe stop
+# ------------------------------------------------------------
+
+HARD_STOP_BUFFER = 1.15  # native stop, yazılımsal SL'den %15 daha geniş
+
+# ------------------------------------------------------------
+# Trade journal
+# ------------------------------------------------------------
+
+TRADE_JOURNAL_PATH = os.getenv("TRADE_JOURNAL_PATH", "/tmp/trade_journal.jsonl")
 
 # ------------------------------------------------------------
 # Logging
@@ -159,7 +162,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("MOMENTUM_BOT")
+logger = logging.getLogger("HC_BOT")
 
 
 # ============================================================
@@ -177,8 +180,6 @@ last_successful_analysis = None
 
 cooldowns = {}
 
-signal_cache = {}
-
 bot_stats = {
     "analysis_count": 0,
     "signals_found": 0,
@@ -188,8 +189,6 @@ bot_stats = {
 }
 
 local_positions = {}
-
-candidate_lock = threading.Lock()
 
 
 # ============================================================
@@ -203,7 +202,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "running",
-        "bot": "Binance Futures Momentum Bot V2",
+        "bot": "High-Conviction Pullback & Breakout Bot V3",
         "dry_run": DRY_RUN,
         "testnet": TESTNET,
         "positions": get_local_positions(),
@@ -260,9 +259,8 @@ def create_exchange():
     exchange.load_markets()
 
     logger.info(
-        "Binance bağlantısı hazır | TESTNET=%s | DRY_RUN=%s",
-        TESTNET,
-        DRY_RUN
+        "Binance bağlantısı hazır | TESTNET=%s | DRY_RUN=%s | MAX_LEVERAGE=%sx | MAX_OPEN_POSITIONS=%s",
+        TESTNET, DRY_RUN, MAX_LEVERAGE, MAX_OPEN_POSITIONS
     )
 
     return exchange
@@ -278,18 +276,10 @@ def safe_call(fn, *args, retries=3, delay=1, **kwargs):
     for attempt in range(retries):
         try:
             return fn(*args, **kwargs)
-
         except Exception as e:
             last_error = e
             bot_stats["errors"] += 1
-
-            logger.warning(
-                "API hata (%s/%s): %s",
-                attempt + 1,
-                retries,
-                e
-            )
-
+            logger.warning("API hata (%s/%s): %s", attempt + 1, retries, e)
             time.sleep(delay * (attempt + 1))
 
     raise last_error
@@ -311,14 +301,10 @@ def safe_float(value, default=0.0):
     try:
         if value is None:
             return default
-
         result = float(value)
-
         if not math.isfinite(result):
             return default
-
         return result
-
     except Exception:
         return default
 
@@ -326,7 +312,6 @@ def safe_float(value, default=0.0):
 def normalize_symbol(symbol):
     if not symbol:
         return None
-
     return symbol.replace("/", "").replace(":USDT", "").upper()
 
 
@@ -339,15 +324,7 @@ def symbol_is_valid(symbol):
     if "/USDT" not in s:
         return False
 
-    blacklist = [
-        "UP/",
-        "DOWN/",
-        "BEAR/",
-        "BULL/",
-        "_",
-        "BID/",
-        "ASK/",
-    ]
+    blacklist = ["UP/", "DOWN/", "BEAR/", "BULL/", "_", "BID/", "ASK/"]
 
     return not any(x in s for x in blacklist)
 
@@ -389,33 +366,18 @@ def format_amount(symbol, amount):
 # ============================================================
 
 def ema(series, period):
-    return series.ewm(
-        span=period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    return series.ewm(span=period, adjust=False, min_periods=period).mean()
 
 
 def rsi(series, period=14):
     delta = series.diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
-
     result = 100 - (100 / (1 + rs))
 
     return result.fillna(50)
@@ -430,27 +392,17 @@ def atr(df, period=14):
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
 
-    tr = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
-    ).max(axis=1)
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    return tr.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 def macd(series):
     fast = ema(series, 12)
     slow = ema(series, 26)
-
     macd_line = fast - slow
     signal = ema(macd_line, 9)
-
     histogram = macd_line - signal
-
     return macd_line, signal, histogram
 
 
@@ -462,62 +414,22 @@ def adx(df, period=14):
     plus_dm = high.diff()
     minus_dm = -low.diff()
 
-    plus_dm = plus_dm.where(
-        (plus_dm > minus_dm) & (plus_dm > 0),
-        0
-    )
-
-    minus_dm = minus_dm.where(
-        (minus_dm > plus_dm) & (minus_dm > 0),
-        0
-    )
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
 
     tr1 = high - low
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    tr = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1
-    ).max(axis=1)
+    atr_val = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
-    atr_val = tr.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / atr_val.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / atr_val.replace(0, np.nan)
 
-    plus_di = (
-        100 *
-        plus_dm.ewm(
-            alpha=1 / period,
-            adjust=False,
-            min_periods=period
-        ).mean() /
-        atr_val.replace(0, np.nan)
-    )
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
 
-    minus_di = (
-        100 *
-        minus_dm.ewm(
-            alpha=1 / period,
-            adjust=False,
-            min_periods=period
-        ).mean() /
-        atr_val.replace(0, np.nan)
-    )
-
-    dx = (
-        100 *
-        (plus_di - minus_di).abs() /
-        (plus_di + minus_di).replace(0, np.nan)
-    )
-
-    adx_val = dx.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period
-    ).mean().fillna(0)
+    adx_val = dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean().fillna(0)
 
     return adx_val, plus_di.fillna(0), minus_di.fillna(0)
 
@@ -525,68 +437,42 @@ def adx(df, period=14):
 def bollinger(series, period=20, std_mult=2):
     middle = series.rolling(period).mean()
     std = series.rolling(period).std()
-
-    upper = middle + std_mult * std
-    lower = middle - std_mult * std
-
-    return middle, upper, lower
+    return middle, middle + std_mult * std, middle - std_mult * std
 
 
 def obv(df):
     direction = np.sign(df["close"].diff()).fillna(0)
-
-    return (
-        direction *
-        df["volume"]
-    ).cumsum()
+    return (direction * df["volume"]).cumsum()
 
 
 def roc(series, period=10):
-    return (
-        series.pct_change(periods=period) * 100
-    )
+    return series.pct_change(periods=period) * 100
 
 
 # ============================================================
-# DATA
+# DATA  (LOOK-AHEAD BIAS KORUMASI DAHİL)
 # ============================================================
+# Binance'in son döndürdüğü mum, HENÜZ KAPANMAMIŞ olan o anki
+# candle'dır. Sinyal üretiminde bu mumu kullanmak look-ahead bias
+# yaratır (henüz oluşmamış bir sonucu "biliyormuş" gibi davranmak).
+# Bu yüzden fetch_ohlcv_closed() sinyal/indikatör hesaplamaları için
+# HER ZAMAN son (kapanmamış) satırı atar. Yalnızca anlık fiyat
+# okumaları (fetch_current_price) için ham/güncel veri kullanılır.
 
 def fetch_ohlcv(symbol, timeframe, limit=OHLCV_LIMIT):
     try:
-        data = safe_call(
-            exchange.fetch_ohlcv,
-            symbol,
-            timeframe,
-            None,
-            limit
-        )
+        data = safe_call(exchange.fetch_ohlcv, symbol, timeframe, None, limit)
 
         if not data:
             return None
 
         df = pd.DataFrame(
             data,
-            columns=[
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume"
-            ]
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
 
-        for col in [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce"
-            )
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df.dropna(inplace=True)
 
@@ -596,14 +482,18 @@ def fetch_ohlcv(symbol, timeframe, limit=OHLCV_LIMIT):
         return df
 
     except Exception as e:
-        logger.warning(
-            "%s %s OHLCV alınamadı: %s",
-            symbol,
-            timeframe,
-            e
-        )
-
+        logger.warning("%s %s OHLCV alınamadı: %s", symbol, timeframe, e)
         return None
+
+
+def fetch_ohlcv_closed(symbol, timeframe, limit=OHLCV_LIMIT):
+    """Sinyal/indikatör hesaplaması için: son (kapanmamış) mum atılır."""
+    df = fetch_ohlcv(symbol, timeframe, limit)
+
+    if df is None or len(df) < 101:
+        return None
+
+    return df.iloc[:-1].reset_index(drop=True)
 
 
 def enrich_dataframe(df):
@@ -614,98 +504,62 @@ def enrich_dataframe(df):
     df["ema50"] = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
 
+    # EMA slope (yön ve hız) — YENİ
+    df["ema9_slope"] = df["ema9"].diff()
+    df["ema21_slope"] = df["ema21"].diff()
+
     df["rsi"] = rsi(df["close"])
+    df["rsi_slope"] = df["rsi"].diff()
 
     df["atr"] = atr(df)
 
-    (
-        df["macd"],
-        df["macd_signal"],
-        df["macd_hist"]
-    ) = macd(df["close"])
+    df["macd"], df["macd_signal"], df["macd_hist"] = macd(df["close"])
+    df["macd_hist_slope"] = df["macd_hist"].diff()
 
     df["adx"], df["plus_di"], df["minus_di"] = adx(df)
 
-    (
-        df["bb_mid"],
-        df["bb_upper"],
-        df["bb_lower"]
-    ) = bollinger(df["close"])
+    df["bb_mid"], df["bb_upper"], df["bb_lower"] = bollinger(df["close"])
 
     df["obv"] = obv(df)
 
-    df["volume_ma20"] = (
-        df["volume"]
-        .rolling(20)
-        .mean()
-    )
-
-    df["volume_ratio"] = (
-        df["volume"] /
-        df["volume_ma20"].replace(0, np.nan)
-    )
+    df["volume_ma20"] = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / df["volume_ma20"].replace(0, np.nan)
 
     df["roc"] = roc(df["close"], 10)
 
-    df["recent_high"] = (
-        df["high"]
-        .rolling(20)
-        .max()
-    )
+    df["recent_high"] = df["high"].rolling(20).max()
+    df["recent_low"] = df["low"].rolling(20).min()
 
-    df["recent_low"] = (
-        df["low"]
-        .rolling(20)
-        .min()
-    )
+    df["atr_pct"] = df["atr"] / df["close"] * 100
 
-    df["atr_pct"] = (
-        df["atr"] /
-        df["close"] *
-        100
-    )
+    # Mum gövde/aralık oranı — breakout kalitesi için (YENİ)
+    candle_range = (df["high"] - df["low"]).replace(0, np.nan)
+    df["body_ratio"] = (df["close"] - df["open"]).abs() / candle_range
 
     return df
 
 
 # ============================================================
-# GAINERS / LOSERS  (+ LIKIDITE FILTRESI)
+# GAINERS / LOSERS / VOLUME  (+ LIKIDITE FILTRESI)
 # ============================================================
 
 def get_top_movers():
-    tickers = safe_call(
-        exchange.fetch_tickers
-    )
+    tickers = safe_call(exchange.fetch_tickers)
 
     rows = []
 
     for symbol, ticker in tickers.items():
-
         if not symbol_is_valid(symbol):
             continue
-
         try:
-            last = safe_float(
-                ticker.get("last")
-            )
-
-            percentage = safe_float(
-                ticker.get("percentage")
-            )
-
-            quote_volume = safe_float(
-                ticker.get("quoteVolume")
-            )
+            last = safe_float(ticker.get("last"))
+            percentage = safe_float(ticker.get("percentage"))
+            quote_volume = safe_float(ticker.get("quoteVolume"))
 
             if last <= 0:
                 continue
 
-            rows.append({
-                "symbol": symbol,
-                "percentage": percentage,
-                "quoteVolume": quote_volume
-            })
-
+            rows.append({"symbol": symbol, "percentage": percentage, "quoteVolume": quote_volume})
         except Exception:
             continue
 
@@ -713,36 +567,15 @@ def get_top_movers():
         return [], [], []
 
     df = pd.DataFrame(rows)
-
-    # Likidite filtresi (eski: sadece > 0, yeni: minimum eşik)
     df = df[df["quoteVolume"] >= MIN_QUOTE_VOLUME_USDT]
 
     if df.empty:
-        logger.warning(
-            "[LIKIDITE] MIN_QUOTE_VOLUME_USDT=%s eşiğini geçen coin yok.",
-            MIN_QUOTE_VOLUME_USDT
-        )
+        logger.warning("[LIKIDITE] MIN_QUOTE_VOLUME_USDT=%s eşiğini geçen coin yok.", MIN_QUOTE_VOLUME_USDT)
         return [], [], []
 
-    gainers = (
-        df.sort_values("percentage", ascending=False)
-        .head(25)["symbol"].tolist()
-    )
-
-    losers = (
-        df.sort_values("percentage", ascending=True)
-        .head(25)["symbol"].tolist()
-    )
-
-    # 24s hacim lideri top 25 (YENİ)
-    # Gainers/losers %değişime göre seçilir, bu yüzden yüksek
-    # likiditeli ama o an aşırı %hareket göstermeyen (dolayısıyla
-    # gainers/losers listesine girmeyen) coinleri kaçırabilir.
-    # Hacme göre ayrı bir top-25 bu boşluğu kapatır.
-    volume_leaders = (
-        df.sort_values("quoteVolume", ascending=False)
-        .head(25)["symbol"].tolist()
-    )
+    gainers = df.sort_values("percentage", ascending=False).head(25)["symbol"].tolist()
+    losers = df.sort_values("percentage", ascending=True).head(25)["symbol"].tolist()
+    volume_leaders = df.sort_values("quoteVolume", ascending=False).head(25)["symbol"].tolist()
 
     return gainers, losers, volume_leaders
 
@@ -753,128 +586,20 @@ def get_top_movers():
 
 def get_funding(symbol):
     try:
-        funding = safe_call(
-            exchange.fetch_funding_rate,
-            symbol
-        )
-
-        return safe_float(
-            funding.get("fundingRate")
-        )
-
+        funding = safe_call(exchange.fetch_funding_rate, symbol)
+        return safe_float(funding.get("fundingRate"))
     except Exception:
         return 0.0
 
 
 # ============================================================
-# TAKER BUY/SELL RATIO
+# BTC PIYASA REJIMI
 # ============================================================
-# Hacim artışının gerçekten alıcı mı satıcı mı kaynaklı olduğunu
-# ayırt etmek için Binance Futures'ın taker long/short ratio
-# verisini kullanıyoruz. Bu veri her coin için ekstra bir API
-# çağrısı gerektirdiğinden yalnızca ön elemeyi geçen adaylarda
-# (top-5 aşamasında) kullanılması önerilir.
-#
-# NOT: Bu endpoint ccxt'de farklı sürümlerde farklı implicit
-# metot adlarıyla bulunabiliyor (bazı sürümlerde hiç yok). Bu
-# yüzden birkaç aday metot adını sırayla deneyip hangisi
-# kullanılabilir buluyoruz; hiçbiri yoksa BİR KEZ uyarı basıp
-# bu veriyi sessizce atlıyoruz (skor/işlem akışını etkilemez).
-
-TAKER_RATIO_METHOD_CANDIDATES = [
-    "fapiDataGetTakerlongshortRatio",
-    "fapiDataGetDeliveryPriceTakerlongshortRatio",
-    "fapiPublicGetFuturesDataTakerlongshortRatio",
-]
-
-_taker_ratio_method_name = None
-_taker_ratio_checked = False
-
-
-def _resolve_taker_ratio_method():
-    global _taker_ratio_method_name, _taker_ratio_checked
-
-    if _taker_ratio_checked:
-        return _taker_ratio_method_name
-
-    _taker_ratio_checked = True
-
-    for name in TAKER_RATIO_METHOD_CANDIDATES:
-        if hasattr(exchange, name):
-            _taker_ratio_method_name = name
-            logger.info("[TAKER RATIO] Kullanılacak ccxt metodu bulundu: %s", name)
-            return name
-
-    logger.warning(
-        "[TAKER RATIO] Bu ccxt sürümünde uygun endpoint bulunamadı, "
-        "taker ratio filtresi bu çalıştırmada pas geçilecek (diğer analizleri etkilemez)."
-    )
-    return None
-
-
-def get_taker_ratio(symbol, period="15m"):
-    method_name = _resolve_taker_ratio_method()
-
-    if not method_name:
-        return None
-
-    try:
-        market_symbol = normalize_symbol(symbol)
-        fn = getattr(exchange, method_name)
-
-        raw = safe_call(
-            fn,
-            {
-                "symbol": market_symbol,
-                "period": period,
-                "limit": 5
-            }
-        )
-
-        if not raw:
-            return None
-
-        last = raw[-1]
-
-        buy_vol = safe_float(last.get("buyVol"))
-        sell_vol = safe_float(last.get("sellVol"))
-
-        if buy_vol <= 0 and sell_vol <= 0:
-            return None
-
-        total = buy_vol + sell_vol
-
-        if total <= 0:
-            return None
-
-        return {
-            "buy_ratio": buy_vol / total,
-            "sell_ratio": sell_vol / total,
-        }
-
-    except Exception as e:
-        logger.info(
-            "%s taker ratio alınamadı (opsiyonel veri): %s",
-            symbol,
-            e
-        )
-        return None
-
-
-# ============================================================
-# BTC PIYASA REJIMI FILTRESI
-# ============================================================
-# Altcoinler büyük ölçüde BTC ile korelasyonlu hareket eder.
-# BTC net bir trend içindeyken bu trende ters yönde açılan
-# işlemler istatistiksel olarak dezavantajlıdır. Bu fonksiyon
-# analysis_cycle başında BIR KEZ çağrılır ve tüm adaylara
-# parametre olarak geçirilir (her coin için tekrar tekrar
-# çağırmak gereksiz API yükü yaratır).
 
 def get_btc_regime():
     try:
-        df15 = fetch_ohlcv(BTC_SYMBOL, "15m", 100)
-        df1h = fetch_ohlcv(BTC_SYMBOL, "1h", 100)
+        df15 = fetch_ohlcv_closed(BTC_SYMBOL, "15m", 100)
+        df1h = fetch_ohlcv_closed(BTC_SYMBOL, "1h", 100)
 
         if df15 is None or df1h is None:
             return {"direction": "neutral", "strength": 0}
@@ -885,10 +610,7 @@ def get_btc_regime():
         t15 = timeframe_trend(df15)
         t1h = timeframe_trend(df1h)
 
-        if (
-            t15["direction"] == t1h["direction"]
-            and t15["direction"] != "neutral"
-        ):
+        if t15["direction"] == t1h["direction"] and t15["direction"] != "neutral":
             strength = (t15["strength"] + t1h["strength"]) / 2
             return {"direction": t15["direction"], "strength": strength}
 
@@ -902,11 +624,6 @@ def get_btc_regime():
 # ============================================================
 # ANOMALI / PUMP-DUMP FILTRESI
 # ============================================================
-# Gainers/losers listesi doğası gereği ani, sert hareketli
-# coinleri getirir. Bunların bir kısmı düşük likiditeli
-# coinlerde manipülatif (pump&dump) olabilir. Son birkaç mumda
-# hacim teyidi OLMADAN aşırı sert tek yönlü hareket varsa
-# bu coini eliyoruz.
 
 def detect_anomaly(df):
     if df is None or len(df) < 10:
@@ -915,17 +632,11 @@ def detect_anomaly(df):
     last5 = df.tail(5)
 
     price_change_pct = (
-        (last5["close"].iloc[-1] - last5["close"].iloc[0])
-        / last5["close"].iloc[0] * 100
+        (last5["close"].iloc[-1] - last5["close"].iloc[0]) / last5["close"].iloc[0] * 100
     )
 
-    avg_volume_ratio = safe_float(
-        last5["volume_ratio"].mean(),
-        1
-    )
+    avg_volume_ratio = safe_float(last5["volume_ratio"].mean(), 1)
 
-    # Son 5 mumda %8'den fazla hareket ama hacim teyidi zayıfsa
-    # (ör. ortalama hacim oranı 1.3'ün altındaysa) şüpheli kabul et
     if abs(price_change_pct) >= 8 and avg_volume_ratio < 1.3:
         return True
 
@@ -933,20 +644,16 @@ def detect_anomaly(df):
 
 
 # ============================================================
-# TREND ANALYSIS
+# TREND ANALYSIS (4H / 1H ana yön için kullanılır)
 # ============================================================
 
 def timeframe_trend(df):
     if df is None or len(df) < 205:
-        return {
-            "direction": "neutral",
-            "strength": 0
-        }
+        return {"direction": "neutral", "strength": 0}
 
     x = df.iloc[-1]
 
     price = safe_float(x["close"])
-
     e9 = safe_float(x["ema9"])
     e21 = safe_float(x["ema21"])
     e50 = safe_float(x["ema50"])
@@ -956,500 +663,44 @@ def timeframe_trend(df):
     plus_di = safe_float(x.get("plus_di"))
     minus_di = safe_float(x.get("minus_di"))
 
-    bullish = (
-        price > e21 >
-        e50 >
-        e200
-    )
-
-    bearish = (
-        price < e21 <
-        e50 <
-        e200
-    )
+    bullish = price > e21 > e50 > e200
+    bearish = price < e21 < e50 < e200
 
     strength = 0
 
     if bullish or bearish:
         strength += 40
-
     if adx_val >= ADX_STRONG:
         strength += 30
-
     if adx_val >= ADX_VERY_STRONG:
         strength += 20
 
-    # +DI / -DI yön teyidi: trend yönü DI'lar tarafından
-    # doğrulanmıyorsa (ör. bullish görünüyor ama -DI > +DI ise)
-    # güç puanını cezalandır.
     if bullish and plus_di <= minus_di:
         strength -= 20
-
     if bearish and minus_di <= plus_di:
         strength -= 20
 
     strength = clamp(strength, 0, 100)
 
     if bullish:
-        return {
-            "direction": "long",
-            "strength": strength
-        }
-
+        return {"direction": "long", "strength": strength}
     if bearish:
-        return {
-            "direction": "short",
-            "strength": strength
-        }
+        return {"direction": "short", "strength": strength}
 
-    # Daha yumuşak trend
     if price > e50 and e9 > e21:
-        soft_strength = 35
-        if plus_di <= minus_di:
-            soft_strength -= 15
-        return {
-            "direction": "long",
-            "strength": clamp(soft_strength, 0, 100)
-        }
+        soft = 35 - (15 if plus_di <= minus_di else 0)
+        return {"direction": "long", "strength": clamp(soft, 0, 100)}
 
     if price < e50 and e9 < e21:
-        soft_strength = 35
-        if minus_di <= plus_di:
-            soft_strength -= 15
-        return {
-            "direction": "short",
-            "strength": clamp(soft_strength, 0, 100)
-        }
+        soft = 35 - (15 if minus_di <= plus_di else 0)
+        return {"direction": "short", "strength": clamp(soft, 0, 100)}
 
-    return {
-        "direction": "neutral",
-        "strength": 0
-    }
+    return {"direction": "neutral", "strength": 0}
 
 
 # ============================================================
-# MOMENTUM
+# SWING POINTS
 # ============================================================
-
-def momentum_analysis(df):
-    if df is None or len(df) < 50:
-        return {
-            "direction": "neutral",
-            "strength": 0
-        }
-
-    x = df.iloc[-1]
-    p = df.iloc[-2]
-
-    rsi_val = safe_float(x["rsi"])
-    macd_hist = safe_float(x["macd_hist"])
-    prev_hist = safe_float(p["macd_hist"])
-
-    roc_val = safe_float(x["roc"])
-    volume_ratio = safe_float(
-        x["volume_ratio"],
-        1
-    )
-
-    long_points = 0
-    short_points = 0
-
-    if 52 <= rsi_val <= 70:
-        long_points += 20
-
-    if 30 <= rsi_val <= 48:
-        short_points += 20
-
-    if macd_hist > 0:
-        long_points += 20
-
-    if macd_hist < 0:
-        short_points += 20
-
-    if macd_hist > prev_hist:
-        long_points += 15
-
-    if macd_hist < prev_hist:
-        short_points += 15
-
-    if roc_val > 0:
-        long_points += 15
-
-    if roc_val < 0:
-        short_points += 15
-
-    if volume_ratio >= VOLUME_CONFIRMATION:
-        if long_points >= short_points:
-            long_points += 15
-        else:
-            short_points += 15
-
-    if long_points > short_points:
-        return {
-            "direction": "long",
-            "strength": clamp(long_points, 0, 100)
-        }
-
-    if short_points > long_points:
-        return {
-            "direction": "short",
-            "strength": clamp(short_points, 0, 100)
-        }
-
-    return {
-        "direction": "neutral",
-        "strength": 0
-    }
-
-
-# ============================================================
-# PRICE STRUCTURE
-# ============================================================
-
-def structure_analysis(df):
-    if df is None or len(df) < 30:
-        return {
-            "direction": "neutral",
-            "strength": 0,
-            "state": "unknown"
-        }
-
-    x = df.iloc[-1]
-
-    close = safe_float(x["close"])
-    high20 = safe_float(x["recent_high"])
-    low20 = safe_float(x["recent_low"])
-
-    atr_val = safe_float(x["atr"])
-
-    if atr_val <= 0:
-        return {
-            "direction": "neutral",
-            "strength": 0,
-            "state": "unknown"
-        }
-
-    previous_high = safe_float(df.iloc[-2]["recent_high"])
-    previous_low = safe_float(df.iloc[-2]["recent_low"])
-
-    if close > previous_high:
-        return {"direction": "long", "strength": 80, "state": "breakout"}
-
-    if close < previous_low:
-        return {"direction": "short", "strength": 80, "state": "breakdown"}
-
-    distance_high = high20 - close
-    distance_low = close - low20
-
-    if distance_high <= atr_val * 1.2:
-        return {"direction": "long", "strength": 60, "state": "pullback_long"}
-
-    if distance_low <= atr_val * 1.2:
-        return {"direction": "short", "strength": 60, "state": "pullback_short"}
-
-    return {"direction": "neutral", "strength": 25, "state": "range"}
-
-
-# ============================================================
-# ENTRY TIMING
-# ============================================================
-
-def entry_timing(df, direction):
-    if df is None or len(df) < 30:
-        return {"confirmed": False, "score": 0, "reason": "insufficient_data"}
-
-    x = df.iloc[-1]
-    p = df.iloc[-2]
-
-    close = safe_float(x["close"])
-    ema9 = safe_float(x["ema9"])
-    ema21 = safe_float(x["ema21"])
-
-    prev_close = safe_float(p["close"])
-    prev_ema9 = safe_float(p["ema9"])
-
-    volume_ratio = safe_float(x["volume_ratio"], 1)
-
-    macd_hist = safe_float(x["macd_hist"])
-    prev_macd_hist = safe_float(p["macd_hist"])
-
-    score = 0
-    reasons = []
-
-    if direction == "long":
-
-        if close > ema21:
-            score += 20
-            reasons.append("price_above_ema21")
-
-        if ema9 > ema21:
-            score += 20
-            reasons.append("ema_alignment")
-
-        if close > prev_close:
-            score += 15
-            reasons.append("price_acceleration")
-
-        if macd_hist > prev_macd_hist:
-            score += 20
-            reasons.append("macd_acceleration")
-
-        if volume_ratio >= 1.15:
-            score += 15
-            reasons.append("volume_confirmation")
-
-        if prev_ema9 <= ema21 and ema9 > ema21:
-            score += 10
-            reasons.append("ema_cross")
-
-    else:
-
-        if close < ema21:
-            score += 20
-            reasons.append("price_below_ema21")
-
-        if ema9 < ema21:
-            score += 20
-            reasons.append("ema_alignment")
-
-        if close < prev_close:
-            score += 15
-            reasons.append("price_acceleration")
-
-        if macd_hist < prev_macd_hist:
-            score += 20
-            reasons.append("macd_acceleration")
-
-        if volume_ratio >= 1.15:
-            score += 15
-            reasons.append("volume_confirmation")
-
-        if prev_ema9 >= ema21 and ema9 < ema21:
-            score += 10
-            reasons.append("ema_cross")
-
-    return {
-        "confirmed": score >= 60,
-        "score": score,
-        "reason": ",".join(reasons)
-    }
-
-
-# ============================================================
-# MOMENTUM REVERSAL + MICRO STRUCTURE CONFIRMATION
-# ============================================================
-# Amaç: yalnızca momentum zaten yükseldikten sonra değil, kısa vadeli
-# düşüş/yükseliş ivmesinin yön değiştirmeye başladığı ilk teyitli bölgede
-# giriş yapmak. Bu katman mevcut trend skorunun yerine geçmez; girişin
-# zamanlamasını doğrular.
-
-def _safe_series(df, col, n=6):
-    if df is None or col not in df.columns:
-        return None
-    return df[col].tail(n).astype(float)
-
-
-def detect_momentum_reversal(df, direction):
-    """5m'de erken momentum dönüşünü 0-100 arası skorlar.
-
-    Long için:
-      - MACD histogram ardışık şekilde iyileşiyor
-      - RSI yönünü yukarı çeviriyor
-      - EMA9 eğimi yukarı dönüyor
-      - kısa vadeli yapıdaki son lower-high kırılıyor
-      - kırılım hacimle destekleniyor
-
-    Short bunun simetriğidir.
-    """
-    if df is None or len(df) < 35:
-        return {"confirmed": False, "score": 0, "reasons": [], "structure_break": False}
-
-    x = df.iloc[-1]
-    p1 = df.iloc[-2]
-    p2 = df.iloc[-3]
-    p3 = df.iloc[-4]
-
-    close = safe_float(x["close"])
-    atr = safe_float(x.get("atr"), 0)
-    rsi = safe_float(x.get("rsi"), 50)
-    rsi1 = safe_float(p1.get("rsi"), 50)
-    rsi2 = safe_float(p2.get("rsi"), 50)
-
-    mh = safe_float(x.get("macd_hist"), 0)
-    mh1 = safe_float(p1.get("macd_hist"), 0)
-    mh2 = safe_float(p2.get("macd_hist"), 0)
-    mh3 = safe_float(p3.get("macd_hist"), 0)
-
-    ema9 = safe_float(x.get("ema9"), close)
-    ema91 = safe_float(p1.get("ema9"), ema9)
-    ema92 = safe_float(p2.get("ema9"), ema91)
-
-    volume_ratio = safe_float(x.get("volume_ratio"), 1.0)
-
-    score = 0
-    reasons = []
-
-    # 1) MACD histogram acceleration: tek mum yerine 2-3 barlık dönüş.
-    if direction == "long":
-        macd_turn = mh > mh1 > mh2 and mh2 >= mh3
-        macd_zero_turn = mh > mh1 and mh >= 0
-    else:
-        macd_turn = mh < mh1 < mh2 and mh2 <= mh3
-        macd_zero_turn = mh < mh1 and mh <= 0
-
-    if macd_turn:
-        score += 20
-        reasons.append("macd_2bar_turn")
-    elif macd_zero_turn:
-        score += 10
-        reasons.append("macd_turn")
-
-    # 2) RSI directional turn. Aşırı bölgeye yeni girmiş bir RSI'ı değil,
-    # dip/tepe sonrası yön değişimini tercih ederiz.
-    if direction == "long":
-        rsi_turn = rsi > rsi1 > rsi2 and rsi - rsi2 >= 2.0
-        rsi_recovery = rsi1 <= 48 and rsi >= 50
-    else:
-        rsi_turn = rsi < rsi1 < rsi2 and rsi2 - rsi >= 2.0
-        rsi_recovery = rsi1 >= 52 and rsi <= 50
-
-    if rsi_turn:
-        score += 15
-        reasons.append("rsi_directional_turn")
-    elif rsi_recovery:
-        score += 10
-        reasons.append("rsi_recovery")
-
-    # 3) EMA9 eğimi. EMA9'un fiyatı kesmesi şart değil; önce eğim değişsin.
-    if direction == "long":
-        ema_slope_turn = ema9 > ema91 > ema92
-    else:
-        ema_slope_turn = ema9 < ema91 < ema92
-
-    if ema_slope_turn:
-        score += 10
-        reasons.append("ema9_slope_turn")
-
-    # 4) Micro-structure break: son kapanan mum, önceki 3-5 mumun karşı
-    # tarafındaki kısa vadeli seviyeyi kırmalı. Bu, ilk yeşil/kırmızı mumdan
-    # daha güvenilir bir reversal teyididir.
-    lookback = df.iloc[-7:-2]
-    if len(lookback) >= 3 and atr > 0:
-        prior_high = safe_float(lookback["high"].max())
-        prior_low = safe_float(lookback["low"].min())
-        if direction == "long":
-            structure_break = close > prior_high + atr * 0.05
-        else:
-            structure_break = close < prior_low - atr * 0.05
-    else:
-        structure_break = False
-
-    if structure_break:
-        score += 20
-        reasons.append("micro_structure_break")
-
-    # 5) Kırılım/ivme hacimle destekleniyorsa +10.
-    if volume_ratio >= 1.15:
-        score += 10
-        reasons.append("volume_confirmation")
-
-    # 6) Mum kapanışı yön teyidi. Wick-only breakout'ları filtreler.
-    candle_range = max(safe_float(x["high"]) - safe_float(x["low"]), 1e-12)
-    body = abs(close - safe_float(x["open"]))
-    body_ratio = body / candle_range
-    if direction == "long":
-        candle_ok = close > safe_float(x["open"]) and body_ratio >= 0.45
-    else:
-        candle_ok = close < safe_float(x["open"]) and body_ratio >= 0.45
-
-    if candle_ok:
-        score += 10
-        reasons.append("directional_close")
-
-    # 7) Fiyatın EMA21'e göre konumu yalnızca destekleyici puandır.
-    # Reversal girişinin EMA21 geçişini bekleyerek geç kalmasını istemiyoruz.
-    ema21 = safe_float(x.get("ema21"), close)
-    if direction == "long" and close >= ema21:
-        score += 5
-        reasons.append("ema21_reclaimed")
-    elif direction == "short" and close <= ema21:
-        score += 5
-        reasons.append("ema21_lost")
-
-    # Zorunlu çekirdek teyit: structure break + (MACD veya RSI dönüşü).
-    core_momentum = macd_turn or rsi_turn or macd_zero_turn or rsi_recovery
-    confirmed = structure_break and core_momentum and score >= 60
-
-    return {
-        "confirmed": confirmed,
-        "score": min(score, 100),
-        "reasons": reasons,
-        "structure_break": structure_break,
-        "macd_turn": macd_turn or macd_zero_turn,
-        "rsi_turn": rsi_turn or rsi_recovery,
-        "volume_ratio": volume_ratio,
-    }
-
-
-def reversal_entry_confirmation(df, direction, mode="scalp"):
-    """Reversal teyidini son kez değerlendirir.
-
-    Score 70+ güçlü teyit; 60-69 yalnızca yüksek zaman dilimi trendi ile
-    uyumluysa kabul edilir. Böylece tek bir yeşil/kırmızı mum işlem açtırmaz.
-    """
-    rev = detect_momentum_reversal(df, direction)
-    if not rev["confirmed"]:
-        return rev
-
-    threshold = 65 if mode == "opportunity" else 70
-    rev["confirmed"] = rev["score"] >= threshold
-    return rev
-
-
-# ============================================================
-# OVEREXTENSION FILTER
-# ============================================================
-
-def is_overextended(df, direction):
-    if df is None or len(df) < 30:
-        return True
-
-    x = df.iloc[-1]
-
-    close = safe_float(x["close"])
-    atr_val = safe_float(x["atr"])
-
-    ema21 = safe_float(x["ema21"])
-    ema50 = safe_float(x["ema50"])
-
-    if close <= 0 or atr_val <= 0:
-        return True
-
-    if direction == "long":
-        distance = close - ema21
-        if distance > atr_val * 2.4:
-            return True
-        distance50 = close - ema50
-        if distance50 > atr_val * 4.0:
-            return True
-    else:
-        distance = ema21 - close
-        if distance > atr_val * 2.4:
-            return True
-        distance50 = ema50 - close
-        if distance50 > atr_val * 4.0:
-            return True
-
-    return False
-
-
-# ============================================================
-# FORMASYON TESPİTİ (OBO / TOBO / BAYRAK)
-# ============================================================
-# Swing high/low (yerel tepe/dip) tespitine dayalı basit ama
-# etkili bir formasyon tanıma katmanı. Kesin/akademik formasyon
-# tanıma yerine, "olası çıkış/iniş sinyali" için ek bir onay/bonus
-# puanı üretmeyi amaçlar — tek başına işlem açma kriteri değildir.
 
 def find_swing_points(df, window=3):
     highs = df["high"].values
@@ -1468,171 +719,528 @@ def find_swing_points(df, window=3):
     return swing_highs, swing_lows
 
 
-def detect_head_shoulders(df):
-    """OBO (Omuz-Baş-Omuz -> short sinyali) ve
-    TOBO (Ters Omuz-Baş-Omuz -> long sinyali) tespiti."""
-    if df is None or len(df) < 40:
-        return None
+# ============================================================
+# PULLBACK TESPİTİ VE KALİTESİ
+# ============================================================
+
+def detect_pullback(df, direction):
+    """Fiyat, ana trend yönünün TERSİNE kısa vadeli bir geri
+    çekilme içinde mi? (Trend hâlâ ana yönde geçerli olmalı.)"""
+    if df is None or len(df) < 30:
+        return False
+
+    x = df.iloc[-1]
+    close = safe_float(x["close"])
+    ema21 = safe_float(x["ema21"])
+    ema50 = safe_float(x["ema50"])
+
+    recent = df.tail(6)
+    short_term_change = (
+        (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0] * 100
+    )
+
+    if direction == "long":
+        # Ana trend hâlâ yukarı (fiyat EMA50 üstünde) ama son mumlarda
+        # kısa vadeli bir geri çekilme (negatif kısa dönem değişim)
+        return close > ema50 and short_term_change < 0
+
+    else:
+        return close < ema50 and short_term_change > 0
+
+
+def assess_pullback_quality(df, direction):
+    """Sağlıklı pullback: ana trend bozulmamış, karşı momentum
+    zayıflıyor, hacim azalıyor, ATR'ye göre aşırı sert değil."""
+    if df is None or len(df) < 30:
+        return {"healthy": False, "score": 0}
+
+    x = df.iloc[-1]
+    recent = df.tail(6)
+
+    atr_val = safe_float(x["atr"])
+    close = safe_float(x["close"])
+
+    if atr_val <= 0 or close <= 0:
+        return {"healthy": False, "score": 0}
+
+    score = 0
+    reasons_bad = []
+
+    # 1) Karşı yönlü hareketin büyüklüğü ATR'ye göre aşırı mı?
+    pullback_move = abs(recent["close"].iloc[-1] - recent["close"].iloc[0])
+    if pullback_move <= atr_val * 2.0:
+        score += 30
+    else:
+        reasons_bad.append("aşırı sert karşı hareket")
+
+    # 2) Pullback hacmi azalıyor mu? (son 3 mum ortalaması, önceki 3 mumdan düşük olmalı)
+    vol_recent = recent["volume"].tail(3).mean()
+    vol_prior = recent["volume"].head(3).mean()
+    if vol_prior > 0 and vol_recent < vol_prior * 1.05:
+        score += 25
+    else:
+        reasons_bad.append("pullback hacmi artıyor")
+
+    # 3) Karşı yönlü mum gövdeleri küçülüyor mu?
+    bodies = (recent["close"] - recent["open"]).abs()
+    if bodies.iloc[-1] < bodies.iloc[:3].mean():
+        score += 20
+    else:
+        reasons_bad.append("karşı mum gövdeleri küçülmüyor")
+
+    # 4) ADX karşı yönde hızlanmıyor mu?
+    adx_now = safe_float(x["adx"])
+    adx_prev = safe_float(df.iloc[-4]["adx"]) if len(df) > 4 else adx_now
+    if adx_now <= adx_prev * 1.15:
+        score += 25
+    else:
+        reasons_bad.append("ADX karşı yönde hızlanıyor")
+
+    healthy = score >= 55 and len(reasons_bad) <= 1
+
+    return {"healthy": healthy, "score": clamp(score, 0, 100), "issues": reasons_bad}
+
+
+# ============================================================
+# MOMENTUM REVERSAL / ACCELERATION
+# ============================================================
+
+def detect_momentum_reversal(df, direction):
+    """WATCH aşaması: karşı yönlü momentum zayıflıyor mu, RSI dipten
+    dönüyor mu, MACD histogram iyileşiyor mu?"""
+    if df is None or len(df) < 20:
+        return False
+
+    last4 = df.tail(4)
+
+    rsi_vals = last4["rsi"].values
+    hist_vals = last4["macd_hist"].values
+
+    if direction == "long":
+        rsi_turning = rsi_vals[-1] > rsi_vals[-2] and rsi_vals[-2] >= rsi_vals[-3] - 1
+        hist_improving = hist_vals[-1] > hist_vals[-2]
+        return bool(rsi_turning and hist_improving)
+    else:
+        rsi_turning = rsi_vals[-1] < rsi_vals[-2] and rsi_vals[-2] <= rsi_vals[-3] + 1
+        hist_weakening = hist_vals[-1] < hist_vals[-2]
+        return bool(rsi_turning and hist_weakening)
+
+
+def calculate_momentum_acceleration(df, direction):
+    """ARM aşaması: son 3-4 mumun MACD histogram DEĞİŞİM HIZI.
+    Sadece pozitif/negatif değil, ivmelenme derecesini 0-100 arası
+    puanlar."""
+    if df is None or len(df) < 6:
+        return {"accelerating": False, "score": 0}
+
+    hist = df["macd_hist"].tail(4).values
+    rsi_vals = df["rsi"].tail(4).values
+
+    slopes = np.diff(hist)
+
+    if direction == "long":
+        consistent = sum(1 for s in slopes if s > 0)
+        rsi_slope_positive = rsi_vals[-1] > rsi_vals[0]
+    else:
+        consistent = sum(1 for s in slopes if s < 0)
+        rsi_slope_positive = rsi_vals[-1] < rsi_vals[0]
+
+    score = (consistent / len(slopes)) * 60
+
+    if rsi_slope_positive:
+        score += 25
+
+    # İvmenin kendisi büyüyor mu (acceleration of acceleration)?
+    if len(slopes) >= 2:
+        accel_of_accel = slopes[-1] - slopes[-2]
+        if (direction == "long" and accel_of_accel > 0) or (direction == "short" and accel_of_accel < 0):
+            score += 15
+
+    score = clamp(score, 0, 100)
+
+    return {"accelerating": score >= 60, "score": score}
+
+
+# ============================================================
+# MICRO STRUCTURE BREAK
+# ============================================================
+
+def detect_micro_structure_break(df, direction):
+    """LONG: son lower-high (LH) kırılmalı (fiyat kapanışı LH'nin
+    üzerinde). SHORT: son higher-low (HL) kırılmalı."""
+    if df is None or len(df) < 30:
+        return {"broken": False, "level": None}
+
+    swing_highs, swing_lows = find_swing_points(df, window=2)
+
+    last_close = df["close"].iloc[-1]
+
+    if direction == "long":
+        if len(swing_highs) < 2:
+            return {"broken": False, "level": None}
+
+        (i1, h1), (i2, h2) = swing_highs[-2:]
+
+        # Lower-high paterni: son tepe bir öncekinden düşük olmalı
+        if h2 < h1:
+            if last_close > h1:
+                return {"broken": True, "level": h1}
+
+        return {"broken": False, "level": h1}
+
+    else:
+        if len(swing_lows) < 2:
+            return {"broken": False, "level": None}
+
+        (i1, l1), (i2, l2) = swing_lows[-2:]
+
+        # Higher-low paterni: son dip bir öncekinden yüksek olmalı
+        if l2 > l1:
+            if last_close < l1:
+                return {"broken": True, "level": l1}
+
+        return {"broken": False, "level": l1}
+
+
+# ============================================================
+# BREAKOUT CONFIRMATION / RETEST
+# ============================================================
+
+def confirm_breakout(df, level, direction):
+    """FALSE BREAKOUT FİLTRESİ dahil: sadece fitil (wick) değil,
+    mum GÖVDESİ kırılım seviyesini geçmiş olmalı; hacim ve ATR'ye
+    göre anlamlı bir mum olmalı."""
+    if df is None or level is None or len(df) < 5:
+        return {"confirmed": False, "type": None}
+
+    last = df.iloc[-1]
+
+    close = safe_float(last["close"])
+    open_ = safe_float(last["open"])
+    atr_val = safe_float(last["atr"])
+    volume_ratio = safe_float(last["volume_ratio"], 1)
+    body_ratio = safe_float(last.get("body_ratio"), 0)
+
+    if atr_val <= 0:
+        return {"confirmed": False, "type": None}
+
+    if direction == "long":
+        body_breaks = close > level and open_ < close  # yeşil mum, kapanış seviyenin üstünde
+        meaningful = (close - level) >= atr_val * 0.15
+    else:
+        body_breaks = close < level and open_ > close
+        meaningful = (level - close) >= atr_val * 0.15
+
+    volume_ok = volume_ratio >= MIN_BREAKOUT_VOLUME_RATIO
+    body_ok = body_ratio >= 0.35  # zayıf/fitilli mumları ele
+
+    if body_breaks and meaningful and volume_ok and body_ok:
+        return {"confirmed": True, "type": "aggressive_breakout"}
+
+    return {"confirmed": False, "type": None}
+
+
+def confirm_breakout_retest(df, level, direction):
+    """Kırılım sonrası seviyeye geri dönüş (retest), seviyenin
+    tutması ve momentumun yeniden başlaması. Daha yüksek kaliteli
+    ama daha az sıklıkta oluşan bir giriş tipi."""
+    if df is None or level is None or len(df) < 8:
+        return {"confirmed": False, "type": None}
+
+    last3 = df.tail(3)
+    last = df.iloc[-1]
+
+    volume_ratio = safe_float(last["volume_ratio"], 1)
+    macd_hist = safe_float(last["macd_hist"])
+    prev_macd_hist = safe_float(df.iloc[-2]["macd_hist"])
+
+    if direction == "long":
+        retested = last3["low"].min() <= level * 1.005
+        held = last3["close"].iloc[-1] > level
+        momentum_resumed = macd_hist > prev_macd_hist
+    else:
+        retested = last3["high"].max() >= level * 0.995
+        held = last3["close"].iloc[-1] < level
+        momentum_resumed = macd_hist < prev_macd_hist
+
+    if retested and held and momentum_resumed and volume_ratio >= 1.0:
+        return {"confirmed": True, "type": "confirmed_retest"}
+
+    return {"confirmed": False, "type": None}
+
+
+# ============================================================
+# ENTRY CHASING FİLTRESİ
+# ============================================================
+
+def is_entry_chasing(df, direction, break_level):
+    """Kırılım gerçekleşti ama fiyat zaten ATR'nin çok üzerinde
+    uzaklaşmışsa (geç kalınmış giriş / chase) işlem açma."""
+    if df is None or break_level is None:
+        return True
+
+    last = df.iloc[-1]
+    close = safe_float(last["close"])
+    atr_val = safe_float(last["atr"])
+
+    if atr_val <= 0:
+        return True
+
+    if direction == "long":
+        distance_atr = (close - break_level) / atr_val
+    else:
+        distance_atr = (break_level - close) / atr_val
+
+    return distance_atr > MAX_ENTRY_CHASE_ATR
+
+
+# ============================================================
+# EXPECTED MOVE
+# ============================================================
+
+def calculate_expected_move(df, direction, entry_price, leverage):
+    """Entry'den itibaren MIN_TARGET_ROI'yi (%10 ROI) sağlayacak
+    fiyat hareketi var mı? En yakın destek/direnç (swing high/low)
+    bu hareketten önce geliyorsa işlem reddedilir."""
+    if df is None or entry_price <= 0 or leverage <= 0:
+        return {"sufficient": False, "required_move_pct": None, "nearest_level": None}
+
+    required_move_pct = MIN_TARGET_ROI / leverage  # ROI% -> ham fiyat %
 
     swing_highs, swing_lows = find_swing_points(df, window=3)
 
-    if len(swing_highs) >= 3:
-        (i1, h1), (i2, h2), (i3, h3) = swing_highs[-3:]
+    if direction == "long":
+        levels_above = [h for _, h in swing_highs if h > entry_price]
+        nearest_level = min(levels_above) if levels_above else None
 
-        if h2 > h1 and h2 > h3:
-            shoulder_diff = abs(h1 - h3) / h2 if h2 else 1
+        if nearest_level:
+            available_move_pct = (nearest_level - entry_price) / entry_price * 100
+        else:
+            available_move_pct = required_move_pct * 3  # üstte belirgin bir engel yok
 
-            if shoulder_diff < 0.035 and h2 > h1 * 1.008 and h2 > h3 * 1.008:
-                neckline = min(
-                    df["low"].iloc[i1:i2].min(),
-                    df["low"].iloc[i2:i3].min()
-                )
-                last_close = df["close"].iloc[-1]
+    else:
+        levels_below = [l for _, l in swing_lows if l < entry_price]
+        nearest_level = max(levels_below) if levels_below else None
 
-                if last_close < neckline:
-                    return {"pattern": "OBO", "direction": "short", "confidence": 75}
+        if nearest_level:
+            available_move_pct = (entry_price - nearest_level) / entry_price * 100
+        else:
+            available_move_pct = required_move_pct * 3
 
-                return {"pattern": "OBO", "direction": "short", "confidence": 40}
+    sufficient = available_move_pct >= required_move_pct
 
-    if len(swing_lows) >= 3:
-        (i1, l1), (i2, l2), (i3, l3) = swing_lows[-3:]
-
-        if l2 < l1 and l2 < l3:
-            shoulder_diff = abs(l1 - l3) / l2 if l2 else 1
-
-            if shoulder_diff < 0.035 and l2 < l1 * 0.992 and l2 < l3 * 0.992:
-                neckline = max(
-                    df["high"].iloc[i1:i2].max(),
-                    df["high"].iloc[i2:i3].max()
-                )
-                last_close = df["close"].iloc[-1]
-
-                if last_close > neckline:
-                    return {"pattern": "TOBO", "direction": "long", "confidence": 75}
-
-                return {"pattern": "TOBO", "direction": "long", "confidence": 40}
-
-    return None
-
-
-def detect_flag(df):
-    """BAYRAK: güçlü tek yönlü hareket (direk) + dar, ters/yatay
-    eğimli konsolidasyon (bayrak)."""
-    if df is None or len(df) < 30:
-        return None
-
-    window = df.tail(20)
-
-    pole = window.iloc[:8]
-    flag_part = window.iloc[8:18]
-
-    if pole["close"].iloc[0] == 0:
-        return None
-
-    pole_change = (
-        (pole["close"].iloc[-1] - pole["close"].iloc[0])
-        / pole["close"].iloc[0] * 100
-    )
-
-    if flag_part["close"].mean() == 0:
-        return None
-
-    flag_range = (
-        (flag_part["high"].max() - flag_part["low"].min())
-        / flag_part["close"].mean() * 100
-    )
-
-    flag_slope = (
-        (flag_part["close"].iloc[-1] - flag_part["close"].iloc[0])
-        / flag_part["close"].iloc[0] * 100
-    )
-
-    if abs(pole_change) >= 4 and flag_range < abs(pole_change) * 0.65:
-
-        if pole_change > 0 and flag_slope <= 1.2:
-            return {"pattern": "BAYRAK", "direction": "long", "confidence": 60}
-
-        if pole_change < 0 and flag_slope >= -1.2:
-            return {"pattern": "BAYRAK", "direction": "short", "confidence": 60}
-
-    return None
-
-
-def detect_chart_patterns(df):
-    hs = detect_head_shoulders(df)
-    flag = detect_flag(df)
-
-    candidates = [p for p in [hs, flag] if p]
-
-    if not candidates:
-        return None
-
-    return max(candidates, key=lambda p: p["confidence"])
+    return {
+        "sufficient": sufficient,
+        "required_move_pct": required_move_pct,
+        "available_move_pct": available_move_pct,
+        "nearest_level": nearest_level,
+    }
 
 
 # ============================================================
-# MULTI TIMEFRAME SCORE
+# MOMENTUM (yön oylaması için — eski koddan korunan yardımcı)
 # ============================================================
 
-def analyze_coin(symbol, mode, btc_regime=None):
-    timeframes = ["5m", "15m", "1h", "4h"]
+def momentum_analysis(df):
+    if df is None or len(df) < 50:
+        return {"direction": "neutral", "strength": 0}
 
-    data = {}
+    x = df.iloc[-1]
+    p = df.iloc[-2]
 
-    for tf in timeframes:
-        df = fetch_ohlcv(symbol, tf)
+    rsi_val = safe_float(x["rsi"])
+    macd_hist = safe_float(x["macd_hist"])
+    prev_hist = safe_float(p["macd_hist"])
+    roc_val = safe_float(x["roc"])
+    volume_ratio = safe_float(x["volume_ratio"], 1)
 
+    long_points = 0
+    short_points = 0
+
+    if 52 <= rsi_val <= 70:
+        long_points += 20
+    if 30 <= rsi_val <= 48:
+        short_points += 20
+    if macd_hist > 0:
+        long_points += 20
+    if macd_hist < 0:
+        short_points += 20
+    if macd_hist > prev_hist:
+        long_points += 15
+    if macd_hist < prev_hist:
+        short_points += 15
+    if roc_val > 0:
+        long_points += 15
+    if roc_val < 0:
+        short_points += 15
+    if volume_ratio >= VOLUME_CONFIRMATION:
+        if long_points >= short_points:
+            long_points += 15
+        else:
+            short_points += 15
+
+    if long_points > short_points:
+        return {"direction": "long", "strength": clamp(long_points, 0, 100)}
+    if short_points > long_points:
+        return {"direction": "short", "strength": clamp(short_points, 0, 100)}
+    return {"direction": "neutral", "strength": 0}
+
+
+# ============================================================
+# SETUP SCORE  (4H/1H/15M zemin kalitesi)
+# ============================================================
+
+def calculate_setup_score(direction, trend4h, trend1h, pullback_quality, atr_pct, funding, volume_ratio, market_regime_ok):
+    score = 0
+    breakdown = {}
+
+    # Market regime (BTC ile uyum) — 15
+    regime_pts = 15 if market_regime_ok else 5
+    score += regime_pts
+    breakdown["market_regime"] = regime_pts
+
+    # 4H trend — 15
+    trend4h_pts = (trend4h["strength"] / 100) * 15 if trend4h["direction"] == direction else 0
+    score += trend4h_pts
+    breakdown["4h_trend"] = round(trend4h_pts, 1)
+
+    # 1H trend — 15
+    trend1h_pts = (trend1h["strength"] / 100) * 15 if trend1h["direction"] == direction else 0
+    score += trend1h_pts
+    breakdown["1h_trend"] = round(trend1h_pts, 1)
+
+    # 15M yapı (pullback var olması + kaliteli olması) — 15
+    structure_pts = 15 if pullback_quality.get("healthy") else 5
+    score += structure_pts
+    breakdown["15m_structure"] = structure_pts
+
+    # Pullback quality — 20
+    pullback_pts = (pullback_quality.get("score", 0) / 100) * 20
+    score += pullback_pts
+    breakdown["pullback_quality"] = round(pullback_pts, 1)
+
+    # Volume environment — 10
+    volume_pts = clamp((volume_ratio - 0.8) * 25, 0, 10)
+    score += volume_pts
+    breakdown["volume_env"] = round(volume_pts, 1)
+
+    # Volatilite (ne çok düşük ne kaotik) — 5
+    if 0.3 <= atr_pct <= 4.0:
+        volat_pts = 5
+    elif atr_pct < 0.3:
+        volat_pts = 1
+    else:
+        volat_pts = 2
+    score += volat_pts
+    breakdown["volatility"] = volat_pts
+
+    # Funding — 5
+    funding_pts = 5 if abs(funding) < FUNDING_SKIP_THRESHOLD * 0.5 else 2
+    score += funding_pts
+    breakdown["funding"] = funding_pts
+
+    return round(clamp(score, 0, 100), 2), breakdown
+
+
+# ============================================================
+# TRIGGER SCORE  (5M giriş zamanlaması kalitesi)
+# ============================================================
+
+def calculate_trigger_score(momentum_accel, rsi_turning, ema_slope_ok, structure_break, breakout_result, atr_position_ok):
+    score = 0
+    breakdown = {}
+    confirmations = 0
+
+    # MACD acceleration — 20
+    macd_pts = (momentum_accel.get("score", 0) / 100) * 20
+    score += macd_pts
+    breakdown["macd_acceleration"] = round(macd_pts, 1)
+    if momentum_accel.get("accelerating"):
+        confirmations += 1
+
+    # RSI directional turn — 15
+    rsi_pts = 15 if rsi_turning else 0
+    score += rsi_pts
+    breakdown["rsi_turn"] = rsi_pts
+    if rsi_turning:
+        confirmations += 1
+
+    # EMA slope — 10
+    ema_pts = 10 if ema_slope_ok else 0
+    score += ema_pts
+    breakdown["ema_slope"] = ema_pts
+
+    # Micro structure break — 25
+    structure_pts = 25 if structure_break.get("broken") else 0
+    score += structure_pts
+    breakdown["structure_break"] = structure_pts
+    if structure_break.get("broken"):
+        confirmations += 1
+
+    # Breakout volume — 15
+    breakout_pts = 15 if breakout_result.get("confirmed") else 0
+    score += breakout_pts
+    breakdown["breakout_volume"] = breakout_pts
+
+    # Candle close (body bazlı — breakout_result içinde zaten kontrol edildi) — 10
+    candle_pts = 10 if breakout_result.get("confirmed") else 0
+    score += candle_pts
+    breakdown["candle_close"] = candle_pts
+
+    # ATR position (aşırı uzamamış olmak) — 5
+    atr_pos_pts = 5 if atr_position_ok else 0
+    score += atr_pos_pts
+    breakdown["atr_position"] = atr_pos_pts
+
+    return round(clamp(score, 0, 100), 2), breakdown, confirmations
+
+
+# ============================================================
+# ANA PIPELINE: SETUP -> WATCH -> ARM -> FIRE
+# ============================================================
+
+def analyze_high_conviction(symbol, btc_regime=None):
+    tf_data = {}
+
+    for tf in ["4h", "1h", "15m", "5m"]:
+        df = fetch_ohlcv_closed(symbol, tf)
         if df is None:
             return None
+        tf_data[tf] = enrich_dataframe(df)
 
-        data[tf] = enrich_dataframe(df)
-
-    # --------------------------------------------------------
-    # Anomali (pump/dump) filtresi — 15m üzerinde kontrol
-    # --------------------------------------------------------
-
-    if detect_anomaly(data["15m"]):
-        return None
-
-    trend = {}
-    momentum = {}
-
-    for tf in timeframes:
-        trend[tf] = timeframe_trend(data[tf])
-        momentum[tf] = momentum_analysis(data[tf])
-
-    # --------------------------------------------------------
-    # Direction voting
-    # --------------------------------------------------------
-
-    long_votes = 0
-    short_votes = 0
-
-    for tf in timeframes:
-
-        if trend[tf]["direction"] == "long":
-            long_votes += 1
-        elif trend[tf]["direction"] == "short":
-            short_votes += 1
-
-        if momentum[tf]["direction"] == "long":
-            long_votes += 0.5
-        elif momentum[tf]["direction"] == "short":
-            short_votes += 0.5
-
-    if long_votes > short_votes:
-        direction = "long"
-    elif short_votes > long_votes:
-        direction = "short"
-    else:
+    # Anomali (pump/dump) filtresi
+    if detect_anomaly(tf_data["15m"]):
         return None
 
     # --------------------------------------------------------
-    # BTC piyasa rejimi filtresi (YENİ)
+    # 1) MARKET REGIME + TREND (4H ana yapı, 1H ana yön)
     # --------------------------------------------------------
-    # BTC net bir trend içindeyse ve bu coin BTC'ye ters yöndeyse
-    # işlemi ele. BTC_SYMBOL'ün kendisini analiz ederken bu
-    # kontrolü atla (sonsuz döngü olmasın diye).
+
+    trend4h = timeframe_trend(tf_data["4h"])
+    trend1h = timeframe_trend(tf_data["1h"])
+
+    mom1h = momentum_analysis(tf_data["1h"])
+
+    # Ana yön: 1H trend + momentum aynı yöndeyse o yön; değilse skip
+    if trend1h["direction"] == "neutral" or trend1h["strength"] < 35:
+        return None
+
+    direction = trend1h["direction"]
+
+    if mom1h["direction"] != "neutral" and mom1h["direction"] != direction:
+        return None
+
+    # 4H ana yapı çok güçlü şekilde ters yöndeyse skip (reversal ayrı ele alınabilir,
+    # basitlik için burada sadece CONTINUATION setup'ları hedefliyoruz)
+    setup_type = "continuation"
+    if trend4h["direction"] != "neutral" and trend4h["direction"] != direction:
+        if trend4h["strength"] >= 60:
+            return None
+        setup_type = "reversal"  # HTF zayıflıyor, daha yüksek teyit isteyeceğiz
+
+    # --------------------------------------------------------
+    # 2) BTC PİYASA REJİMİ FİLTRESİ
+    # --------------------------------------------------------
 
     if btc_regime and symbol != BTC_SYMBOL:
         if (
@@ -1642,408 +1250,180 @@ def analyze_coin(symbol, mode, btc_regime=None):
         ):
             return None
 
-    # --------------------------------------------------------
-    # Weighted trend
-    # --------------------------------------------------------
-
-    trend_score = (
-        trend["5m"]["strength"] * 0.15 +
-        trend["15m"]["strength"] * 0.25 +
-        trend["1h"]["strength"] * 0.30 +
-        trend["4h"]["strength"] * 0.30
-    )
-
-    momentum_score = (
-        momentum["5m"]["strength"] * 0.25 +
-        momentum["15m"]["strength"] * 0.30 +
-        momentum["1h"]["strength"] * 0.30 +
-        momentum["4h"]["strength"] * 0.15
+    market_regime_ok = not (
+        btc_regime and btc_regime["direction"] != "neutral"
+        and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
+        and btc_regime["direction"] != direction
     )
 
     # --------------------------------------------------------
-    # Alignment
-    # --------------------------------------------------------
-
-    alignment = 0
-
-    for tf in timeframes:
-        if (
-            trend[tf]["direction"] == direction and
-            momentum[tf]["direction"] == direction
-        ):
-            alignment += 25
-
-    alignment = clamp(alignment, 0, 100)
-
-    # --------------------------------------------------------
-    # Current structure
-    # --------------------------------------------------------
-
-    structure = structure_analysis(data["15m"])
-
-    structure_score = (
-        structure["strength"] if structure["direction"] == direction else 0
-    )
-
-    # --------------------------------------------------------
-    # Formasyon tespiti (OBO / TOBO / BAYRAK) — YENİ
-    # --------------------------------------------------------
-    # 1h verisinde formasyon aranır. Tespit edilen formasyon işlem
-    # yönüyle aynıysa küçük bir bonus puan eklenir; tek başına
-    # işlem açtırmaz, sadece mevcut sinyali güçlendirir.
-
-    pattern = detect_chart_patterns(data["1h"])
-    pattern_label = "yok"
-    pattern_score = 0
-
-    if pattern:
-        pattern_label = pattern["pattern"]
-        if pattern["direction"] == direction:
-            pattern_score = pattern["confidence"]
-
-    # --------------------------------------------------------
-    # Entry timing
-    # --------------------------------------------------------
-
-    timing = entry_timing(data["5m"], direction)
-    reversal = detect_momentum_reversal(data["5m"], direction)
-
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
-
-    current = data["15m"].iloc[-1]
-
-    volume_ratio = safe_float(current["volume_ratio"], 1)
-
-    volume_score = clamp((volume_ratio - 1) * 80, 0, 100)
-
-    # --------------------------------------------------------
-    # ADX
-    # --------------------------------------------------------
-
-    adx_val = safe_float(current["adx"])
-
-    adx_score = clamp((adx_val / 45) * 100, 0, 100)
-
-    # --------------------------------------------------------
-    # Raw score
-    # --------------------------------------------------------
-
-    score = (
-        trend_score * 0.25 +
-        momentum_score * 0.25 +
-        alignment * 0.20 +
-        structure_score * 0.10 +
-        timing["score"] * 0.05 +
-        reversal["score"] * 0.05 +
-        volume_score * 0.05 +
-        adx_score * 0.05
-    )
-
-    # Formasyon bonusu: ağırlıklı skorun dışında, küçük bir ek puan
-    # (maks +11.25) — mevcut kalibrasyonu bozmadan destekleyici katkı.
-    score += pattern_score * 0.15
-
-    score = round(clamp(score, 0, 100), 2)
-
-    # --------------------------------------------------------
-    # Funding
+    # 3) FUNDING
     # --------------------------------------------------------
 
     funding = get_funding(symbol)
-
     if abs(funding) >= FUNDING_SKIP_THRESHOLD:
         return None
 
     # --------------------------------------------------------
-    # Overextension
+    # 4) WATCH — 15M PULLBACK + KALİTESİ
     # --------------------------------------------------------
 
-    if is_overextended(data["15m"], direction):
+    if not detect_pullback(tf_data["15m"], direction):
+        return None
+
+    pullback_quality = assess_pullback_quality(tf_data["15m"], direction)
+
+    if not pullback_quality["healthy"]:
+        return None
+
+    momentum_reversal_15m = detect_momentum_reversal(tf_data["15m"], direction)
+
+    if not momentum_reversal_15m:
         return None
 
     # --------------------------------------------------------
-    # Strict confirmation
+    # 5) ARM — 5M MOMENTUM ACCELERATION
     # --------------------------------------------------------
 
-    minimum = SCALP_MIN_SCORE if mode == "scalp" else OPPORTUNITY_MIN_SCORE
+    momentum_accel = calculate_momentum_acceleration(tf_data["5m"], direction)
 
-    if score < minimum:
-        return None
-
-    for tf in ["1h", "4h"]:
-        if (
-            trend[tf]["direction"] != direction
-            and trend[tf]["strength"] >= 65
-        ):
-            return None
-
-    # Scalp'te 15m momentum yönü giriş yönüyle aynı olmalı.
-    # Opportunity'de ise zayıf/kararsız 15m momentum tamamen reddedilmez;
-    # yalnızca belirgin karşı momentum (>=55) engel olur. Böylece uzun
-    # vadeli trend devam ederken kısa süreli 15m pullback'ler fırsatı
-    # gereksiz yere elemez.
-    if mode == "scalp":
-        if momentum["15m"]["direction"] != direction:
-            return None
+    rsi_vals_5m = tf_data["5m"]["rsi"].tail(4).values
+    if direction == "long":
+        rsi_turning = rsi_vals_5m[-1] > rsi_vals_5m[0]
     else:
-        if (
-            momentum["15m"]["direction"] not in (direction, "neutral")
-            and momentum["15m"]["strength"] >= 55
-        ):
-            return None
+        rsi_turning = rsi_vals_5m[-1] < rsi_vals_5m[0]
 
-    if timing["score"] < (55 if mode == "opportunity" else 60) and not reversal["confirmed"]:
-        return None
+    ema9_slope = safe_float(tf_data["5m"].iloc[-1]["ema9_slope"])
+    ema21_slope = safe_float(tf_data["5m"].iloc[-1]["ema21_slope"])
 
-    # Erken dönüş teyidi: işlem, momentum yön değiştirmeden yalnızca trend
-    # skoru yüksek diye açılmasın. Güçlü continuation sinyallerinde de
-    # reversal katmanı başarısızsa giriş ertelenir.
-    reversal_min = 60 if mode == "opportunity" else 65
-    if reversal["score"] < reversal_min:
-        return None
-
-    if mode == "opportunity":
-        # Opportunity hâlâ çoklu zaman dilimi trendini ister, fakat
-        # önceki eşikler aşırı sıkıydı. Orta kuvvette devam eden trendler
-        # de kabul edilir; pozisyon açıldıktan sonra dinamik ATR stop ve
-        # canlı trend/momentum kontrolü riski yönetir.
-        if alignment < 55:
-            return None
-        if trend["1h"]["strength"] < 42:
-            return None
-        if trend["4h"]["strength"] < 42:
-            return None
-        if momentum["1h"]["strength"] < 42:
-            return None
-        if adx_val < 16:
-            return None
-
-    # --------------------------------------------------------
-    # Taker buy/sell ratio (YENİ) — sadece skoru geçen adaylarda
-    # ekstra API çağrısı yapıyoruz, tüm coinlerde değil.
-    # --------------------------------------------------------
-
-    taker = get_taker_ratio(symbol)
-    taker_note = "n/a"
-
-    if taker:
-        if direction == "long" and taker["buy_ratio"] < 0.45:
-            return None
-        if direction == "short" and taker["sell_ratio"] < 0.45:
-            return None
-        taker_note = (
-            f"buy={taker['buy_ratio']:.2f} sell={taker['sell_ratio']:.2f}"
-        )
-
-    # --------------------------------------------------------
-    # Dynamic TP / SL
-    # --------------------------------------------------------
-
-    price = safe_float(current["close"])
-
-    atr_pct = safe_float(current["atr_pct"])
-    atr_pct = clamp(atr_pct, 0.15, 6.0)
-
-    if mode == "scalp":
-        tp_pct = (
-            atr_pct * 1.20 +
-            momentum_score * 0.012 +
-            adx_score * 0.006
-        )
-        tp_pct = clamp(tp_pct, MIN_SCALP_TP_PCT, MAX_SCALP_TP_PCT)
+    if direction == "long":
+        ema_slope_ok = ema9_slope > 0 and ema21_slope >= 0
     else:
-        tp_pct = (
-            atr_pct * 2.00 +
-            momentum_score * 0.020 +
-            alignment * 0.010
-        )
-        tp_pct = clamp(tp_pct, MIN_OPP_TP_PCT, MAX_OPP_TP_PCT)
+        ema_slope_ok = ema9_slope < 0 and ema21_slope <= 0
 
-    max_sl_pct = tp_pct * MAX_LOSS_TO_TARGET_RATIO
+    # --------------------------------------------------------
+    # 6) FIRE — MICRO STRUCTURE BREAK + BREAKOUT CONFIRM/RETEST
+    # --------------------------------------------------------
 
-    volatility_sl = atr_pct * (0.85 if mode == "scalp" else 1.10)
+    structure_break = detect_micro_structure_break(tf_data["5m"], direction)
 
-    sl_pct = min(volatility_sl, max_sl_pct)
-    sl_pct = max(sl_pct, 0.35)
+    if not structure_break["broken"]:
+        return None
 
-    if sl_pct > tp_pct * MAX_LOSS_TO_TARGET_RATIO:
-        tp_pct = sl_pct / MAX_LOSS_TO_TARGET_RATIO
+    level = structure_break["level"]
 
-        if mode == "scalp":
-            tp_pct = clamp(tp_pct, MIN_SCALP_TP_PCT, MAX_SCALP_TP_PCT)
-        else:
-            tp_pct = clamp(tp_pct, MIN_OPP_TP_PCT, MAX_OPP_TP_PCT)
+    breakout_result = confirm_breakout(tf_data["5m"], level, direction)
 
-        sl_pct = min(sl_pct, tp_pct * MAX_LOSS_TO_TARGET_RATIO)
+    if not breakout_result["confirmed"]:
+        breakout_result = confirm_breakout_retest(tf_data["5m"], level, direction)
+
+    if not breakout_result["confirmed"]:
+        return None
+
+    # Entry chasing filtresi
+    if is_entry_chasing(tf_data["5m"], direction, level):
+        return None
+
+    current_5m = tf_data["5m"].iloc[-1]
+
+    atr_val = safe_float(current_5m["atr"])
+    atr_pct = clamp(safe_float(current_5m["atr_pct"]), 0.15, 6.0)
+
+    price = safe_float(current_5m["close"])
+
+    distance_atr = abs(price - level) / atr_val if atr_val > 0 else 0
+    atr_position_ok = distance_atr <= MAX_ENTRY_CHASE_ATR
+
+    volume_ratio = safe_float(current_5m["volume_ratio"], 1)
+
+    # --------------------------------------------------------
+    # SETUP SCORE
+    # --------------------------------------------------------
+
+    setup_score, setup_breakdown = calculate_setup_score(
+        direction, trend4h, trend1h, pullback_quality, atr_pct, funding, volume_ratio, market_regime_ok
+    )
+
+    min_setup = MIN_SETUP_SCORE if setup_type == "continuation" else MIN_SETUP_SCORE + 5
+
+    if setup_score < min_setup:
+        return None
+
+    # --------------------------------------------------------
+    # TRIGGER SCORE
+    # --------------------------------------------------------
+
+    trigger_score, trigger_breakdown, confirmations = calculate_trigger_score(
+        momentum_accel, rsi_turning, ema_slope_ok, structure_break, breakout_result, atr_position_ok
+    )
+
+    min_trigger = MIN_TRIGGER_SCORE if setup_type == "continuation" else MIN_TRIGGER_SCORE + 5
+
+    if trigger_score < min_trigger:
+        return None
+
+    if confirmations < 2:
+        # MACD acceleration / RSI turn / structure break üçlüsünden en az 2'si şart
+        return None
+
+    # --------------------------------------------------------
+    # LEVERAGE (tentatif — expected move hesaplaması için gerekli)
+    # --------------------------------------------------------
+
+    leverage = calculate_leverage(setup_score, trigger_score, atr_pct)
+
+    # --------------------------------------------------------
+    # EXPECTED MOVE
+    # --------------------------------------------------------
+
+    expected_move = calculate_expected_move(tf_data["1h"], direction, price, leverage)
+
+    if not expected_move["sufficient"]:
+        return None
 
     return {
         "symbol": symbol,
-        "mode": mode,
         "direction": direction,
-        "score": score,
-        "trend_score": round(trend_score, 2),
-        "momentum_score": round(momentum_score, 2),
-        "alignment": alignment,
-        "structure": structure["state"],
-        "pattern": pattern_label,
-        "timing_score": timing["score"],
-        "reversal_score": reversal["score"],
-        "reversal_reasons": ",".join(reversal["reasons"]),
-        "timing_reason": timing["reason"],
-        "volume_ratio": volume_ratio,
-        "adx": adx_val,
-        "atr_pct": atr_pct,
-        "funding": funding,
-        "taker_note": taker_note,
+        "setup_type": setup_type,
+        "setup_score": setup_score,
+        "trigger_score": trigger_score,
+        "setup_breakdown": setup_breakdown,
+        "trigger_breakdown": trigger_breakdown,
+        "confirmations": confirmations,
+        "breakout_type": breakout_result["type"],
         "price": price,
-        "tp_pct": tp_pct,
-        "sl_pct": sl_pct,
-        "data": data,
+        "atr": atr_val,
+        "atr_pct": atr_pct,
+        "structure_level": level,
+        "leverage": leverage,
+        "funding": funding,
+        "expected_move": expected_move,
+        "pullback_quality": pullback_quality,
+        "trend4h": trend4h,
+        "trend1h": trend1h,
+        "data_1h": tf_data["1h"],
+        "data_5m": tf_data["5m"],
     }
 
 
 # ============================================================
-# COOLDOWN
+# LEVERAGE
 # ============================================================
 
-def is_on_cooldown(symbol):
-    t = cooldowns.get(normalize_symbol(symbol))
+def calculate_leverage(setup_score, trigger_score, atr_pct):
+    combined = (setup_score + trigger_score) / 2
 
-    if not t:
-        return False
+    leverage = MIN_LEVERAGE + 1  # taban 2x
 
-    return (now_ms() - t) < COOLDOWN_MS
-
-
-def set_cooldown(symbol):
-    cooldowns[normalize_symbol(symbol)] = now_ms()
-
-
-# ============================================================
-# POSITION STATE
-# ============================================================
-
-def get_local_positions():
-    with state_lock:
-        return {k: dict(v) for k, v in local_positions.items()}
-
-
-def local_position_count(mode=None):
-    with state_lock:
-        if mode is None:
-            return len(local_positions)
-        return sum(1 for p in local_positions.values() if p.get("mode") == mode)
-
-
-def has_local_symbol(symbol):
-    normalized = normalize_symbol(symbol)
-    with state_lock:
-        return any(
-            normalize_symbol(p["symbol"]) == normalized
-            for p in local_positions.values()
-        )
-
-
-# ============================================================
-# BINANCE POSITIONS
-# ============================================================
-
-def fetch_real_positions():
-    try:
-        positions = safe_call(exchange.fetch_positions)
-
-        active = []
-
-        for p in positions:
-            contracts = safe_float(p.get("contracts"))
-
-            if abs(contracts) <= 0:
-                continue
-
-            symbol = p.get("symbol")
-
-            if not symbol:
-                continue
-
-            active.append({
-                "symbol": symbol,
-                "side": p.get("side"),
-                "contracts": contracts,
-                "entryPrice": safe_float(p.get("entryPrice")),
-                "markPrice": safe_float(p.get("markPrice")),
-                "unrealizedPnl": safe_float(p.get("unrealizedPnl")),
-                "leverage": safe_float(p.get("leverage")),
-            })
-
-        return active
-
-    except Exception as e:
-        logger.warning("Gerçek pozisyonlar alınamadı: %s", e)
-        # API hatasını "0 açık pozisyon" olarak yorumlama. Aksi halde
-        # geçici ağ/API probleminde local state yanlışlıkla silinebilir.
-        return None
-
-
-def sync_real_positions():
-    if DRY_RUN:
-        return
-
-    real = fetch_real_positions()
-    if real is None:
-        return
-
-    with state_lock:
-        real_symbols = {normalize_symbol(p["symbol"]) for p in real}
-
-        remove = [
-            key for key, local in local_positions.items()
-            if normalize_symbol(local["symbol"]) not in real_symbols
-        ]
-
-        for key in remove:
-            local_positions.pop(key, None)
-
-
-# ============================================================
-# POSITION LIMIT
-# ============================================================
-
-def can_open_mode(mode):
-    total = local_position_count()
-
-    if total >= MAX_TOTAL_POSITIONS:
-        return False
-
-    if mode == "scalp":
-        return local_position_count("scalp") < MAX_SCALP_POSITIONS
-
-    return local_position_count("opportunity") < MAX_OPPORTUNITY_POSITIONS
-
-
-# ============================================================
-# LEVERAGE  (tavan artık 5x)
-# ============================================================
-
-def calculate_leverage(signal):
-    score = signal["score"]
-    adx_val = signal["adx"]
-    atr_pct = signal["atr_pct"]
-
-    leverage = MIN_LEVERAGE
-
-    if score >= 85:
-        leverage += 1
-
-    if score >= 92:
-        leverage += 1
-
-    if adx_val >= 30:
+    if combined >= 85:
+        leverage += 2
+    elif combined >= 78:
         leverage += 1
 
     if atr_pct > 4:
         leverage -= 1
+    if atr_pct < 1.0:
+        leverage += 1
 
     return int(clamp(leverage, MIN_LEVERAGE, MAX_LEVERAGE))
 
@@ -2067,7 +1447,282 @@ def set_isolated_and_leverage(symbol, leverage):
 
 
 # ============================================================
-# ENTRY PRICE
+# DINAMIK ATR STOP
+# ============================================================
+# "ATR stop daha yakınsa onu kullan, çok uzaksa maksimum risk
+# sınırına göre daralt" mantığı:
+#   1) natural_distance = max(ATR mesafesi, yapı mesafesi) — gerçek
+#      geçersizlik noktasını temsil eder (ikisinin de ötesi = trend bozuk)
+#   2) max_risk_distance = hedefin (%10 ROI) %50'si karşılığı ham fiyat mesafesi
+#   3) final = min(natural_distance, max_risk_distance)
+#      -> natural zaten dar ise onu kullan, genişse risk sınırına daralt
+
+def calculate_dynamic_atr_stop(df, direction, entry_price, leverage, structure_level):
+    x = df.iloc[-1]
+    atr_val = safe_float(x["atr"])
+
+    if atr_val <= 0 or entry_price <= 0:
+        atr_val = entry_price * 0.01  # aşırı durumda %1 fallback
+
+    atr_distance = atr_val * INITIAL_STOP_ATR_MULTIPLIER
+
+    if direction == "long":
+        structure_distance = max(entry_price - structure_level, atr_val * 0.5) if structure_level else atr_distance
+    else:
+        structure_distance = max(structure_level - entry_price, atr_val * 0.5) if structure_level else atr_distance
+
+    natural_distance = max(atr_distance, structure_distance)
+
+    max_loss_roi = MIN_TARGET_ROI * MAX_LOSS_TO_TARGET_RATIO  # örn. %5
+    max_risk_distance = (max_loss_roi / 100 / leverage) * entry_price
+
+    final_distance = min(natural_distance, max_risk_distance)
+    final_distance = max(final_distance, entry_price * 0.0015)  # aşırı küçük stop'u engelle
+
+    if direction == "long":
+        stop_price = entry_price - final_distance
+    else:
+        stop_price = entry_price + final_distance
+
+    return {
+        "stop_price": stop_price,
+        "distance": final_distance,
+        "atr_distance": atr_distance,
+        "structure_distance": structure_distance,
+        "max_risk_distance": max_risk_distance,
+    }
+
+
+# ============================================================
+# KORELASYON KONTROLÜ
+# ============================================================
+
+def get_recent_returns(symbol, timeframe="1h", n=30):
+    try:
+        df = fetch_ohlcv_closed(symbol, timeframe, n + 5)
+        if df is None or len(df) < n:
+            return None
+        closes = df["close"].tail(n).values
+        returns = np.diff(closes) / closes[:-1]
+        return returns
+    except Exception:
+        return None
+
+
+def is_correlated_with_open_positions(symbol):
+    """Yeni aday, açık pozisyonlardan biriyle yüksek korelasyonlu mu?
+    (Aynı BTC hareketine bağımlı 3 pozisyon açmayı önlemek için.)"""
+    with state_lock:
+        open_symbols = [p["symbol"] for p in local_positions.values()]
+
+    if not open_symbols:
+        return False
+
+    candidate_returns = get_recent_returns(symbol)
+
+    if candidate_returns is None:
+        return False  # veri yoksa engelleme, sessizce izin ver
+
+    for open_symbol in open_symbols:
+        if normalize_symbol(open_symbol) == normalize_symbol(symbol):
+            continue
+
+        other_returns = get_recent_returns(open_symbol)
+
+        if other_returns is None or len(other_returns) != len(candidate_returns):
+            continue
+
+        try:
+            corr = np.corrcoef(candidate_returns, other_returns)[0, 1]
+        except Exception:
+            continue
+
+        if not math.isnan(corr) and corr >= CORRELATION_MAX_ALLOWED:
+            logger.info(
+                "[KORELASYON] %s, açık pozisyon %s ile yüksek korelasyonlu (%.2f) — elendi.",
+                symbol, open_symbol, corr
+            )
+            return True
+
+    return False
+
+
+# ============================================================
+# COOLDOWN
+# ============================================================
+
+def is_on_cooldown(symbol):
+    t = cooldowns.get(normalize_symbol(symbol))
+    if not t:
+        return False
+    return (now_ms() - t) < COOLDOWN_MS
+
+
+def set_cooldown(symbol):
+    cooldowns[normalize_symbol(symbol)] = now_ms()
+
+
+# ============================================================
+# POSITION STATE
+# ============================================================
+
+def get_local_positions():
+    with state_lock:
+        return {k: dict(v) for k, v in local_positions.items()}
+
+
+def local_position_count():
+    with state_lock:
+        return len(local_positions)
+
+
+def has_local_symbol(symbol):
+    normalized = normalize_symbol(symbol)
+    with state_lock:
+        return any(normalize_symbol(p["symbol"]) == normalized for p in local_positions.values())
+
+
+# ============================================================
+# BINANCE POSITIONS  (API FAILURE != ZERO POSITION)
+# ============================================================
+
+class PositionFetchError(Exception):
+    pass
+
+
+def fetch_real_positions():
+    """API çağrısı başarısız olursa exception fırlatır — ASLA
+    sessizce boş liste döndürmez. Çünkü 'API hatası' ile 'gerçekten
+    pozisyon yok' birbirinden kesinlikle ayrılmalıdır; aksi halde
+    geçici bir API hatasında bot açık pozisyonları local state'ten
+    yanlışlıkla silebilir."""
+    try:
+        positions = safe_call(exchange.fetch_positions)
+    except Exception as e:
+        raise PositionFetchError(str(e))
+
+    active = []
+
+    for p in positions:
+        contracts = safe_float(p.get("contracts"))
+        if abs(contracts) <= 0:
+            continue
+
+        symbol = p.get("symbol")
+        if not symbol:
+            continue
+
+        active.append({
+            "symbol": symbol,
+            "side": p.get("side"),
+            "contracts": contracts,
+            "entryPrice": safe_float(p.get("entryPrice")),
+            "markPrice": safe_float(p.get("markPrice")),
+            "unrealizedPnl": safe_float(p.get("unrealizedPnl")),
+            "leverage": safe_float(p.get("leverage")),
+        })
+
+    return active
+
+
+def sync_real_positions():
+    if DRY_RUN:
+        return
+
+    try:
+        real = fetch_real_positions()
+    except PositionFetchError as e:
+        logger.warning("Pozisyon senkronizasyonu atlandı (API hatası, state korunuyor): %s", e)
+        return
+
+    with state_lock:
+        real_symbols = {normalize_symbol(p["symbol"]) for p in real}
+        remove = [
+            key for key, local in local_positions.items()
+            if normalize_symbol(local["symbol"]) not in real_symbols
+        ]
+        for key in remove:
+            logger.warning(
+                "[SENKRON] %s borsada artık açık değil (muhtemelen native stop/TP tetiklendi), local state'ten kaldırılıyor.",
+                local_positions[key]["symbol"]
+            )
+            local_positions.pop(key, None)
+
+
+def recover_positions_from_exchange():
+    """RESTART / POSITION RECOVERY: Bot yeniden başladığında Binance'te
+    açık olan gerçek pozisyonları okuyup local state'e geri yükler.
+    RAM tek gerçek kaynak DEĞİLDİR."""
+    if DRY_RUN:
+        logger.info("[RECOVERY] DRY_RUN aktif, gerçek pozisyon kurtarma atlanıyor.")
+        return
+
+    try:
+        real = fetch_real_positions()
+    except PositionFetchError as e:
+        logger.error(
+            "[RECOVERY] Açık pozisyonlar okunamadı (%s) — bot, mevcut pozisyonlar hakkında "
+            "BİLGİSİZ başlıyor. Manuel kontrol önerilir.", e
+        )
+        return
+
+    if not real:
+        logger.info("[RECOVERY] Borsada açık pozisyon bulunamadı, temiz başlangıç.")
+        return
+
+    with state_lock:
+        for p in real:
+            symbol = p["symbol"]
+            side = "long" if p["side"] == "long" else "short"
+            key = f"hc:{normalize_symbol(symbol)}"
+
+            if key in local_positions:
+                continue
+
+            entry_price = p["entryPrice"]
+            leverage = p["leverage"] if p["leverage"] > 0 else MIN_LEVERAGE
+
+            # Orijinal setup verisi bilinmediğinden konservatif
+            # varsayılan hedef/stop ile geri yükleniyor.
+            local_positions[key] = {
+                "key": key,
+                "symbol": symbol,
+                "mode": "hc",
+                "side": side,
+                "entry_price": entry_price,
+                "amount": abs(p["contracts"]),
+                "margin": MARGIN_PER_TRADE,
+                "leverage": leverage,
+                "target_roi": MIN_TARGET_ROI,
+                "initial_stop_price": None,  # bilinmiyor — failsafe/ATR ile yeniden kurulacak
+                "current_stop_price": None,
+                "profit_lock_active": False,
+                "peak_price": entry_price,
+                "trough_price": entry_price,
+                "opened_at": now_ms(),
+                "last_monitor": now_ms(),
+                "last_trend_check": 0,
+                "stop_order_id": None,
+                "recovered": True,
+            }
+
+            logger.warning(
+                "[RECOVERY] %s %s pozisyonu geri yüklendi | entry=%s | lev=%sx | "
+                "(orijinal stop/hedef bilinmiyor, ATR ile yeniden hesaplanacak)",
+                side.upper(), symbol, entry_price, leverage
+            )
+
+
+# ============================================================
+# POSITION LIMIT
+# ============================================================
+
+def can_open_more():
+    return local_position_count() < MAX_OPEN_POSITIONS
+
+
+# ============================================================
+# ENTRY PRICE / QUANTITY
 # ============================================================
 
 def fetch_current_price(symbol):
@@ -2076,9 +1731,6 @@ def fetch_current_price(symbol):
 
 
 def fetch_current_price_fast(symbol):
-    """Pozisyon izleme döngüsü için hızlı fiyat sorgusu — az retry,
-    az bekleme. Amaç: yazılım tabanlı stop kontrolünün API
-    gecikmesinden dolayı geç kalmasını en aza indirmek."""
     try:
         ticker = safe_call(exchange.fetch_ticker, symbol, retries=1, delay=0.3)
         return safe_float(ticker.get("last"))
@@ -2086,25 +1738,28 @@ def fetch_current_price_fast(symbol):
         return 0.0
 
 
+def calculate_amount(margin, leverage, price):
+    notional = margin * leverage
+    return notional / price
+
+
 # ============================================================
-# BORSA SEVIYESINDE FAILSAFE STOP EMRI  (YENİ)
+# BORSA SEVIYESINDE FAILSAFE STOP EMRI
 # ============================================================
-# Botun yazılım tabanlı (polling) stop-loss mantığı; API gecikmesi,
-# rate limit veya bot çökmesi durumunda geç kalabilir. Bu yüzden
-# gerçek işlemlerde, pozisyon açılır açılmaz Binance'e GERÇEK bir
-# STOP_MARKET emri de gönderiyoruz. Bu emir borsa sunucusunda durur
-# ve bot ne yaparsa yapsın (çöksün, yavaşlasın, internetsiz kalsın)
-# devrede kalır. Yazılımsal SL/trailing/kâr kilitleme normal şartlarda
-# bundan önce tetiklenip pozisyonu daha erken/akıllıca kapatacaktır;
-# bu native emir sadece SON ÇARE (failsafe) güvenlik ağıdır — bu
-# yüzden yazılımsal SL'den biraz daha geniş (HARD_STOP_BUFFER) tutulur.
+# Botun yazılım tabanlı takibi API gecikmesi/rate limit/çökme
+# durumunda geç kalabilir. Bu yüzden gerçek işlemlerde pozisyon
+# açılır açılmaz Binance'e GERÇEK bir STOP_MARKET emri gönderilir.
+# side/positionSide/reduceOnly/quantity/stopPrice parametreleri
+# pozisyon yönüne göre KESİN doğru olacak şekilde ayarlanır.
 
-HARD_STOP_BUFFER = 1.15  # native stop, yazılımsal SL'den %15 daha geniş
+HARD_STOP_BUFFER_LOCAL = HARD_STOP_BUFFER
 
 
-def place_stop_market_order(symbol, entry_side, amount, stop_price):
+def place_stop_market_order(symbol, position_side, amount, stop_price):
+    """position_side: 'long' ya da 'short' (pozisyonun kendi yönü,
+    emrin side'ı değil). Emrin side'ı bunun tersidir (kapatma emri)."""
     try:
-        close_side = "sell" if entry_side == "buy" else "buy"
+        close_side = "sell" if position_side == "long" else "buy"
 
         order = safe_call(
             exchange.create_order,
@@ -2117,8 +1772,8 @@ def place_stop_market_order(symbol, entry_side, amount, stop_price):
         )
 
         logger.warning(
-            "[FAILSAFE STOP] %s | stop_price=%s | side=%s",
-            symbol, stop_price, close_side
+            "[FAILSAFE STOP] %s | pozisyon_yönü=%s | emir_yönü=%s | stop_price=%s",
+            symbol, position_side, close_side, stop_price
         )
 
         return order.get("id")
@@ -2141,258 +1796,165 @@ def cancel_stop_order(symbol, order_id):
 
 
 # ============================================================
-# ORDER QUANTITY
+# TRADE JOURNAL
 # ============================================================
 
-def calculate_amount(symbol, margin, leverage, price):
-    notional = margin * leverage
-    return notional / price
+def write_trade_journal(entry):
+    logger.warning("[JOURNAL] %s", json.dumps(entry, default=str, ensure_ascii=False))
+
+    try:
+        with open(TRADE_JOURNAL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.info("Trade journal dosyaya yazılamadı (best-effort, sorun değil): %s", e)
+
+
+def estimate_net_roi(gross_roi, leverage):
+    """Tahmini net ROI: giriş + çıkış taker komisyonu, kaldıraçlı
+    ROI üzerinden yaklaşık olarak düşülür."""
+    fee_roi_cost = TAKER_FEE_PCT * 2 * leverage
+    return gross_roi - fee_roi_cost
 
 
 # ============================================================
-# DRY RUN ORDER
+# POZİSYON AÇMA
 # ============================================================
 
-def create_dry_run_position(signal):
-    symbol = signal["symbol"]
-    direction = signal["direction"]
-    mode = signal["mode"]
-    price = signal["price"]
+def open_position(candidate):
+    symbol = candidate["symbol"]
+    direction = candidate["direction"]
 
-    leverage = calculate_leverage(signal)
+    if is_on_cooldown(symbol):
+        return False
+    if not can_open_more():
+        return False
+    if has_local_symbol(symbol):
+        return False
+    if is_correlated_with_open_positions(symbol):
+        return False
 
-    margin = SCALP_MARGIN if mode == "scalp" else OPPORTUNITY_MARGIN
+    leverage = candidate["leverage"]
+    price = candidate["price"]
 
-    amount = calculate_amount(symbol, margin, leverage, price)
+    stop_info = calculate_dynamic_atr_stop(
+        candidate["data_5m"], direction, price, leverage, candidate["structure_level"]
+    )
 
-    key = f"{mode}:{normalize_symbol(symbol)}"
+    key = f"hc:{normalize_symbol(symbol)}"
+
+    if DRY_RUN:
+        amount = calculate_amount(MARGIN_PER_TRADE, leverage, price)
+        entry_price = price
+        stop_order_id = None
+    else:
+        with state_lock:
+            if len(local_positions) >= MAX_OPEN_POSITIONS or has_local_symbol(symbol):
+                return False
+
+        real_positions = fetch_real_positions_safe()
+        if real_positions is None:
+            logger.warning("%s pozisyon açma iptal — API durumu belirsiz.", symbol)
+            return False
+
+        normalized = normalize_symbol(symbol)
+        for p in real_positions:
+            if normalize_symbol(p["symbol"]) == normalized and abs(safe_float(p["contracts"])) > 0:
+                logger.info("%s zaten açık pozisyon. Emir iptal.", symbol)
+                return False
+
+        set_isolated_and_leverage(symbol, leverage)
+
+        fresh_price = fetch_current_price(symbol)
+        if fresh_price <= 0:
+            return False
+
+        amount = calculate_amount(MARGIN_PER_TRADE, leverage, fresh_price)
+        amount = float(format_amount(symbol, amount))
+
+        if amount <= 0:
+            return False
+
+        side = "buy" if direction == "long" else "sell"
+
+        order = safe_call(
+            exchange.create_order,
+            symbol, "market", side, amount, None,
+            {"positionSide": "BOTH"}
+        )
+
+        entry_price = fresh_price
+        try:
+            filled = safe_float(order.get("average"))
+            if filled > 0:
+                entry_price = filled
+        except Exception:
+            pass
+
+        # Stop fiyatını gerçek entry'ye göre yeniden hesapla
+        stop_info = calculate_dynamic_atr_stop(
+            candidate["data_5m"], direction, entry_price, leverage, candidate["structure_level"]
+        )
+
+        native_stop_distance = stop_info["distance"] * HARD_STOP_BUFFER_LOCAL
+        if direction == "long":
+            native_stop_price = entry_price - native_stop_distance
+        else:
+            native_stop_price = entry_price + native_stop_distance
+
+        stop_order_id = place_stop_market_order(symbol, direction, amount, native_stop_price)
 
     with state_lock:
         if key in local_positions:
             return False
-        if not can_open_mode(mode):
+        if len(local_positions) >= MAX_OPEN_POSITIONS:
             return False
 
         local_positions[key] = {
             "key": key,
             "symbol": symbol,
-            "mode": mode,
-            "side": direction,
-            "entry_price": price,
-            "amount": amount,
-            "margin": margin,
-            "leverage": leverage,
-            "tp_pct": signal["tp_pct"],
-            "sl_pct": signal["sl_pct"],
-            "initial_sl_pct": min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
-            "atr_pct": signal.get("atr_pct", 0.0),
-            "dynamic_stop_roi": -min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
-            "highest_roi": 0.0,
-            "lowest_roi": 0.0,
-            "locked_roi": None,
-            "profit_lock_active": False,
-            "trailing_active": False,
-            "trail_distance_pct": None,
-            "last_atr_refresh": now_ms(),
-            "opened_at": now_ms(),
-            "last_monitor": now_ms(),
-            "last_trend_check": 0,
-            "stop_order_id": None,
-        }
-
-    logger.warning(
-        "[DRY RUN] %s %s açıldı | score=%.2f | TP=%.2f%% | SL=%.2f%% | lev=%sx | margin=%s$",
-        mode.upper(), symbol, signal["score"], signal["tp_pct"], signal["sl_pct"], leverage, margin
-    )
-
-    bot_stats["orders"] += 1
-    return True
-
-
-# ============================================================
-# REAL MARKET ORDER
-# ============================================================
-
-def create_real_position(signal):
-    symbol = signal["symbol"]
-    direction = signal["direction"]
-    mode = signal["mode"]
-
-    key = f"{mode}:{normalize_symbol(symbol)}"
-
-    with state_lock:
-        if len(local_positions) >= MAX_TOTAL_POSITIONS:
-            return False
-        if not can_open_mode(mode):
-            return False
-        if has_local_symbol(symbol):
-            return False
-
-    real_positions = fetch_real_positions()
-    if real_positions is None:
-        logger.warning("%s gerçek pozisyon kontrolü başarısız; yeni emir açılmayacak.", symbol)
-        return False
-
-    normalized = normalize_symbol(symbol)
-
-    for p in real_positions:
-        if (
-            normalize_symbol(p["symbol"]) == normalized
-            and abs(safe_float(p["contracts"])) > 0
-        ):
-            logger.info("%s zaten açık pozisyon. Emir iptal.", symbol)
-            return False
-
-    leverage = calculate_leverage(signal)
-    margin = SCALP_MARGIN if mode == "scalp" else OPPORTUNITY_MARGIN
-
-    price = fetch_current_price(symbol)
-
-    if price <= 0:
-        return False
-
-    amount = calculate_amount(symbol, margin, leverage, price)
-    amount = float(format_amount(symbol, amount))
-
-    if amount <= 0:
-        return False
-
-    set_isolated_and_leverage(symbol, leverage)
-
-    side = "buy" if direction == "long" else "sell"
-
-    order = safe_call(
-        exchange.create_order,
-        symbol, "market", side, amount, None,
-        {"positionSide": "BOTH"}
-    )
-
-    entry_price = price
-
-    try:
-        filled = safe_float(order.get("average"))
-        if filled > 0:
-            entry_price = filled
-    except Exception:
-        pass
-
-    with state_lock:
-        local_positions[key] = {
-            "key": key,
-            "symbol": symbol,
-            "mode": mode,
+            "mode": "hc",
             "side": direction,
             "entry_price": entry_price,
             "amount": amount,
-            "margin": margin,
+            "margin": MARGIN_PER_TRADE,
             "leverage": leverage,
-            "tp_pct": signal["tp_pct"],
-            "sl_pct": signal["sl_pct"],
-            "initial_sl_pct": min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
-            "atr_pct": signal.get("atr_pct", 0.0),
-            "dynamic_stop_roi": -min(signal["sl_pct"], signal["tp_pct"] * MAX_LOSS_TO_TARGET_RATIO),
-            "highest_roi": 0.0,
-            "lowest_roi": 0.0,
-            "locked_roi": None,
+            "target_roi": MIN_TARGET_ROI,
+            "initial_stop_price": stop_info["stop_price"],
+            "current_stop_price": stop_info["stop_price"],
             "profit_lock_active": False,
-            "trailing_active": False,
-            "trail_distance_pct": None,
-            "last_atr_refresh": now_ms(),
+            "peak_price": entry_price,
+            "trough_price": entry_price,
             "opened_at": now_ms(),
             "last_monitor": now_ms(),
             "last_trend_check": 0,
-            "stop_order_id": None,
+            "stop_order_id": stop_order_id,
+            "recovered": False,
+            "setup_score": candidate["setup_score"],
+            "trigger_score": candidate["trigger_score"],
+            "setup_type": candidate["setup_type"],
+            "breakout_type": candidate["breakout_type"],
         }
 
-    # --------------------------------------------------------
-    # Borsa seviyesinde failsafe stop emri
-    # --------------------------------------------------------
-    # Native emir başlangıçta maksimum zarar sınırının biraz dışında
-    # bir SON ÇARE failsafe olarak kalır. Normal çalışma sırasında asıl
-    # çıkış kararı ATR bazlı dinamik yazılım stopundan gelir.
-    # ROI -> gerçek fiyat mesafesi dönüşümü kaldıraçla yapılır.
-
-    try:
-        price_distance_fraction = (
-            (signal["sl_pct"] * HARD_STOP_BUFFER) / 100 / leverage
-        )
-
-        if direction == "long":
-            stop_price = entry_price * (1 - price_distance_fraction)
-        else:
-            stop_price = entry_price * (1 + price_distance_fraction)
-
-        stop_order_id = place_stop_market_order(symbol, side, amount, stop_price)
-
-        with state_lock:
-            if key in local_positions:
-                local_positions[key]["stop_order_id"] = stop_order_id
-
-    except Exception as e:
-        logger.error("%s failsafe stop hesaplanamadı: %s", symbol, e)
+    set_cooldown(symbol)
+    bot_stats["orders"] += 1
 
     logger.warning(
-        "[REAL] %s %s açıldı | entry=%s | score=%.2f | TP=%.2f%% | SL=%.2f%% | lev=%sx | margin=%s$",
-        mode.upper(), symbol, entry_price, signal["score"], signal["tp_pct"], signal["sl_pct"], leverage, margin
+        "[%s AÇILDI] %s %s | entry=%s | stop=%s | lev=%sx | margin=%s$ | "
+        "setup=%.1f trigger=%.1f | tip=%s/%s",
+        "DRY RUN" if DRY_RUN else "REAL", direction.upper(), symbol,
+        entry_price, stop_info["stop_price"], leverage, MARGIN_PER_TRADE,
+        candidate["setup_score"], candidate["trigger_score"],
+        candidate["setup_type"], candidate["breakout_type"]
     )
 
-    bot_stats["orders"] += 1
     return True
 
 
-# ============================================================
-# OPEN POSITION
-# ============================================================
-
-def open_position(signal):
-    if not signal:
-        return False
-
-    symbol = signal["symbol"]
-    mode = signal["mode"]
-
-    if is_on_cooldown(symbol):
-        return False
-    if not can_open_mode(mode):
-        return False
-    if has_local_symbol(symbol):
-        return False
-
-    result = create_dry_run_position(signal) if DRY_RUN else create_real_position(signal)
-
-    if result:
-        set_cooldown(symbol)
-
-    return result
-
-
-# ============================================================
-# FEE / NET ROI
-# ============================================================
-
-def estimated_fee_roi(position):
-    """Round-trip tahmini komisyonun kaldıraçlı ROI karşılığı."""
-    leverage = max(safe_float(position.get("leverage"), 1.0), 1.0)
-    return TAKER_FEE_RATE * 2.0 * leverage * 100.0
-
-
-def calculate_net_roi(position, gross_roi=None):
-    if gross_roi is None:
-        gross_roi = safe_float(position.get("current_roi"), 0.0)
-    return gross_roi - estimated_fee_roi(position)
-
-
-def calculate_atr_stop_distance_roi(position, atr_pct=None):
-    if atr_pct is None:
-        atr_pct = safe_float(position.get("atr_pct"), 0.0)
-    atr_pct = clamp(atr_pct, 0.05, 10.0)
-    leverage = max(safe_float(position.get("leverage"), 1.0), 1.0)
-    multiplier = (
-        ATR_STOP_MULTIPLIER_SCALP
-        if position.get("mode") == "scalp"
-        else ATR_STOP_MULTIPLIER_OPPORTUNITY
-    )
-    return atr_pct * multiplier * leverage
+def fetch_real_positions_safe():
+    try:
+        return fetch_real_positions()
+    except PositionFetchError:
+        return None
 
 
 # ============================================================
@@ -2406,9 +1968,7 @@ def calculate_roi(position, price):
     if entry <= 0:
         return 0.0
 
-    side = position["side"]
-
-    if side == "long":
+    if position["side"] == "long":
         price_change = (price - entry) / entry
     else:
         price_change = (entry - price) / entry
@@ -2417,126 +1977,116 @@ def calculate_roi(position, price):
 
 
 # ============================================================
-# TREND / MOMENTUM LIVE CHECK
+# CANLI TREND/MOMENTUM/YAPI KONTROLÜ (erken çıkış teyidi için)
 # ============================================================
 
-def live_signal_check(symbol, direction):
+def live_reversal_check(symbol, direction):
+    """Trend, momentum ve yapı bozulmasını AYRI AYRI değerlendirir;
+    erken çıkış için REQUIRED_REVERSAL_CONFIRMATIONS kadar ters
+    sinyal aynı anda gerekir — tek bir zayıf sinyal yetmez."""
     try:
-        df5 = fetch_ohlcv(symbol, "5m", 100)
-        df15 = fetch_ohlcv(symbol, "15m", 100)
+        df5 = fetch_ohlcv_closed(symbol, "5m", 100)
+        df15 = fetch_ohlcv_closed(symbol, "15m", 100)
 
         if df5 is None or df15 is None:
-            return {"trend_ok": True, "momentum_ok": True, "strength": 50}
+            return {"confirmations": 0, "details": {}}
 
         df5 = enrich_dataframe(df5)
         df15 = enrich_dataframe(df15)
 
         t5 = timeframe_trend(df5)
         t15 = timeframe_trend(df15)
-
         m5 = momentum_analysis(df5)
-        m15 = momentum_analysis(df15)
 
-        # "ok" (bozulma yok) sayılma eşiği yükseltildi: ters yönde
-        # sadece belirgin güçte (>=55) bir sinyal varsa "bozuldu"
-        # sayılsın; zayıf/geçici dalgalanmalar erken çıkışı tetiklemesin.
-        trend_ok = (t5["direction"] == direction or t5["strength"] < 55)
-        trend_ok = trend_ok and (t15["direction"] == direction or t15["strength"] < 55)
+        confirmations = 0
+        details = {}
 
-        momentum_ok = (m5["direction"] == direction or m5["strength"] < 55)
-
-        strength = (
-            t5["strength"] * 0.25 +
-            t15["strength"] * 0.35 +
-            m5["strength"] * 0.20 +
-            m15["strength"] * 0.20
+        # 1) Trend reversal: 5m VE 15m ikisi de belirgin ters yönde
+        trend_reversed = (
+            t5["direction"] not in ("neutral", direction) and t5["strength"] >= 55
+            and t15["direction"] not in ("neutral", direction) and t15["strength"] >= 50
         )
+        details["trend_reversed"] = trend_reversed
+        if trend_reversed:
+            confirmations += 1
 
-        return {"trend_ok": trend_ok, "momentum_ok": momentum_ok, "strength": strength}
+        # 2) Momentum reversal: 5m momentum belirgin ters yönde
+        momentum_reversed = m5["direction"] not in ("neutral", direction) and m5["strength"] >= 55
+        details["momentum_reversed"] = momentum_reversed
+        if momentum_reversed:
+            confirmations += 1
+
+        # 3) Structure failure: fiyat son 5m yapısal seviyeyi (recent_high/low) ters yönde kırdı
+        last = df5.iloc[-1]
+        close = safe_float(last["close"])
+
+        if direction == "long":
+            structure_level = safe_float(df5.iloc[-2]["recent_low"])
+            structure_failed = close < structure_level
+        else:
+            structure_level = safe_float(df5.iloc[-2]["recent_high"])
+            structure_failed = close > structure_level
+
+        details["structure_failed"] = structure_failed
+        if structure_failed:
+            confirmations += 1
+
+        return {"confirmations": confirmations, "details": details}
 
     except Exception as e:
-        logger.warning("%s live trend kontrolü başarısız: %s", symbol, e)
-        return {"trend_ok": True, "momentum_ok": True, "strength": 50}
+        logger.warning("%s canlı reversal kontrolü başarısız: %s", symbol, e)
+        return {"confirmations": 0, "details": {}}
 
 
 # ============================================================
-# DYNAMIC POSITION MANAGEMENT
+# PROFIT LOCK
 # ============================================================
 
-def update_position_management(position, price):
-    gross_roi = calculate_roi(position, price)
-    position["current_roi"] = gross_roi
-    position["net_roi"] = calculate_net_roi(position, gross_roi)
+def update_profit_lock(position, roi):
+    target = position["target_roi"]
+    trigger = target * PROFIT_LOCK_TRIGGER_RATIO
 
-    if gross_roi > position["highest_roi"]:
-        position["highest_roi"] = gross_roi
-    if gross_roi < position["lowest_roi"]:
-        position["lowest_roi"] = gross_roi
-
-    tp = position["tp_pct"]
-    max_loss_roi = tp * MAX_LOSS_TO_TARGET_RATIO
-
-    # ATR yalnızca 15 saniyede bir yenilenir; böylece 1 saniyelik monitor
-    # döngüsü Binance API'sini gereksiz OHLCV çağrılarıyla boğmaz.
-    now = now_ms()
-    if now - position.get("last_atr_refresh", 0) >= ATR_REFRESH_INTERVAL_MS:
-        try:
-            df = fetch_ohlcv(position["symbol"], "5m", 100)
-            if df is not None:
-                df = enrich_dataframe(df)
-                latest_atr_pct = safe_float(df.iloc[-1]["atr_pct"], position.get("atr_pct", 0.0))
-                if latest_atr_pct > 0:
-                    position["atr_pct"] = clamp(latest_atr_pct, 0.05, 10.0)
-        except Exception as e:
-            logger.info("%s ATR yenileme atlandı: %s", position["symbol"], e)
-        position["last_atr_refresh"] = now
-
-    atr_stop_distance = calculate_atr_stop_distance_roi(position)
-
-    # ATR stop hiçbir zaman hedefin %60'ı olan maksimum zarar sınırını
-    # aşamaz. Pozisyon kâra geçtikçe stop, peak ROI'den ATR mesafesiyle
-    # yukarı taşınır; böylece kârı gereksiz yere erken kesmeden takip eder.
-    candidate_stop = position["highest_roi"] - atr_stop_distance
-    candidate_stop = max(candidate_stop, -max_loss_roi)
-
-    previous_stop = safe_float(position.get("dynamic_stop_roi"), -max_loss_roi)
-    position["dynamic_stop_roi"] = max(previous_stop, candidate_stop)
-
-    # Hedefin %75'i görüldüğü anda kâr kilidi. Kilit, tahmini round-trip
-    # komisyon + buffer'ın altında kalamaz. Böylece küçük +ROI kapanışları
-    # komisyon sonrası sistematik zarara dönüştürmez.
-    if gross_roi >= tp * PROFIT_LOCK_TRIGGER:
-        fee_roi = estimated_fee_roi(position)
-        lock = max(
-            tp * PROFIT_LOCK_TRIGGER * PROFIT_LOCK_RATIO,
-            fee_roi + NET_PROFIT_BUFFER_ROI
-        )
-        lock = min(lock, gross_roi)
-        position["locked_roi"] = max(
-            safe_float(position.get("locked_roi"), -999.0),
-            lock
-        )
+    if roi >= trigger and not position["profit_lock_active"]:
         position["profit_lock_active"] = True
-
-    # Profit lock sonrası ATR trailing daha sıkılaşır; ancak kilit
-    # seviyesinin altına inmesine izin verilmez.
-    if position.get("profit_lock_active"):
-        trailing_distance = max(atr_stop_distance * 0.75, tp * 0.08)
-        position["trailing_active"] = True
-    else:
-        trailing_distance = atr_stop_distance
-        position["trailing_active"] = gross_roi > 0
-
-    position["trail_distance_pct"] = trailing_distance
-
-    if position["trailing_active"]:
-        trailing_stop = position["highest_roi"] - trailing_distance
-        position["dynamic_stop_roi"] = max(
-            position["dynamic_stop_roi"],
-            trailing_stop
+        logger.warning(
+            "[PROFIT LOCK AKTİF] %s | ROI=%.2f%% (tetik=%.2f%%)",
+            position["symbol"], roi, trigger
         )
 
-    return gross_roi
+
+# ============================================================
+# ATR TRAILING STOP
+# ============================================================
+# Profit lock aktifleştikten sonra devreye girer. Stop, ATR'ye göre
+# fiyatı takip eder ama ASLA pozisyon aleyhine gevşetilmez (LONG'da
+# geri düşemez, SHORT'ta geri yükselemez).
+
+def update_atr_trailing_stop(position, price, current_atr):
+    if not position["profit_lock_active"]:
+        return
+
+    distance = current_atr * TRAILING_ATR_MULTIPLIER
+
+    if position["side"] == "long":
+        if price > position["peak_price"]:
+            position["peak_price"] = price
+
+        candidate_stop = position["peak_price"] - distance
+
+        # Stop asla mevcut stop'un altına inemez (gevşetilemez) VE
+        # asla entry'nin altında kalamaz (profit lock sonrası en az
+        # breakeven garanti edilir).
+        floor_stop = max(position["current_stop_price"], position["entry_price"])
+        position["current_stop_price"] = max(floor_stop, candidate_stop)
+
+    else:
+        if price < position["trough_price"]:
+            position["trough_price"] = price
+
+        candidate_stop = position["trough_price"] + distance
+
+        ceiling_stop = min(position["current_stop_price"], position["entry_price"])
+        position["current_stop_price"] = min(ceiling_stop, candidate_stop)
 
 
 # ============================================================
@@ -2544,46 +2094,109 @@ def update_position_management(position, price):
 # ============================================================
 
 def should_close_position(position, price):
-    roi = update_position_management(position, price)
-    tp = position["tp_pct"]
+    roi = calculate_roi(position, price)
+    position["current_roi"] = roi
 
-    # Dinamik ATR stop. Başlangıçta maksimum zarar = hedefin %60'ı;
-    # pozisyon lehine ilerledikçe stop yalnızca yukarı hareket eder.
-    dynamic_stop = safe_float(
-        position.get("dynamic_stop_roi"),
-        -tp * MAX_LOSS_TO_TARGET_RATIO
-    )
+    if position["side"] == "long":
+        if price > position["peak_price"]:
+            position["peak_price"] = price
+    else:
+        if price < position["trough_price"]:
+            position["trough_price"] = price
 
-    if roi <= dynamic_stop:
-        return True, "ATR_DYNAMIC_STOP"
+    # RECOVERY pozisyonlarında orijinal stop bilinmiyordu — ilk
+    # kontrolde ATR bazlı bir stop hesaplayıp atıyoruz (yapı seviyesi
+    # olmadan, sadece ATR ile — konservatif tahmin).
+    if position.get("initial_stop_price") is None:
+        try:
+            df5 = fetch_ohlcv_closed(position["symbol"], "5m", 60)
+            if df5 is not None:
+                df5 = enrich_dataframe(df5)
+                stop_info = calculate_dynamic_atr_stop(
+                    df5, position["side"], position["entry_price"],
+                    position["leverage"], None
+                )
+                position["initial_stop_price"] = stop_info["stop_price"]
+                position["current_stop_price"] = stop_info["stop_price"]
+                logger.warning(
+                    "[RECOVERY STOP] %s için ATR bazlı stop hesaplandı: %s",
+                    position["symbol"], stop_info["stop_price"]
+                )
+        except Exception as e:
+            logger.warning("%s recovery stop hesaplanamadı: %s", position["symbol"], e)
 
-    locked = position.get("locked_roi")
-    if locked is not None and roi <= safe_float(locked):
-        return True, "PROFIT_LOCK"
+    target = position["target_roi"]
+    max_loss_roi = target * MAX_LOSS_TO_TARGET_RATIO
 
-    # Trend + momentum tersine dönüşü, kârı koruyan ana erken çıkış
-    # mekanizmasıdır. Küçük geri çekilmeler tek başına pozisyonu kapatmaz.
+    # Mutlak güvenlik tavanı — hiçbir hesaplama/gecikme bunu aşamaz
+    hard_cap = max_loss_roi * 2.0
+    if roi <= -hard_cap:
+        return True, "HARD_FAILSAFE_STOP"
+
+    # --------------------------------------------------------
+    # Aşama 1 — Initial Risk (ATR + yapı bazlı stop, fiyat seviyesinde)
+    # --------------------------------------------------------
+
+    initial_stop = position.get("initial_stop_price")
+
+    if initial_stop and not position["profit_lock_active"]:
+        if position["side"] == "long" and price <= initial_stop:
+            return True, "INITIAL_STOP"
+        if position["side"] == "short" and price >= initial_stop:
+            return True, "INITIAL_STOP"
+
+    # ROI bazlı ek güvenlik (stop hesaplanamadıysa dahi asla aşılmasın)
+    if roi <= -max_loss_roi:
+        return True, "MAX_LOSS_CAP"
+
+    # --------------------------------------------------------
+    # Aşama 2/3 — Profit lock + ATR trailing
+    # --------------------------------------------------------
+
+    update_profit_lock(position, roi)
+
     current_time = now_ms()
 
-    if (current_time - position.get("last_trend_check", 0)) >= 15000:
+    # ATR'yi periyodik olarak tazele (her check'te ağır hesap yapmamak için)
+    if (current_time - position.get("last_trend_check", 0)) >= LIVE_CHECK_INTERVAL_MS:
         position["last_trend_check"] = current_time
 
-        check = live_signal_check(position["symbol"], position["side"])
-        position["live_strength"] = check["strength"]
+        try:
+            df5 = fetch_ohlcv_closed(position["symbol"], "5m", 60)
+            if df5 is not None:
+                df5 = enrich_dataframe(df5)
+                current_atr = safe_float(df5.iloc[-1]["atr"])
 
-        reversal_trigger = 0.50 if position["mode"] == "opportunity" else 0.40
+                if position["profit_lock_active"] and current_atr > 0:
+                    update_atr_trailing_stop(position, price, current_atr)
+        except Exception as e:
+            logger.warning("%s ATR tazeleme hatası: %s", position["symbol"], e)
 
-        if roi > tp * reversal_trigger and not check["trend_ok"] and not check["momentum_ok"]:
-            return True, "TREND_MOMENTUM_REVERSAL"
+        # --------------------------------------------------------
+        # Aşama 4 — Gerçek trend/momentum/yapı çöküşü kontrolü
+        # --------------------------------------------------------
+        # Küçük bir geri çekilme yüzünden kazanan pozisyon kapatılmaz.
+        # Sadece REQUIRED_REVERSAL_CONFIRMATIONS kadar (varsayılan 2)
+        # bağımsız ters sinyal AYNI ANDA varsa erken çıkılır.
 
-        # Tek başına momentum zayıflaması pozisyonu kapatmaz.
-        # Trend ve momentum gerçekten tersine dönmedikçe ATR stop / profit
-        # lock pozisyonu taşımaya devam eder.
+        reversal = live_reversal_check(position["symbol"], position["side"])
 
-    # TP artık zorunlu kapanış değil. Hedefe ulaşıldığında trend/momentum
-    # güçlü kalıyorsa pozisyonu taşımaya devam ediyoruz; ATR trailing ve
-    # profit-lock kazanımı koruyor. Böylece güçlü hareketlerde hedefin
-    # üzerine çıkma ihtimali korunur.
+        if reversal["confirmations"] >= REQUIRED_REVERSAL_CONFIRMATIONS:
+            logger.warning(
+                "[REVERSAL TEYİDİ] %s | %s/%s ters sinyal: %s",
+                position["symbol"], reversal["confirmations"],
+                REQUIRED_REVERSAL_CONFIRMATIONS, reversal["details"]
+            )
+            return True, "TREND_MOMENTUM_STRUCTURE_REVERSAL"
+
+    # Profit lock sonrası trailing stop'a değdi mi?
+    if position["profit_lock_active"]:
+        stop = position["current_stop_price"]
+        if position["side"] == "long" and price <= stop:
+            return True, "PROFIT_LOCK_TRAILING_STOP"
+        if position["side"] == "short" and price >= stop:
+            return True, "PROFIT_LOCK_TRAILING_STOP"
+
     return False, None
 
 
@@ -2591,29 +2204,61 @@ def should_close_position(position, price):
 # CLOSE POSITION
 # ============================================================
 
-def close_dry_position(key, reason):
+def build_journal_entry(position, exit_price, reason):
+    roi = calculate_roi(position, exit_price)
+    net_roi = estimate_net_roi(roi, position["leverage"])
+
+    holding_ms = now_ms() - position["opened_at"]
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": position["symbol"],
+        "side": position["side"],
+        "leverage": position["leverage"],
+        "margin": position["margin"],
+        "entry": position["entry_price"],
+        "exit": exit_price,
+        "target_roi": position.get("target_roi"),
+        "initial_stop": position.get("initial_stop_price"),
+        "final_stop": position.get("current_stop_price"),
+        "peak_price": position.get("peak_price"),
+        "trough_price": position.get("trough_price"),
+        "gross_roi": round(roi, 3),
+        "estimated_net_roi": round(net_roi, 3),
+        "holding_time_sec": round(holding_ms / 1000, 1),
+        "exit_reason": reason,
+        "setup_score": position.get("setup_score"),
+        "trigger_score": position.get("trigger_score"),
+        "setup_type": position.get("setup_type"),
+        "breakout_type": position.get("breakout_type"),
+        "profit_lock_active": position.get("profit_lock_active"),
+        "recovered": position.get("recovered", False),
+        "dry_run": DRY_RUN,
+    }
+
+
+def close_dry_position(key, reason, exit_price):
     with state_lock:
         position = local_positions.get(key)
         if not position:
             return False
-
-        roi = position.get("current_roi", 0)
-        symbol = position["symbol"]
-        mode = position["mode"]
-
+        entry = dict(position)
         local_positions.pop(key, None)
 
-    net_roi = calculate_net_roi(position, roi)
+    journal_entry = build_journal_entry(entry, exit_price, reason)
+    write_trade_journal(journal_entry)
+
     logger.warning(
-        "[DRY RUN] %s %s kapandı | gross ROI=%+.2f%% | net ROI≈%+.2f%% | sebep=%s",
-        mode.upper(), symbol, roi, net_roi, reason
+        "[DRY RUN KAPANDI] %s %s | gross_roi=%.2f%% | net_roi=%.2f%% | sebep=%s",
+        entry["side"].upper(), entry["symbol"],
+        journal_entry["gross_roi"], journal_entry["estimated_net_roi"], reason
     )
 
     bot_stats["closed_positions"] += 1
     return True
 
 
-def close_real_position(key, reason):
+def close_real_position(key, reason, exit_price):
     with state_lock:
         position = local_positions.get(key)
         if not position:
@@ -2631,18 +2276,18 @@ def close_real_position(key, reason):
             {"reduceOnly": True, "positionSide": "BOTH"}
         )
 
-        # Bot bilinçli olarak pozisyonu kapattı; artık gerek kalmayan
-        # failsafe stop emrini borsadan iptal ediyoruz.
         cancel_stop_order(symbol, position.get("stop_order_id"))
 
         with state_lock:
             local_positions.pop(key, None)
 
-        gross_roi = safe_float(position.get("current_roi"), 0.0)
-        net_roi = calculate_net_roi(position, gross_roi)
+        journal_entry = build_journal_entry(position, exit_price, reason)
+        write_trade_journal(journal_entry)
+
         logger.warning(
-            "[REAL] %s %s kapandı | gross ROI=%+.2f%% | net ROI≈%+.2f%% | sebep=%s",
-            position["mode"].upper(), symbol, gross_roi, net_roi, reason
+            "[REAL KAPANDI] %s %s | gross_roi=%.2f%% | net_roi=%.2f%% | sebep=%s",
+            position["side"].upper(), symbol,
+            journal_entry["gross_roi"], journal_entry["estimated_net_roi"], reason
         )
 
         bot_stats["closed_positions"] += 1
@@ -2653,8 +2298,8 @@ def close_real_position(key, reason):
         return False
 
 
-def close_position(key, reason):
-    return close_dry_position(key, reason) if DRY_RUN else close_real_position(key, reason)
+def close_position(key, reason, exit_price):
+    return close_dry_position(key, reason, exit_price) if DRY_RUN else close_real_position(key, reason, exit_price)
 
 
 # ============================================================
@@ -2680,7 +2325,6 @@ def monitor_positions():
 
                 try:
                     price = fetch_current_price_fast(symbol)
-
                     if price <= 0:
                         continue
 
@@ -2688,27 +2332,25 @@ def monitor_positions():
 
                     with state_lock:
                         current = local_positions.get(key)
-
                         if not current:
                             continue
 
                         should_close, reason = should_close_position(current, price)
 
                         roi = current.get("current_roi", 0)
-                        peak = current.get("highest_roi", 0)
-                        tp = current["tp_pct"]
-                        sl = current["sl_pct"]
+                        peak = current.get("peak_price")
+                        stop = current.get("current_stop_price")
+                        lock = current.get("profit_lock_active")
 
                     logger.info(
-                        "[MONITOR] %s | %s | price=%s | gross=%+.2f%% | net≈%+.2f%% | peak=%+.2f%% | "
-                        "TP=%.2f%% | dynSL=%+.2f%% | lock=%s | trail=%s",
-                        symbol, position["mode"].upper(), price, roi, calculate_net_roi(current, roi), peak, tp,
-                        current.get("dynamic_stop_roi", -sl), current.get("locked_roi"),
-                        current.get("trail_distance_pct")
+                        "[MONITOR] %s | %s | price=%s | ROI=%+.2f%% | peak/trough=%s | "
+                        "stop=%s | lock=%s | hedef=%.1f%%",
+                        symbol, position["side"].upper(), price, roi, peak, stop, lock,
+                        current.get("target_roi", MIN_TARGET_ROI)
                     )
 
                     if should_close:
-                        close_position(key, reason)
+                        close_position(key, reason, price)
 
                 except Exception as e:
                     logger.warning("%s monitor hatası: %s", symbol, e)
@@ -2721,10 +2363,59 @@ def monitor_positions():
 
 
 # ============================================================
-# CANDIDATE ANALYSIS
+# FINAL ENTRY CONFIRMATION
 # ============================================================
 
-def analyze_candidates(symbols, mode, btc_regime=None):
+def final_entry_confirmation(candidate):
+    """Top-N aday sıraya girdikten sonra, emir açılmadan hemen önce
+    EN GÜNCEL kapanmış 5m mumla yapı kırılımı ve breakout'un hâlâ
+    geçerli olduğunu, entry chasing'e dönüşmediğini son kez doğrular."""
+    symbol = candidate["symbol"]
+    direction = candidate["direction"]
+
+    try:
+        df5 = fetch_ohlcv_closed(symbol, "5m", 100)
+        if df5 is None:
+            return False
+
+        df5 = enrich_dataframe(df5)
+
+        structure_break = detect_micro_structure_break(df5, direction)
+        if not structure_break["broken"]:
+            logger.info("[ENTRY RED] %s yapı kırılımı artık geçerli değil.", symbol)
+            return False
+
+        level = structure_break["level"]
+
+        breakout_result = confirm_breakout(df5, level, direction)
+        if not breakout_result["confirmed"]:
+            breakout_result = confirm_breakout_retest(df5, level, direction)
+
+        if not breakout_result["confirmed"]:
+            logger.info("[ENTRY RED] %s breakout teyidi artık geçerli değil.", symbol)
+            return False
+
+        if is_entry_chasing(df5, direction, level):
+            logger.info("[ENTRY RED] %s fiyat kırılımdan çok uzaklaşmış (chase).", symbol)
+            return False
+
+        funding = get_funding(symbol)
+        if abs(funding) >= FUNDING_SKIP_THRESHOLD:
+            logger.info("[ENTRY RED] %s funding aşırı.", symbol)
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.warning("%s final confirmation hatası: %s", symbol, e)
+        return False
+
+
+# ============================================================
+# CANDIDATE ANALYSIS + TOP-N SIRALI TEYIT
+# ============================================================
+
+def analyze_candidates(symbols, btc_regime=None):
     candidates = []
 
     for symbol in symbols:
@@ -2736,17 +2427,18 @@ def analyze_candidates(symbols, mode, btc_regime=None):
             continue
 
         try:
-            result = analyze_coin(symbol, mode, btc_regime=btc_regime)
+            result = analyze_high_conviction(symbol, btc_regime=btc_regime)
 
             if result:
                 candidates.append(result)
 
                 logger.info(
-                    "[%s] %s | score=%.2f | trend=%.2f | momentum=%.2f | "
-                    "align=%s | timing=%s | taker=%s | formasyon=%s | TP=%.2f%% SL=%.2f%%",
-                    mode.upper(), symbol, result["score"], result["trend_score"],
-                    result["momentum_score"], result["alignment"], result["timing_score"],
-                    result["taker_note"], result["pattern"], result["tp_pct"], result["sl_pct"]
+                    "[HC] %s | %s | setup=%.1f | trigger=%.1f | confirm=%s | tip=%s/%s | "
+                    "expected_move=%.2f%% (gerekli=%.2f%%)",
+                    symbol, result["direction"], result["setup_score"], result["trigger_score"],
+                    result["confirmations"], result["setup_type"], result["breakout_type"],
+                    result["expected_move"]["available_move_pct"],
+                    result["expected_move"]["required_move_pct"]
                 )
 
         except Exception as e:
@@ -2754,116 +2446,52 @@ def analyze_candidates(symbols, mode, btc_regime=None):
 
         time.sleep(0.05)
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    combined_score = lambda c: (c["setup_score"] + c["trigger_score"]) / 2
+    candidates.sort(key=combined_score, reverse=True)
+
     return candidates
 
 
-# ============================================================
-# FINAL ENTRY CONFIRMATION
-# ============================================================
-
-def final_entry_confirmation(signal):
-    symbol = signal["symbol"]
-    direction = signal["direction"]
-
-    try:
-        df = fetch_ohlcv(symbol, "5m", 100)
-
-        if df is None:
-            return False
-
-        df = enrich_dataframe(df)
-
-        timing = entry_timing(df, direction)
-        reversal = reversal_entry_confirmation(
-            df, direction, signal.get("mode", "scalp")
-        )
-
-        timing_threshold = 55 if signal.get("mode") == "opportunity" else 60
-        if timing["score"] < timing_threshold and not reversal["confirmed"]:
-            logger.info("[ENTRY RED] %s timing teyidi yok | score=%s < %s", symbol, timing["score"], timing_threshold)
-            return False
-
-        reversal_min = 65 if signal.get("mode") == "opportunity" else 70
-        if reversal["score"] < reversal_min:
-            logger.info(
-                "[ENTRY RED] %s reversal teyidi yok | score=%s < %s | neden=%s",
-                symbol, reversal["score"], reversal_min, ",".join(reversal["reasons"])
-            )
-            return False
-
-        if is_overextended(df, direction):
-            logger.info("[ENTRY RED] %s aşırı uzamış.", symbol)
-            return False
-
-        last = df.iloc[-1]
-        close = safe_float(last["close"])
-        ema21 = safe_float(last["ema21"])
-        atr_val = safe_float(last["atr"])
-
-        if direction == "long":
-            if close - ema21 > atr_val * 2.0:
-                return False
-        else:
-            if ema21 - close > atr_val * 2.0:
-                return False
-
-        funding = get_funding(symbol)
-        if abs(funding) >= FUNDING_SKIP_THRESHOLD:
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.warning("%s final confirmation hatası: %s", symbol, e)
-        return False
-
-
-# ============================================================
-# TOP-N ADAY ÜZERINDEN SIRALI TEYIT  (YENİ)
-# ============================================================
-# Sadece en yüksek skorlu tek adaya bakmak yerine, top-5 adayı
-# skora göre sırayla dener. İlk teyidi geçen (ve emir başarıyla
-# açılan) adayda durur. Hiçbiri geçemezse o döngüde işlem açılmaz.
-
-def try_open_from_candidates(signals, mode):
-    top_candidates = signals[:TOP_N_CANDIDATES]
+def try_open_from_candidates(candidates):
+    top_candidates = candidates[:TOP_N_CANDIDATES]
 
     logger.info(
-        "[%s] Top %s aday: %s",
-        mode.upper(),
+        "[HC] Top %s aday: %s",
         len(top_candidates),
-        [(c["symbol"], c["direction"], c["score"]) for c in top_candidates]
+        [(c["symbol"], c["direction"], round((c["setup_score"] + c["trigger_score"]) / 2, 1)) for c in top_candidates]
     )
 
+    opened_any = False
+
     for candidate in top_candidates:
+        if not can_open_more():
+            break
+
         logger.info(
-            "[%s TEYİT DENENİYOR] %s | yön=%s | skor=%.2f | trend=%.2f | "
-            "momentum=%.2f | align=%s | timing=%s | reversal=%s | taker=%s | funding=%.5f | "
-            "TP=%.2f%% SL=%.2f%%",
-            mode.upper(), candidate["symbol"], candidate["direction"], candidate["score"],
-            candidate["trend_score"], candidate["momentum_score"], candidate["alignment"],
-            candidate["timing_score"], candidate.get("reversal_score", 0), candidate["taker_note"], candidate["funding"],
-            candidate["tp_pct"], candidate["sl_pct"]
+            "[HC TEYİT DENENİYOR] %s | yön=%s | setup=%.1f | trigger=%.1f | "
+            "yapı_seviyesi=%s | tip=%s/%s",
+            candidate["symbol"], candidate["direction"], candidate["setup_score"],
+            candidate["trigger_score"], candidate["structure_level"],
+            candidate["setup_type"], candidate["breakout_type"]
         )
 
         if final_entry_confirmation(candidate):
             logger.warning(
-                "[%s AÇILIYOR] %s %s | skor=%.2f | gerekçe: trend+momentum hizalı, "
-                "son teyit geçti, BTC rejimine ters değil",
-                mode.upper(), candidate["direction"], candidate["symbol"], candidate["score"]
+                "[HC AÇILIYOR] %s %s | setup=%.1f trigger=%.1f | gerekçe: pullback sağlıklı, "
+                "momentum ivmeleniyor, yapı kırılımı+breakout teyitli, expected move yeterli",
+                candidate["direction"], candidate["symbol"],
+                candidate["setup_score"], candidate["trigger_score"]
             )
 
             if open_position(candidate):
-                return True
+                opened_any = True
         else:
-            logger.info(
-                "[%s RED] %s son teyidi geçemedi, sıradaki adaya geçiliyor.",
-                mode.upper(), candidate["symbol"]
-            )
+            logger.info("[HC RED] %s son teyidi geçemedi, sıradaki adaya geçiliyor.", candidate["symbol"])
 
-    logger.info("[%s] Top-%s aday içinde teyidi geçen olmadı.", mode.upper(), TOP_N_CANDIDATES)
-    return False
+    if not opened_any:
+        logger.info("[HC] Top-%s aday içinde teyidi geçen olmadı.", TOP_N_CANDIDATES)
+
+    return opened_any
 
 
 # ============================================================
@@ -2883,32 +2511,14 @@ def analysis_cycle():
     sync_real_positions()
 
     total = local_position_count()
-    scalp_count = local_position_count("scalp")
-    opp_count = local_position_count("opportunity")
+    logger.info("[POZİSYON] açık=%s / maksimum=%s", total, MAX_OPEN_POSITIONS)
 
-    logger.info(
-        "[POZİSYON] toplam=%s | scalp=%s | opportunity=%s",
-        total, scalp_count, opp_count
-    )
-
-    if total >= MAX_TOTAL_POSITIONS:
+    if total >= MAX_OPEN_POSITIONS:
         logger.info("[DOLU] Maksimum pozisyon sayısına ulaşıldı, analiz atlanıyor.")
         return
 
-    # --------------------------------------------------------
-    # BTC piyasa rejimi — bu döngü için bir kez hesaplanır
-    # --------------------------------------------------------
-
     btc_regime = get_btc_regime()
-
-    logger.info(
-        "[BTC REJİM] yön=%s | güç=%.1f",
-        btc_regime["direction"], btc_regime["strength"]
-    )
-
-    # --------------------------------------------------------
-    # Movers
-    # --------------------------------------------------------
+    logger.info("[BTC REJİM] yön=%s | güç=%.1f", btc_regime["direction"], btc_regime["strength"])
 
     gainers, losers, volume_leaders = get_top_movers()
 
@@ -2916,65 +2526,31 @@ def analysis_cycle():
     logger.info("[LOSERS TOP25] %s", losers)
     logger.info("[VOLUME TOP25] %s", volume_leaders)
 
-    candidates = []
+    candidates_pool = []
     seen = set()
-
     btc_normalized = normalize_symbol(BTC_SYMBOL)
 
     for symbol in gainers + losers + volume_leaders:
         normalized = normalize_symbol(symbol)
-        if normalized in seen:
-            continue
-        if normalized == btc_normalized:
-            # BTC yalnızca piyasa rejimi (yön) belirlemek için
-            # kullanılır, min notional / margin uyumsuzluğu
-            # nedeniyle işlem adayı olarak taranmaz.
+        if normalized in seen or normalized == btc_normalized:
             continue
         seen.add(normalized)
-        candidates.append(symbol)
+        candidates_pool.append(symbol)
 
-    logger.info("[TARAMA] %s benzersiz coin (likidite filtresinden geçen, BTC hariç).", len(candidates))
+    logger.info("[TARAMA] %s benzersiz coin (likidite filtresinden geçen, BTC hariç).", len(candidates_pool))
 
-    # --------------------------------------------------------
-    # Scalp (bağımsız tarama — opportunity dolu olsa bile çalışır)
-    # --------------------------------------------------------
+    signals = analyze_candidates(candidates_pool, btc_regime=btc_regime)
 
-    if SCALP_ENABLED and scalp_count < MAX_SCALP_POSITIONS and total < MAX_TOTAL_POSITIONS:
-        logger.info("[SCALP] %s coin analiz ediliyor...", len(candidates))
-
-        scalp_signals = analyze_candidates(candidates, "scalp", btc_regime=btc_regime)
-
-        if scalp_signals:
-            try_open_from_candidates(scalp_signals, "scalp")
-        else:
-            logger.info("[SCALP] Uygun sinyal yok.")
-
-    # --------------------------------------------------------
-    # Opportunity (bağımsız tarama)
-    # --------------------------------------------------------
-
-    total = local_position_count()
-    opp_count = local_position_count("opportunity")
-
-    if OPPORTUNITY_ENABLED and opp_count < MAX_OPPORTUNITY_POSITIONS and total < MAX_TOTAL_POSITIONS:
-        logger.info("[OPPORTUNITY] %s coin analiz ediliyor...", len(candidates))
-
-        opp_signals = analyze_candidates(candidates, "opportunity", btc_regime=btc_regime)
-
-        if opp_signals:
-            try_open_from_candidates(opp_signals, "opportunity")
-        else:
-            logger.info("[OPPORTUNITY] Uygun sinyal yok.")
+    if signals:
+        try_open_from_candidates(signals)
+    else:
+        logger.info("[HC] Uygun setup/trigger bulunamadı.")
 
     last_successful_analysis = datetime.now(timezone.utc).isoformat()
 
     logger.info("BOT ANALİZ BİTTİ")
     logger.info("=" * 70)
 
-
-# ============================================================
-# ANALYSIS LOOP
-# ============================================================
 
 def analysis_loop():
     logger.info("ANALYSIS LOOP başlatıldı.")
@@ -2988,7 +2564,6 @@ def analysis_loop():
             logger.exception("Analiz döngüsü hatası: %s", e)
 
         elapsed = time.time() - start
-
         wait_time = max(NO_SIGNAL_INTERVAL, ANALYSIS_INTERVAL - elapsed)
 
         for _ in range(int(wait_time)):
@@ -3005,20 +2580,8 @@ def cleanup_loop():
     while running:
         try:
             gc.collect()
-
-            cutoff = now_ms() - (30 * 60 * 1000)
-
-            with candidate_lock:
-                old = [
-                    k for k, v in signal_cache.items()
-                    if v.get("timestamp", 0) < cutoff
-                ]
-                for k in old:
-                    signal_cache.pop(k, None)
-
         except Exception:
             pass
-
         time.sleep(300)
 
 
@@ -3030,12 +2593,18 @@ def start_bot():
     global running
 
     logger.info("=" * 70)
-    logger.info("BINANCE FUTURES MOMENTUM BOT V2")
+    logger.info("HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3")
     logger.info("=" * 70)
-    logger.info("DRY_RUN=%s | TESTNET=%s | MAX_LEVERAGE=%sx | ANALYSIS_INTERVAL=%ss",
-                DRY_RUN, TESTNET, MAX_LEVERAGE, ANALYSIS_INTERVAL)
+    logger.info(
+        "DRY_RUN=%s | TESTNET=%s | MAX_LEVERAGE=%sx | MAX_OPEN_POSITIONS=%s | "
+        "MIN_TARGET_ROI=%.1f%% | ANALYSIS_INTERVAL=%ss",
+        DRY_RUN, TESTNET, MAX_LEVERAGE, MAX_OPEN_POSITIONS, MIN_TARGET_ROI, ANALYSIS_INTERVAL
+    )
 
     create_exchange()
+
+    # RESTART / POSITION RECOVERY — thread'ler başlamadan önce
+    recover_positions_from_exchange()
 
     monitor_thread = threading.Thread(target=monitor_positions, name="PositionMonitor", daemon=True)
     monitor_thread.start()
