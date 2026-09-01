@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 
 
 # ============================================================
-# BINANCE FUTURES — HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3.4 — RELAXED + PATTERNS + FULL DIAGNOSTICS
+# BINANCE FUTURES — HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3.5 — RELAXED + PATTERNS + FULL DIAGNOSTICS + BTC/XAU EXCLUDED
 # ============================================================
 #
 # STRATEJİ ÖZETİ
@@ -144,9 +144,9 @@ DIAGNOSTIC_KEYS = [
     "anomaly", "trend_neutral", "trend_weak", "momentum_conflict", "htf_conflict",
     "funding", "no_setup", "pullback_unhealthy", "no_15m_reversal", "pattern_none",
     "pattern_BULL_FLAG", "pattern_BEAR_FLAG", "pattern_TOBO", "pattern_OBO",
-    "pattern_other", "pattern_breakout", "no_breakout", "breakout_body",
+    "pattern_other", "pattern_breakout", "pattern_scanned", "pattern_candidate", "pattern_valid", "no_breakout", "breakout_body",
     "breakout_volume", "breakout_atr", "breakout_close", "entry_chase",
-    "invalid_atr", "setup_score_low", "trigger_score_low", "trigger_confirmations",
+    "invalid_atr", "setup_score_low", "trigger_score_low", "trigger_confirmations", "final_reason_no_data", "final_reason_breakout", "final_reason_chase", "final_reason_momentum", "final_reason_rsi", "final_reason_volume", "final_reason_retest", "final_reason_funding", "final_reason_other",
     "expected_move", "correlation", "btc_risk_adjusted", "final_confirmation",
     "opened", "setup_candidates", "breakout_confirmed", "analysis_error"
 ]
@@ -177,6 +177,30 @@ def pattern_diag_key(pattern_type):
     key = f"pattern_{pattern_type}"
     return key if key in DIAGNOSTIC_KEYS else "pattern_other"
 
+
+def log_final_decision(symbol, direction, level, df5, breakout_result,
+                       momentum_accel=None, rsi_turn=None, volume_ok=None,
+                       retest=None, funding=None, accepted=False, reason=""):
+    """Final confirmation telemetry only; does not alter entry logic."""
+    try:
+        current = float(df5["close"].iloc[-1])
+        atr = float(df5["atr"].iloc[-1]) if "atr" in df5.columns else 0.0
+        distance_atr = abs(current - float(level)) / atr if atr > 0 and level is not None else None
+    except Exception:
+        current, atr, distance_atr = None, None, None
+
+    logger.info(
+        "[HC FINAL DETAIL] %s | dir=%s | level=%s | price=%s | ATR=%s | distance_ATR=%s | "
+        "breakout=%s | momentum_accel=%s | rsi_turn=%s | volume_ok=%s | retest=%s | funding=%s",
+        symbol, direction, level, current, atr, distance_atr,
+        bool(breakout_result and breakout_result.get("confirmed")),
+        momentum_accel, rsi_turn, volume_ok, retest, funding
+    )
+    logger.info(
+        "[HC DECISION] %s | %s | primary=%s",
+        symbol, "PASS" if accepted else "REJECT", reason or "NONE"
+    )
+
 def log_cycle_diagnostics(scanned, final_candidates, opened):
     d = bot_stats.get("diagnostics", new_diagnostics())
     logger.info("=" * 70)
@@ -196,7 +220,8 @@ def log_cycle_diagnostics(scanned, final_candidates, opened):
         d.get("no_15m_reversal",0), d.get("setup_score_low",0)
     )
     logger.info(
-        "[HC DIAGNOSTICS] Pattern | BULL_FLAG=%s BEAR_FLAG=%s TOBO=%s OBO=%s other=%s pattern_breakout=%s",
+        "[HC DIAGNOSTICS] Pattern | scanned=%s candidate=%s valid=%s BULL_FLAG=%s BEAR_FLAG=%s TOBO=%s OBO=%s other=%s pattern_breakout=%s",
+        d.get("pattern_scanned",0), d.get("pattern_candidate",0), d.get("pattern_valid",0),
         d.get("pattern_BULL_FLAG",0), d.get("pattern_BEAR_FLAG",0),
         d.get("pattern_TOBO",0), d.get("pattern_OBO",0),
         d.get("pattern_other",0), d.get("pattern_breakout",0)
@@ -209,10 +234,15 @@ def log_cycle_diagnostics(scanned, final_candidates, opened):
     )
     logger.info(
         "[HC DIAGNOSTICS] Trigger | score_low=%s confirmations=%s expected_move=%s "
-        "correlation=%s btc_risk_adjusted=%s final_confirmation=%s",
+        "correlation=%s btc_risk_adjusted=%s final_confirmation=%s | "
+        "final_no_data=%s breakout=%s chase=%s momentum=%s rsi=%s volume=%s retest=%s funding=%s",
         d.get("trigger_score_low",0), d.get("trigger_confirmations",0),
         d.get("expected_move",0), d.get("correlation",0),
-        d.get("btc_risk_adjusted",0), d.get("final_confirmation",0)
+        d.get("btc_risk_adjusted",0), d.get("final_confirmation",0),
+        d.get("final_reason_no_data",0), d.get("final_reason_breakout",0),
+        d.get("final_reason_chase",0), d.get("final_reason_momentum",0),
+        d.get("final_reason_rsi",0), d.get("final_reason_volume",0),
+        d.get("final_reason_retest",0), d.get("final_reason_funding",0)
     )
     logger.info("[HC DIAGNOSTICS] Hatalar=%s", d.get("analysis_error",0))
     logger.info("=" * 70)
@@ -2643,6 +2673,8 @@ def final_entry_confirmation(candidate):
         if is_entry_chasing(df5, direction, level):
             diag_inc("final_confirmation")
             diag_inc("entry_chase")
+            diag_inc("final_confirmation")
+            diag_inc("final_reason_chase")
             logger.info("[ENTRY RED] %s fiyat kırılımdan çok uzaklaşmış (chase).", symbol)
             return False
 
