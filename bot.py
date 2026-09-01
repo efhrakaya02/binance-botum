@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 
 
 # ============================================================
-# BINANCE FUTURES — HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3
+# BINANCE FUTURES — HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3.1 — RELAXED + PATTERNS
 # ============================================================
 #
 # STRATEJİ ÖZETİ
@@ -80,11 +80,22 @@ MAX_LOSS_TO_TARGET_RATIO = 0.50       # Maksimum zarar, hedefin %50'sini geçeme
 # Setup / Trigger skorları  (YENİ)
 # ------------------------------------------------------------
 
-MIN_SETUP_SCORE = 75
-MIN_TRIGGER_SCORE = 75
+MIN_SETUP_SCORE = 68
+MIN_TRIGGER_SCORE = 68
 
-MIN_BREAKOUT_VOLUME_RATIO = 1.15
-REQUIRED_REVERSAL_CONFIRMATIONS = 2   # Erken çıkış için gereken ters sinyal sayısı (trend/momentum/yapı)
+MIN_BREAKOUT_VOLUME_RATIO = 1.10
+REQUIRED_REVERSAL_CONFIRMATIONS = 2
+
+# Daha esnek giriş: pattern breakoutları, klasik pullback kadar katı olmayan
+# ama yine de breakout + momentum/volume teyidi isteyen ikinci fırsat yolu.
+PATTERN_MIN_SCORE = 62
+PATTERN_MIN_TRIGGER_SCORE = 64
+PATTERN_VOLUME_RATIO = 1.05
+PATTERN_LOOKBACK = 90
+PATTERN_MAX_SHOULDER_DIFF = 0.035
+PATTERN_MAX_HEAD_SHOULDER_DIFF = 0.020
+FLAG_MAX_RETRACE = 0.55
+FLAG_MIN_IMPULSE_ATR = 1.5   # Erken çıkış için gereken ters sinyal sayısı (trend/momentum/yapı)
 
 # ------------------------------------------------------------
 # ATR bazlı stop / trailing  (YENİ)
@@ -724,8 +735,13 @@ def find_swing_points(df, window=3):
 # ============================================================
 
 def detect_pullback(df, direction):
-    """Fiyat, ana trend yönünün TERSİNE kısa vadeli bir geri
-    çekilme içinde mi? (Trend hâlâ ana yönde geçerli olmalı.)"""
+    """Ana trend içinde kısa vadeli geri çekilme arar.
+
+    Önceki sürümde son 6 mumun toplam değişiminin kesinlikle ters yönde
+    olması gerekiyordu. Bu, dönüşün başladığı ilk mumlarda setup'ları
+    gereksiz yere kaçırabiliyordu. Artık hafif geri çekilme veya yatay
+    sıkışma da kabul edilir; kaliteyi assess_pullback_quality belirler.
+    """
     if df is None or len(df) < 30:
         return False
 
@@ -733,72 +749,185 @@ def detect_pullback(df, direction):
     close = safe_float(x["close"])
     ema21 = safe_float(x["ema21"])
     ema50 = safe_float(x["ema50"])
-
     recent = df.tail(6)
-    short_term_change = (
-        (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0] * 100
-    )
+    change = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0] * 100
 
     if direction == "long":
-        # Ana trend hâlâ yukarı (fiyat EMA50 üstünde) ama son mumlarda
-        # kısa vadeli bir geri çekilme (negatif kısa dönem değişim)
-        return close > ema50 and short_term_change < 0
-
-    else:
-        return close < ema50 and short_term_change > 0
+        return close > ema50 and (change <= 0.15 or close <= ema21 * 1.01)
+    return close < ema50 and (change >= -0.15 or close >= ema21 * 0.99)
 
 
 def assess_pullback_quality(df, direction):
-    """Sağlıklı pullback: ana trend bozulmamış, karşı momentum
-    zayıflıyor, hacim azalıyor, ATR'ye göre aşırı sert değil."""
+    """Sağlıklı pullback için yumuşatılmış kalite skoru.
+
+    Amaç setup havuzunu biraz genişletmek; buna karşılık gerçek giriş
+    trigger'ı hâlâ 5M breakout/momentum teyidi istemeye devam eder.
+    """
     if df is None or len(df) < 30:
-        return {"healthy": False, "score": 0}
+        return {"healthy": False, "score": 0, "issues": ["yetersiz veri"]}
 
     x = df.iloc[-1]
     recent = df.tail(6)
-
     atr_val = safe_float(x["atr"])
     close = safe_float(x["close"])
-
     if atr_val <= 0 or close <= 0:
-        return {"healthy": False, "score": 0}
+        return {"healthy": False, "score": 0, "issues": ["ATR geçersiz"]}
 
     score = 0
-    reasons_bad = []
-
-    # 1) Karşı yönlü hareketin büyüklüğü ATR'ye göre aşırı mı?
+    issues = []
     pullback_move = abs(recent["close"].iloc[-1] - recent["close"].iloc[0])
-    if pullback_move <= atr_val * 2.0:
+    if pullback_move <= atr_val * 2.5:
         score += 30
+    elif pullback_move <= atr_val * 3.25:
+        score += 15
     else:
-        reasons_bad.append("aşırı sert karşı hareket")
+        issues.append("aşırı sert karşı hareket")
 
-    # 2) Pullback hacmi azalıyor mu? (son 3 mum ortalaması, önceki 3 mumdan düşük olmalı)
     vol_recent = recent["volume"].tail(3).mean()
     vol_prior = recent["volume"].head(3).mean()
-    if vol_prior > 0 and vol_recent < vol_prior * 1.05:
+    if vol_prior > 0 and vol_recent <= vol_prior * 1.15:
         score += 25
+    elif vol_prior > 0 and vol_recent <= vol_prior * 1.35:
+        score += 12
     else:
-        reasons_bad.append("pullback hacmi artıyor")
+        issues.append("pullback hacmi belirgin artıyor")
 
-    # 3) Karşı yönlü mum gövdeleri küçülüyor mu?
     bodies = (recent["close"] - recent["open"]).abs()
-    if bodies.iloc[-1] < bodies.iloc[:3].mean():
+    if bodies.iloc[-1] <= bodies.iloc[:3].mean() * 1.10:
         score += 20
     else:
-        reasons_bad.append("karşı mum gövdeleri küçülmüyor")
+        issues.append("karşı mum gövdeleri güçlü")
 
-    # 4) ADX karşı yönde hızlanmıyor mu?
     adx_now = safe_float(x["adx"])
     adx_prev = safe_float(df.iloc[-4]["adx"]) if len(df) > 4 else adx_now
-    if adx_now <= adx_prev * 1.15:
+    if adx_now <= adx_prev * 1.20:
         score += 25
+    elif adx_now <= adx_prev * 1.35:
+        score += 12
     else:
-        reasons_bad.append("ADX karşı yönde hızlanıyor")
+        issues.append("karşı yönde ADX hızlanıyor")
 
-    healthy = score >= 55 and len(reasons_bad) <= 1
+    healthy = score >= 48 and len(issues) <= 1
+    return {"healthy": healthy, "score": clamp(score, 0, 100), "issues": issues}
 
-    return {"healthy": healthy, "score": clamp(score, 0, 100), "issues": reasons_bad}
+
+# ============================================================
+# CHART PATTERN ENGINE — OBO / TOBO / FLAG
+# ============================================================
+
+def _pct_diff(a, b):
+    base = max(abs(a), abs(b), 1e-12)
+    return abs(a - b) / base
+
+
+def detect_chart_patterns(df, direction):
+    """Klasik indikatör teyidine alternatif fırsat yolu.
+
+    OBO/TOBO için swing noktalarını, flag için impulse + sıkışma + breakout
+    yapısını kullanır. Pattern tek başına giriş değildir; analyze pipeline
+    pattern breakoutunu ayrıca volume/momentum/candle ile teyit eder.
+    """
+    result = {"detected": False, "type": None, "direction": direction,
+              "score": 0, "break_level": None, "details": {}}
+    if df is None or len(df) < 45:
+        return result
+
+    x = df.iloc[-1]
+    atr_val = safe_float(x.get("atr"))
+    close = safe_float(x.get("close"))
+    if atr_val <= 0 or close <= 0:
+        return result
+
+    work = df.tail(PATTERN_LOOKBACK).reset_index(drop=True)
+    highs, lows = find_swing_points(work, window=2)
+
+    # OBO (bearish): left shoulder < head, right shoulder yaklaşık left shoulder.
+    if direction == "short" and len(highs) >= 3:
+        a, b, c = highs[-3:]
+        if b[1] > a[1] and b[1] > c[1] and _pct_diff(a[1], c[1]) <= PATTERN_MAX_SHOULDER_DIFF:
+            low_candidates = [(i, v) for i, v in lows if a[0] < i < c[0]]
+            if len(low_candidates) >= 2:
+                n1 = min(low_candidates, key=lambda z: z[0])
+                n2 = max(low_candidates, key=lambda z: z[0])
+                neckline = (n1[1] + n2[1]) / 2
+                if close <= neckline * 1.003:
+                    score = 70
+                    if close < neckline:
+                        score += 10
+                    result.update({"detected": True, "type": "OBO", "score": clamp(score, 0, 100),
+                                   "break_level": neckline,
+                                   "details": {"left_shoulder": a[1], "head": b[1],
+                                               "right_shoulder": c[1], "neckline": neckline}})
+
+    # TOBO / inverse H&S (bullish).
+    if not result["detected"] and direction == "long" and len(lows) >= 3:
+        a, b, c = lows[-3:]
+        if b[1] < a[1] and b[1] < c[1] and _pct_diff(a[1], c[1]) <= PATTERN_MAX_SHOULDER_DIFF:
+            high_candidates = [(i, v) for i, v in highs if a[0] < i < c[0]]
+            if len(high_candidates) >= 2:
+                n1 = min(high_candidates, key=lambda z: z[0])
+                n2 = max(high_candidates, key=lambda z: z[0])
+                neckline = (n1[1] + n2[1]) / 2
+                if close >= neckline * 0.997:
+                    score = 70
+                    if close > neckline:
+                        score += 10
+                    result.update({"detected": True, "type": "TOBO", "score": clamp(score, 0, 100),
+                                   "break_level": neckline,
+                                   "details": {"left_shoulder": a[1], "head": b[1],
+                                               "right_shoulder": c[1], "neckline": neckline}})
+
+    # Flag: son impulse + kontrollü daralan karşı eğimli konsolidasyon.
+    if not result["detected"] and len(work) >= 30:
+        impulse = work.iloc[-30:-10]
+        flag = work.iloc[-10:]
+        impulse_move = (impulse["close"].iloc[-1] - impulse["close"].iloc[0]) / impulse["close"].iloc[0]
+        impulse_atr = abs(impulse["close"].iloc[-1] - impulse["close"].iloc[0]) / max(atr_val, 1e-12)
+        flag_high = safe_float(flag["high"].max())
+        flag_low = safe_float(flag["low"].min())
+        flag_range = flag_high - flag_low
+        flag_start = safe_float(flag["close"].iloc[0])
+        flag_end = safe_float(flag["close"].iloc[-1])
+        flag_change = (flag_end - flag_start) / max(flag_start, 1e-12)
+        same_direction_impulse = (direction == "long" and impulse_move > 0) or (direction == "short" and impulse_move < 0)
+        counter_drift = (direction == "long" and flag_change <= 0.01) or (direction == "short" and flag_change >= -0.01)
+        range_ok = flag_range <= abs(impulse["close"].iloc[-1] - impulse["close"].iloc[0]) * FLAG_MAX_RETRACE
+        if same_direction_impulse and impulse_atr >= FLAG_MIN_IMPULSE_ATR and counter_drift and range_ok:
+            breakout_level = flag_high if direction == "long" else flag_low
+            broken = (close > breakout_level) if direction == "long" else (close < breakout_level)
+            score = 62 + (12 if broken else 0)
+            result.update({"detected": True, "type": "BULL_FLAG" if direction == "long" else "BEAR_FLAG",
+                           "score": clamp(score, 0, 100), "break_level": breakout_level,
+                           "details": {"impulse_atr": impulse_atr, "flag_range": flag_range, "broken": broken}})
+
+    return result
+
+
+def confirm_pattern_breakout(df, pattern, direction):
+    if not pattern or not pattern.get("detected") or pattern.get("break_level") is None:
+        return {"confirmed": False, "type": None}
+    if df is None or len(df) < 5:
+        return {"confirmed": False, "type": None}
+    last = df.iloc[-1]
+    level = safe_float(pattern["break_level"])
+    close = safe_float(last["close"])
+    open_ = safe_float(last["open"])
+    volume_ratio = safe_float(last.get("volume_ratio"), 1.0)
+    body_ratio = safe_float(last.get("body_ratio"), 0.0)
+    atr_val = safe_float(last.get("atr"))
+    if level <= 0 or atr_val <= 0:
+        return {"confirmed": False, "type": None}
+    if direction == "long":
+        body_break = close > level and close > open_
+        meaningful = close - level >= atr_val * 0.08
+    else:
+        body_break = close < level and close < open_
+        meaningful = level - close >= atr_val * 0.08
+    volume_ok = volume_ratio >= PATTERN_VOLUME_RATIO
+    body_ok = body_ratio >= 0.25
+    if body_break and meaningful and volume_ok and body_ok:
+        return {"confirmed": True, "type": f"{pattern['type']}_BREAKOUT"}
+    return {"confirmed": False, "type": None}
 
 
 # ============================================================
@@ -1201,183 +1330,144 @@ def calculate_trigger_score(momentum_accel, rsi_turning, ema_slope_ok, structure
 
 def analyze_high_conviction(symbol, btc_regime=None):
     tf_data = {}
-
     for tf in ["4h", "1h", "15m", "5m"]:
         df = fetch_ohlcv_closed(symbol, tf)
         if df is None:
             return None
         tf_data[tf] = enrich_dataframe(df)
 
-    # Anomali (pump/dump) filtresi
     if detect_anomaly(tf_data["15m"]):
         return None
 
-    # --------------------------------------------------------
-    # 1) MARKET REGIME + TREND (4H ana yapı, 1H ana yön)
-    # --------------------------------------------------------
-
     trend4h = timeframe_trend(tf_data["4h"])
     trend1h = timeframe_trend(tf_data["1h"])
-
     mom1h = momentum_analysis(tf_data["1h"])
 
-    # Ana yön: 1H trend + momentum aynı yöndeyse o yön; değilse skip
-    if trend1h["direction"] == "neutral" or trend1h["strength"] < 35:
+    if trend1h["direction"] == "neutral" or trend1h["strength"] < 30:
         return None
-
     direction = trend1h["direction"]
-
-    if mom1h["direction"] != "neutral" and mom1h["direction"] != direction:
+    if mom1h["direction"] != "neutral" and mom1h["direction"] != direction and mom1h["strength"] >= 55:
         return None
 
-    # 4H ana yapı çok güçlü şekilde ters yöndeyse skip (reversal ayrı ele alınabilir,
-    # basitlik için burada sadece CONTINUATION setup'ları hedefliyoruz)
     setup_type = "continuation"
     if trend4h["direction"] != "neutral" and trend4h["direction"] != direction:
-        if trend4h["strength"] >= 60:
+        if trend4h["strength"] >= 68:
             return None
-        setup_type = "reversal"  # HTF zayıflıyor, daha yüksek teyit isteyeceğiz
-
-    # --------------------------------------------------------
-    # 2) BTC PİYASA REJİMİ FİLTRESİ
-    # --------------------------------------------------------
+        setup_type = "reversal"
 
     if btc_regime and symbol != BTC_SYMBOL:
-        if (
-            btc_regime["direction"] != "neutral"
-            and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
-            and btc_regime["direction"] != direction
-        ):
+        if (btc_regime["direction"] != "neutral" and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
+                and btc_regime["direction"] != direction):
             return None
-
-    market_regime_ok = not (
-        btc_regime and btc_regime["direction"] != "neutral"
-        and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
-        and btc_regime["direction"] != direction
-    )
-
-    # --------------------------------------------------------
-    # 3) FUNDING
-    # --------------------------------------------------------
+    market_regime_ok = not (btc_regime and btc_regime["direction"] != "neutral"
+                            and btc_regime["strength"] >= BTC_REGIME_MIN_STRENGTH
+                            and btc_regime["direction"] != direction)
 
     funding = get_funding(symbol)
     if abs(funding) >= FUNDING_SKIP_THRESHOLD:
         return None
 
     # --------------------------------------------------------
-    # 4) WATCH — 15M PULLBACK + KALİTESİ
+    # SETUP: klasik pullback veya chart pattern
     # --------------------------------------------------------
+    pullback_detected = detect_pullback(tf_data["15m"], direction)
+    pullback_quality = assess_pullback_quality(tf_data["15m"], direction) if pullback_detected else {"healthy": False, "score": 0, "issues": []}
+    pattern = detect_chart_patterns(tf_data["15m"], direction)
 
-    if not detect_pullback(tf_data["15m"], direction):
-        return None
-
-    pullback_quality = assess_pullback_quality(tf_data["15m"], direction)
-
-    if not pullback_quality["healthy"]:
+    pattern_setup = bool(pattern.get("detected"))
+    valid_setup = pullback_quality.get("healthy") or pattern_setup
+    if not valid_setup:
         return None
 
     momentum_reversal_15m = detect_momentum_reversal(tf_data["15m"], direction)
-
-    if not momentum_reversal_15m:
+    # Patternlerde klasik 15M reversal zorunlu değil; patternin yapısı zaten
+    # setup teyidini sağlıyor. Yine de mevcut momentum yönü güçlü şekilde tersse reddet.
+    if not momentum_reversal_15m and not pattern_setup:
         return None
 
     # --------------------------------------------------------
-    # 5) ARM — 5M MOMENTUM ACCELERATION
+    # ARM — 5M momentum
     # --------------------------------------------------------
-
     momentum_accel = calculate_momentum_acceleration(tf_data["5m"], direction)
-
     rsi_vals_5m = tf_data["5m"]["rsi"].tail(4).values
-    if direction == "long":
-        rsi_turning = rsi_vals_5m[-1] > rsi_vals_5m[0]
-    else:
-        rsi_turning = rsi_vals_5m[-1] < rsi_vals_5m[0]
+    rsi_turning = (rsi_vals_5m[-1] > rsi_vals_5m[0]) if direction == "long" else (rsi_vals_5m[-1] < rsi_vals_5m[0])
 
     ema9_slope = safe_float(tf_data["5m"].iloc[-1]["ema9_slope"])
     ema21_slope = safe_float(tf_data["5m"].iloc[-1]["ema21_slope"])
-
-    if direction == "long":
-        ema_slope_ok = ema9_slope > 0 and ema21_slope >= 0
-    else:
-        ema_slope_ok = ema9_slope < 0 and ema21_slope <= 0
+    ema_slope_ok = ((ema9_slope > 0 and ema21_slope >= -abs(ema9_slope) * 0.5)
+                    if direction == "long" else
+                    (ema9_slope < 0 and ema21_slope <= abs(ema9_slope) * 0.5))
 
     # --------------------------------------------------------
-    # 6) FIRE — MICRO STRUCTURE BREAK + BREAKOUT CONFIRM/RETEST
+    # FIRE — klasik micro break veya pattern breakout
     # --------------------------------------------------------
-
     structure_break = detect_micro_structure_break(tf_data["5m"], direction)
+    pattern_breakout = confirm_pattern_breakout(tf_data["5m"], pattern, direction)
 
-    if not structure_break["broken"]:
-        return None
-
-    level = structure_break["level"]
-
-    breakout_result = confirm_breakout(tf_data["5m"], level, direction)
-
-    if not breakout_result["confirmed"]:
-        breakout_result = confirm_breakout_retest(tf_data["5m"], level, direction)
-
-    if not breakout_result["confirmed"]:
-        return None
-
-    # Entry chasing filtresi
-    if is_entry_chasing(tf_data["5m"], direction, level):
+    if structure_break["broken"]:
+        level = structure_break["level"]
+        breakout_result = confirm_breakout(tf_data["5m"], level, direction)
+        if not breakout_result["confirmed"]:
+            breakout_result = confirm_breakout_retest(tf_data["5m"], level, direction)
+        breakout_type = breakout_result.get("type")
+    elif pattern_breakout["confirmed"]:
+        level = pattern["break_level"]
+        breakout_result = pattern_breakout
+        breakout_type = pattern_breakout.get("type")
+    else:
         return None
 
     current_5m = tf_data["5m"].iloc[-1]
-
     atr_val = safe_float(current_5m["atr"])
     atr_pct = clamp(safe_float(current_5m["atr_pct"]), 0.15, 6.0)
-
     price = safe_float(current_5m["close"])
-
-    distance_atr = abs(price - level) / atr_val if atr_val > 0 else 0
-    atr_position_ok = distance_atr <= MAX_ENTRY_CHASE_ATR
-
     volume_ratio = safe_float(current_5m["volume_ratio"], 1)
 
-    # --------------------------------------------------------
-    # SETUP SCORE
-    # --------------------------------------------------------
+    if level is None or atr_val <= 0:
+        return None
+    distance_atr = abs(price - level) / atr_val
+    atr_position_ok = distance_atr <= MAX_ENTRY_CHASE_ATR
+    if not atr_position_ok:
+        return None
 
+    # --------------------------------------------------------
+    # SCORE — biraz gevşetilmiş, pattern için ayrı alt sınır
+    # --------------------------------------------------------
     setup_score, setup_breakdown = calculate_setup_score(
         direction, trend4h, trend1h, pullback_quality, atr_pct, funding, volume_ratio, market_regime_ok
     )
+    if pattern_setup:
+        setup_score = max(setup_score, pattern.get("score", 0))
+        setup_breakdown["chart_pattern"] = pattern.get("score", 0)
 
-    min_setup = MIN_SETUP_SCORE if setup_type == "continuation" else MIN_SETUP_SCORE + 5
-
+    min_setup = PATTERN_MIN_SCORE if pattern_setup else (MIN_SETUP_SCORE + (3 if setup_type == "reversal" else 0))
     if setup_score < min_setup:
         return None
 
-    # --------------------------------------------------------
-    # TRIGGER SCORE
-    # --------------------------------------------------------
-
     trigger_score, trigger_breakdown, confirmations = calculate_trigger_score(
-        momentum_accel, rsi_turning, ema_slope_ok, structure_break, breakout_result, atr_position_ok
+        momentum_accel, rsi_turning, ema_slope_ok,
+        {"broken": structure_break["broken"] or pattern_breakout["confirmed"]},
+        breakout_result, atr_position_ok
     )
+    if pattern_setup:
+        trigger_score += 8
+        trigger_breakdown["chart_pattern_bonus"] = 8
+        trigger_score = clamp(trigger_score, 0, 100)
 
-    min_trigger = MIN_TRIGGER_SCORE if setup_type == "continuation" else MIN_TRIGGER_SCORE + 5
-
+    min_trigger = PATTERN_MIN_TRIGGER_SCORE if pattern_setup else (MIN_TRIGGER_SCORE + (3 if setup_type == "reversal" else 0))
     if trigger_score < min_trigger:
         return None
 
-    if confirmations < 2:
-        # MACD acceleration / RSI turn / structure break üçlüsünden en az 2'si şart
+    # Klasik pullbackta 2 teyit yerine 1 güçlü trigger yeterli olabilir;
+    # pattern breakoutunda ise breakout + en az bir momentum/RSI teyidi gerekir.
+    if pattern_setup:
+        if confirmations < 1 or not (momentum_accel.get("accelerating") or rsi_turning):
+            return None
+    elif confirmations < 1:
         return None
 
-    # --------------------------------------------------------
-    # LEVERAGE (tentatif — expected move hesaplaması için gerekli)
-    # --------------------------------------------------------
-
     leverage = calculate_leverage(setup_score, trigger_score, atr_pct)
-
-    # --------------------------------------------------------
-    # EXPECTED MOVE
-    # --------------------------------------------------------
-
     expected_move = calculate_expected_move(tf_data["1h"], direction, price, leverage)
-
     if not expected_move["sufficient"]:
         return None
 
@@ -1390,7 +1480,9 @@ def analyze_high_conviction(symbol, btc_regime=None):
         "setup_breakdown": setup_breakdown,
         "trigger_breakdown": trigger_breakdown,
         "confirmations": confirmations,
-        "breakout_type": breakout_result["type"],
+        "breakout_type": breakout_type,
+        "chart_pattern": pattern.get("type") if pattern_setup else None,
+        "pattern_details": pattern.get("details", {}) if pattern_setup else {},
         "price": price,
         "atr": atr_val,
         "atr_pct": atr_pct,
@@ -1703,6 +1795,8 @@ def recover_positions_from_exchange():
                 "last_monitor": now_ms(),
                 "last_trend_check": 0,
                 "stop_order_id": None,
+                "chart_pattern": None,
+                "pattern_details": {},
                 "recovered": True,
             }
 
@@ -1895,7 +1989,11 @@ def open_position(candidate):
             candidate["data_5m"], direction, entry_price, leverage, candidate["structure_level"]
         )
 
-        native_stop_distance = stop_info["distance"] * HARD_STOP_BUFFER_LOCAL
+        # Native failsafe, yazılımsal risk tavanını ASLA aşmamalı.
+        native_stop_distance = min(
+            stop_info["distance"] * HARD_STOP_BUFFER_LOCAL,
+            stop_info["max_risk_distance"]
+        )
         if direction == "long":
             native_stop_price = entry_price - native_stop_distance
         else:
@@ -1933,6 +2031,8 @@ def open_position(candidate):
             "trigger_score": candidate["trigger_score"],
             "setup_type": candidate["setup_type"],
             "breakout_type": candidate["breakout_type"],
+            "chart_pattern": candidate.get("chart_pattern"),
+            "pattern_details": candidate.get("pattern_details", {}),
         }
 
     set_cooldown(symbol)
@@ -1940,11 +2040,11 @@ def open_position(candidate):
 
     logger.warning(
         "[%s AÇILDI] %s %s | entry=%s | stop=%s | lev=%sx | margin=%s$ | "
-        "setup=%.1f trigger=%.1f | tip=%s/%s",
+        "setup=%.1f trigger=%.1f | tip=%s/%s | pattern=%s",
         "DRY RUN" if DRY_RUN else "REAL", direction.upper(), symbol,
         entry_price, stop_info["stop_price"], leverage, MARGIN_PER_TRADE,
         candidate["setup_score"], candidate["trigger_score"],
-        candidate["setup_type"], candidate["breakout_type"]
+        candidate["setup_type"], candidate["breakout_type"], candidate.get("chart_pattern")
     )
 
     return True
@@ -2128,8 +2228,10 @@ def should_close_position(position, price):
     target = position["target_roi"]
     max_loss_roi = target * MAX_LOSS_TO_TARGET_RATIO
 
-    # Mutlak güvenlik tavanı — hiçbir hesaplama/gecikme bunu aşamaz
-    hard_cap = max_loss_roi * 2.0
+    # Mutlak güvenlik tavanı: hedefin %50'si.
+    # API/fiyat gecikmesi nedeniyle gerçekleşen zarar farklı olabilir, ancak
+    # yazılımsal karar katmanı bu seviyenin ötesini kabul etmez.
+    hard_cap = max_loss_roi
     if roi <= -hard_cap:
         return True, "HARD_FAILSAFE_STOP"
 
@@ -2231,6 +2333,8 @@ def build_journal_entry(position, exit_price, reason):
         "trigger_score": position.get("trigger_score"),
         "setup_type": position.get("setup_type"),
         "breakout_type": position.get("breakout_type"),
+        "chart_pattern": position.get("chart_pattern"),
+        "pattern_details": position.get("pattern_details", {}),
         "profit_lock_active": position.get("profit_lock_active"),
         "recovered": position.get("recovered", False),
         "dry_run": DRY_RUN,
@@ -2381,18 +2485,25 @@ def final_entry_confirmation(candidate):
         df5 = enrich_dataframe(df5)
 
         structure_break = detect_micro_structure_break(df5, direction)
-        if not structure_break["broken"]:
-            logger.info("[ENTRY RED] %s yapı kırılımı artık geçerli değil.", symbol)
+        pattern = detect_chart_patterns(df5, direction) if candidate.get("chart_pattern") else {"detected": False}
+
+        if structure_break["broken"]:
+            level = structure_break["level"]
+            breakout_result = confirm_breakout(df5, level, direction)
+            if not breakout_result["confirmed"]:
+                breakout_result = confirm_breakout_retest(df5, level, direction)
+            if not breakout_result["confirmed"] and pattern.get("detected"):
+                level = pattern.get("break_level")
+                breakout_result = confirm_pattern_breakout(df5, pattern, direction)
+        elif pattern.get("detected"):
+            level = pattern.get("break_level")
+            breakout_result = confirm_pattern_breakout(df5, pattern, direction)
+        else:
+            logger.info("[ENTRY RED] %s yapı/pattern kırılımı artık geçerli değil.", symbol)
             return False
 
-        level = structure_break["level"]
-
-        breakout_result = confirm_breakout(df5, level, direction)
         if not breakout_result["confirmed"]:
-            breakout_result = confirm_breakout_retest(df5, level, direction)
-
-        if not breakout_result["confirmed"]:
-            logger.info("[ENTRY RED] %s breakout teyidi artık geçerli değil.", symbol)
+            logger.info("[ENTRY RED] %s breakout/pattern teyidi artık geçerli değil.", symbol)
             return False
 
         if is_entry_chasing(df5, direction, level):
@@ -2433,7 +2544,7 @@ def analyze_candidates(symbols, btc_regime=None):
                 candidates.append(result)
 
                 logger.info(
-                    "[HC] %s | %s | setup=%.1f | trigger=%.1f | confirm=%s | tip=%s/%s | "
+                    "[HC] %s | %s | setup=%.1f | trigger=%.1f | confirm=%s | tip=%s/%s | pattern=%s | "
                     "expected_move=%.2f%% (gerekli=%.2f%%)",
                     symbol, result["direction"], result["setup_score"], result["trigger_score"],
                     result["confirmations"], result["setup_type"], result["breakout_type"],
@@ -2469,10 +2580,10 @@ def try_open_from_candidates(candidates):
 
         logger.info(
             "[HC TEYİT DENENİYOR] %s | yön=%s | setup=%.1f | trigger=%.1f | "
-            "yapı_seviyesi=%s | tip=%s/%s",
+            "yapı_seviyesi=%s | tip=%s/%s | pattern=%s",
             candidate["symbol"], candidate["direction"], candidate["setup_score"],
             candidate["trigger_score"], candidate["structure_level"],
-            candidate["setup_type"], candidate["breakout_type"]
+            candidate["setup_type"], candidate["breakout_type"], candidate.get("chart_pattern")
         )
 
         if final_entry_confirmation(candidate):
@@ -2593,7 +2704,7 @@ def start_bot():
     global running
 
     logger.info("=" * 70)
-    logger.info("HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3")
+    logger.info("HIGH-CONVICTION PULLBACK & BREAKOUT BOT V3.1 — RELAXED + PATTERNS")
     logger.info("=" * 70)
     logger.info(
         "DRY_RUN=%s | TESTNET=%s | MAX_LEVERAGE=%sx | MAX_OPEN_POSITIONS=%s | "
