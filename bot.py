@@ -129,7 +129,7 @@ MAX_POSITIONS = 2
 MIN_LONG_SCORE = 72
 MIN_SHORT_SCORE = 72
 
-EARLY_ENTRY_SCORE = 76
+EARLY_ENTRY_SCORE = 72
 
 MAX_ABS_FUNDING = 0.0015
 
@@ -2933,7 +2933,8 @@ def side_count(
 
 def choose_leverage(
     score,
-    atr_percent
+    atr_percent,
+    btc_context=None
 ):
 
     leverage = 3
@@ -2961,6 +2962,9 @@ def choose_leverage(
     if atr_percent >= 4:
 
         leverage -= 1
+
+    if btc_context and btc_context.get("strength", 0) >= 70:
+        leverage += 1
 
     leverage = int(
         clamp(
@@ -3047,26 +3051,15 @@ def calculate_quantity(
 
 def calculate_target_roi(
     score,
-    atr_percent
+    atr_percent,
+    ticker_percentage
 ):
 
-    target = 0.012
+    base_move = max(abs(ticker_percentage) / 100.0, 0.01)
 
-    if score >= 90:
+    score_factor = score / 100.0
 
-        target = 0.030
-
-    elif score >= 85:
-
-        target = 0.025
-
-    elif score >= 80:
-
-        target = 0.020
-
-    elif score >= 76:
-
-        target = 0.015
+    target = max(0.01, base_move * score_factor)
 
     if atr_percent >= 2.5:
 
@@ -3108,14 +3101,24 @@ def dry_run_open(
 
         return False
 
+    max_loss_pnl_fraction = 0.50
+    target_pnl_fraction = target_roi * leverage
+    allowed_max_loss_fraction = target_pnl_fraction * max_loss_pnl_fraction
+
+    max_loss_stop_distance_pct = allowed_max_loss_fraction / leverage
+
+    calculated_hard_stop_distance = atr_value * HARD_STOP_ATR / price
+    if calculated_hard_stop_distance > max_loss_stop_distance_pct:
+        effective_hard_stop_distance = max_loss_stop_distance_pct * price
+    else:
+        effective_hard_stop_distance = atr_value * HARD_STOP_ATR
+
     if side == "LONG":
 
         stop_price = (
             price
             -
-            atr_value
-            *
-            HARD_STOP_ATR
+            effective_hard_stop_distance
         )
 
     else:
@@ -3123,9 +3126,7 @@ def dry_run_open(
         stop_price = (
             price
             +
-            atr_value
-            *
-            HARD_STOP_ATR
+            effective_hard_stop_distance
         )
 
     opened_at = (
@@ -3336,14 +3337,23 @@ def live_open_position(
             .isoformat()
         )
 
+        max_loss_pnl_fraction = 0.50
+        target_pnl_fraction = target_roi * leverage
+        allowed_max_loss_fraction = target_pnl_fraction * max_loss_pnl_fraction
+        max_loss_stop_distance_pct = allowed_max_loss_fraction / leverage
+
+        calculated_hard_stop_distance = atr_value * HARD_STOP_ATR / price
+        if calculated_hard_stop_distance > max_loss_stop_distance_pct:
+            effective_hard_stop_distance = max_loss_stop_distance_pct * price
+        else:
+            effective_hard_stop_distance = atr_value * HARD_STOP_ATR
+
         if side == "LONG":
 
             initial_stop = (
                 price
                 -
-                atr_value
-                *
-                HARD_STOP_ATR
+                effective_hard_stop_distance
             )
 
         else:
@@ -3351,9 +3361,7 @@ def live_open_position(
             initial_stop = (
                 price
                 +
-                atr_value
-                *
-                HARD_STOP_ATR
+                effective_hard_stop_distance
             )
 
         position = {
@@ -3524,6 +3532,13 @@ def update_trailing_stop(
         "atr"
     ]
 
+    entry = position[
+        "entry"
+    ]
+
+    target_roi = position.get("target_roi", 0.012)
+    leverage = position["leverage"]
+
     pnl, roi = calculate_pnl(
         position,
         current_price
@@ -3562,54 +3577,19 @@ def update_trailing_stop(
             current_price
         )
 
-        if roi >= MIN_PROFIT_TO_TRAIL:
+        steps_reached = int(roi // 0.01)
+        if steps_reached > 0:
+            step_stop = entry * (1.0 + (steps_reached * 0.01 / leverage))
+            position["stop_price"] = max(position["stop_price"], step_stop)
 
-            position[
-                "trailing_active"
-            ] = True
+        if roi >= (target_roi * 0.40):
+            position["stop_price"] = max(position["stop_price"], entry)
+            position["trailing_active"] = True
 
-        if position[
-            "trailing_active"
-        ]:
-
-            if roi >= TRAIL_LEVEL_3:
-
-                multiplier = (
-                    TRAIL_ATR_TIGHT
-                )
-
-            elif roi >= TRAIL_LEVEL_2:
-
-                multiplier = 1.20
-
-            elif roi >= TRAIL_LEVEL_1:
-
-                multiplier = 1.30
-
-            else:
-
-                multiplier = (
-                    TRAIL_ATR_MULTIPLIER
-                )
-
-            trailing_stop = (
-                position[
-                    "highest"
-                ]
-                -
-                atr_value
-                *
-                multiplier
-            )
-
-            position[
-                "stop_price"
-            ] = max(
-                position[
-                    "stop_price"
-                ],
-                trailing_stop
-            )
+        if position["trailing_active"] and roi >= (target_roi * 0.40):
+            dynamic_atr_distance = atr_value * TRAIL_ATR_TIGHT
+            dynamic_stop = position["highest"] - dynamic_atr_distance
+            position["stop_price"] = max(position["stop_price"], dynamic_stop)
 
     else:
 
@@ -3622,54 +3602,19 @@ def update_trailing_stop(
             current_price
         )
 
-        if roi >= MIN_PROFIT_TO_TRAIL:
+        steps_reached = int(roi // 0.01)
+        if steps_reached > 0:
+            step_stop = entry * (1.0 - (steps_reached * 0.01 / leverage))
+            position["stop_price"] = min(position["stop_price"], step_stop)
 
-            position[
-                "trailing_active"
-            ] = True
+        if roi >= (target_roi * 0.40):
+            position["stop_price"] = min(position["stop_price"], entry)
+            position["trailing_active"] = True
 
-        if position[
-            "trailing_active"
-        ]:
-
-            if roi >= TRAIL_LEVEL_3:
-
-                multiplier = (
-                    TRAIL_ATR_TIGHT
-                )
-
-            elif roi >= TRAIL_LEVEL_2:
-
-                multiplier = 1.20
-
-            elif roi >= TRAIL_LEVEL_1:
-
-                multiplier = 1.30
-
-            else:
-
-                multiplier = (
-                    TRAIL_ATR_MULTIPLIER
-                )
-
-            trailing_stop = (
-                position[
-                    "lowest"
-                ]
-                +
-                atr_value
-                *
-                multiplier
-            )
-
-            position[
-                "stop_price"
-            ] = min(
-                position[
-                    "stop_price"
-                ],
-                trailing_stop
-            )
+        if position["trailing_active"] and roi >= (target_roi * 0.40):
+            dynamic_atr_distance = atr_value * TRAIL_ATR_TIGHT
+            dynamic_stop = position["lowest"] + dynamic_atr_distance
+            position["stop_price"] = min(position["stop_price"], dynamic_stop)
 
     position[
         "last_update"
@@ -4788,15 +4733,20 @@ def analyze_symbol(
 
     leverage = choose_leverage(
         score,
-        atr_percent
+        atr_percent,
+        btc_context
     )
 
     target_roi = (
         calculate_target_roi(
             score,
-            atr_percent
+            atr_percent,
+            ticker["percentage"]
         )
     )
+
+    if target_roi < 0.01:
+        return None
 
     structure_1h = market_structure(
         df1h
@@ -5080,7 +5030,7 @@ def final_entry_validation(
             original
         )
 
-        if move > 0.012:
+        if move > 0.015:
 
             logger.info(
                 "ENTRY SKIP | %s | "
