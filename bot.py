@@ -3046,7 +3046,7 @@ def calculate_quantity(
 
 
 # ============================================================
-# TARGET ROI
+# TARGET ROI (GÜNCELLENDİ)
 # ============================================================
 
 def calculate_target_roi(
@@ -3059,15 +3059,15 @@ def calculate_target_roi(
 
     score_factor = score / 100.0
 
-    target = max(0.01, base_move * score_factor)
+    target = max(0.015, base_move * score_factor * 1.25)
 
     if atr_percent >= 2.5:
 
-        target += 0.005
+        target += 0.008
 
     if atr_percent >= 4:
 
-        target += 0.005
+        target += 0.010
 
     return target
 
@@ -3516,7 +3516,7 @@ def calculate_pnl(
 
 
 # ============================================================
-# UPDATE TRAILING
+# UPDATE TRAILING (GÜNCELLENDİ)
 # ============================================================
 
 def update_trailing_stop(
@@ -3536,7 +3536,7 @@ def update_trailing_stop(
         "entry"
     ]
 
-    target_roi = position.get("target_roi", 0.012)
+    target_roi = position.get("target_roi", 0.015)
     leverage = position["leverage"]
 
     pnl, roi = calculate_pnl(
@@ -3577,13 +3577,11 @@ def update_trailing_stop(
             current_price
         )
 
-        # DÜZELTME: Erken kilitlenmeyi önlemek için adım bazlı stop seviyesinin 
-        # devreye girmesi için ROI'nin anlamlı bir eşiği (hedefin en az %40'ı veya %3 minimum) aşması şartı eklendi.
-        activation_limit = max(0.03, target_roi * 0.40)
+        activation_limit = max(0.025, target_roi * 0.35)
         if roi >= activation_limit:
-            steps_reached = int(roi // 0.01)
+            steps_reached = int(roi // 0.008)
             if steps_reached > 0:
-                step_stop = entry * (1.0 + (steps_reached * 0.01 / leverage))
+                step_stop = entry * (1.0 + (steps_reached * 0.008 / leverage))
                 position["stop_price"] = max(position["stop_price"], step_stop)
 
             position["trailing_active"] = True
@@ -3603,11 +3601,11 @@ def update_trailing_stop(
             current_price
         )
 
-        activation_limit = max(0.03, target_roi * 0.40)
+        activation_limit = max(0.025, target_roi * 0.35)
         if roi >= activation_limit:
-            steps_reached = int(roi // 0.01)
+            steps_reached = int(roi // 0.008)
             if steps_reached > 0:
-                step_stop = entry * (1.0 - (steps_reached * 0.01 / leverage))
+                step_stop = entry * (1.0 - (steps_reached * 0.008 / leverage))
                 position["stop_price"] = min(position["stop_price"], step_stop)
 
             position["trailing_active"] = True
@@ -4360,7 +4358,7 @@ def hourly_report_loop():
 # BTC işlem evreninden tamamen hariç tutulur (valid_symbol zaten
 # banned listesinde tutuyor). Burada BTC SADECE piyasa yönü
 # teyidi (context) ve korelasyon kontrolü için kullanılır — asla
-# doğrudan işlem adayı olmaz.
+# doğrudan işlem alımı olmaz.
 
 BTC_SYMBOL = "BTC/USDT"
 
@@ -4376,9 +4374,7 @@ BTC_CONTEXT_CACHE_SECONDS = 30
 
 def compute_btc_context():
     """BTC 1H market structure + kısa vadeli impulse'a göre basit
-    bir 'piyasa yönü' bağlamı üretir. Sert bir veto değildir —
-    score_long/score_short içinde küçük bir bonus/penalty olarak
-    kullanılır."""
+    bir 'piyasa yönü' bağlamı üretir."""
 
     df1h = fetch_ohlcv_cached(
         BTC_SYMBOL,
@@ -4423,8 +4419,7 @@ def compute_btc_context():
 
 def get_btc_context():
     """BTC context'i her sembol için değil, tarama döngüsü başına
-    bir kez hesaplayıp kısa süreliğine cache'ler (gereksiz API
-    yükünü azaltmak için)."""
+    bir kez hesaplayıp kısa süreliğine cache'ler."""
 
     current = time.time()
 
@@ -4449,9 +4444,6 @@ def get_btc_context():
 # ============================================================
 # KORELASYON KONTROLÜ  (YENİ)
 # ============================================================
-# BTC ve açık pozisyonlarla yüksek korelasyonlu yeni işlem
-# açılmasını engeller — aynı hareketin tekrar tekrar
-# fiyatlanmasını önlemeye çalışır.
 
 def get_recent_returns(symbol, timeframe="1h", n=30):
     try:
@@ -4466,9 +4458,7 @@ def get_recent_returns(symbol, timeframe="1h", n=30):
 
 
 def is_correlation_blocked(symbol):
-    """Aday, açık pozisyonlardan biriyle çok yüksek korelasyonlu
-    mu? (Aynı BTC hareketine bağımlı çoklu pozisyon açmayı önlemek
-    için.)"""
+    """Aday, açık pozisyonlardan biriyle çok yüksek korelasyonlu mu?"""
 
     candidate_returns = get_recent_returns(symbol)
 
@@ -4723,10 +4713,6 @@ def analyze_symbol(
         ] > 5:
 
             return None
-
-    # --------------------------------------------------------
-    # KORELASYON KONTROLÜ  (YENİ)
-    # --------------------------------------------------------
 
     if is_correlation_blocked(symbol):
         return None
@@ -5341,10 +5327,6 @@ def scan_cycle():
         )
 
         return
-
-    # --------------------------------------------------------
-    # BTC MARKET CONTEXT — döngü başına bir kez  (YENİ)
-    # --------------------------------------------------------
 
     btc_context = get_btc_context()
 
