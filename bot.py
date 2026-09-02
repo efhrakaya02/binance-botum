@@ -18,71 +18,71 @@ from flask import Flask, jsonify
 #
 # COIN HAVUZU
 #
-# GAINERS  : ilk 50
-# LOSERS   : ilk 50
-# VOLUME   : ilk 50
+# GAINERS  : ilk 50[cite: 5]
+# LOSERS   : ilk 50[cite: 5]
+# VOLUME   : ilk 50[cite: 5]
 #
-# BTC / XAU işlem evreninden hariç (yalnızca BTC piyasa yönü
-# teyidi ve korelasyon kontrolü için kullanılır)
+# BTC / XAU işlem evreninden hariç (yalnızca BTC piyasa yönü[cite: 5]
+# teyidi ve korelasyon kontrolü için kullanılır)[cite: 5]
 #
 # İŞLEM KURALLARI
 #
 # Maksimum:
-#   2 açık pozisyon
-#   10 USDT margin / pozisyon
-#   maksimum 5x
+#   2 açık pozisyon[cite: 5]
+#   10 USDT margin / pozisyon[cite: 5]
+#   maksimum 5x[cite: 5]
 #
 # LONG / SHORT
 #
 # ANALİZ:
 #
-#   SADECE PRICE ACTION
+#   SADECE PRICE ACTION[cite: 5]
 #
-#   1H  = Ana market structure
-#   15M = Orta yapı / breakout
-#   5M  = Setup / retest
-#   1M  = Entry trigger
+#   1H  = Ana market structure[cite: 5]
+#   15M = Orta yapı / breakout[cite: 5]
+#   5M  = Setup / retest[cite: 5]
+#   1M  = Entry trigger[cite: 5]
 #
 # KULLANILAN PRICE ACTION:
 #
-#   HH / HL
-#   LH / LL
-#   Swing High / Swing Low
-#   Breakout
-#   Breakdown
-#   Retest
-#   Failed Breakout
-#   Failed Breakdown
-#   Engulfing
-#   Rejection Candle
-#   Momentum Candle
-#   Compression
-#   Impulse
-#   Pullback
-#   Continuation
-#   Volume confirmation
-#   Move position / exhaustion
+#   HH / HL[cite: 5]
+#   LH / LL[cite: 5]
+#   Swing High / Swing Low[cite: 5]
+#   Breakout[cite: 5]
+#   Breakdown[cite: 5]
+#   Retest[cite: 5]
+#   Failed Breakout[cite: 5]
+#   Failed Breakdown[cite: 5]
+#   Engulfing[cite: 5]
+#   Rejection Candle[cite: 5]
+#   Momentum Candle[cite: 5]
+#   Compression[cite: 5]
+#   Impulse[cite: 5]
+#   Pullback[cite: 5]
+#   Continuation[cite: 5]
+#   Volume confirmation[cite: 5]
+#   Move position / exhaustion[cite: 5]
 #
 # KULLANILMAYANLAR:
 #
-#   EMA
-#   RSI
-#   MACD
-#   ADX
-#   Bollinger
-#   Ichimoku
-#   Fibonacci
-#   StochRSI
-#   Elder-Ray
-#   ROC
+#   EMA[cite: 5]
+#   RSI[cite: 5]
+#   MACD[cite: 5]
+#   ADX[cite: 5]
+#   Bollinger[cite: 5]
+#   Ichimoku[cite: 5]
+#   Fibonacci[cite: 5]
+#   StochRSI[cite: 5]
+#   Elder-Ray[cite: 5]
+#   ROC[cite: 5]
 #
-# DRY RUN = TRUE
+# DRY RUN = TRUE[cite: 5]
 #
 # ============================================================
 
 
 # ============================================================
-# CONFIG
+# CONFIG[cite: 5]
 # ============================================================
 
 DRY_RUN = os.getenv(
@@ -102,7 +102,7 @@ API_SECRET = os.getenv(
 
 
 # ------------------------------------------------------------
-# TIMEFRAMES
+# TIMEFRAMES[cite: 5]
 # ------------------------------------------------------------
 
 TIMEFRAME_FAST = "1m"
@@ -112,7 +112,7 @@ TIMEFRAME_TREND = "1h"
 
 
 # ------------------------------------------------------------
-# BOT (İşlem İsabetini Artırmak İçin Güncellenen Eşikler)
+# BOT (İşlem İsabetini Artırmak İçin Güncellenen Eşikler)[cite: 5]
 # ------------------------------------------------------------
 
 SCAN_INTERVAL = 20
@@ -126,7 +126,7 @@ MIN_LEVERAGE = 2
 
 MAX_POSITIONS = 2
 
-# Sinyal kalitesini ve isabet oranını artırmak için eşikler yükseltildi
+# Sinyal kalitesini ve isabet oranını artırmak için eşikler yükseltildi[cite: 5]
 MIN_LONG_SCORE = 76
 MIN_SHORT_SCORE = 76
 
@@ -136,14 +136,14 @@ MAX_ABS_FUNDING = 0.0015
 
 COOLDOWN_MINUTES = 60
 
-# Likidite ve kayma (slippage) optimizasyonu için hacim ve spread filtreleri sıkılaştırıldı
+# Likidite ve kayma (slippage) optimizasyonu için hacim ve spread filtreleri sıkılaştırıldı[cite: 5]
 MIN_QUOTE_VOLUME = 3_000_000
 
 MAX_SPREAD_PERCENT = 0.12
 
 
 # ------------------------------------------------------------
-# POSITION MANAGEMENT
+# POSITION MANAGEMENT[cite: 5]
 # ------------------------------------------------------------
 
 MIN_PROFIT_TO_TRAIL = 0.004
@@ -163,7 +163,7 @@ MAX_CORRELATED_SIDE = 2
 
 
 # ------------------------------------------------------------
-# CACHE
+# CACHE[cite: 5]
 # ------------------------------------------------------------
 
 OHLCV_CACHE_SECONDS = 12
@@ -172,17 +172,17 @@ MAX_DETAILED_CANDIDATES = 70
 
 
 # ------------------------------------------------------------
-# COIN POOL  (GENİŞLETİLDİ — YENİ)
+# COIN POOL  (GENİŞLETİLDİ — YENİ)[cite: 5]
 # ------------------------------------------------------------
-# Gainers / Losers / Volume artık ilk 50'şer coini kapsıyor
+# Gainers / Losers / Volume artık ilk 50'şer coini kapsıyor[cite: 5]
 
 RANK_START = 1
 RANK_END = 50
 
-# Volume ilk 50
+# Volume ilk 50[cite: 5]
 VOLUME_LIMIT = 50
 
-# Binance'den en az bu kadar coin çek
+# Binance'den en az bu kadar coin çek[cite: 5]
 LIST_LIMIT = 50
 
 
@@ -193,7 +193,7 @@ LOG_LEVEL = os.getenv(
 
 
 # ------------------------------------------------------------
-# HOURLY REPORT
+# HOURLY REPORT[cite: 5]
 # ------------------------------------------------------------
 
 HOURLY_REPORT_ENABLED = True
@@ -204,7 +204,7 @@ HOURLY_REPORT_INTERVAL = 5
 
 
 # ============================================================
-# LOGGING
+# LOGGING[cite: 5]
 # ============================================================
 
 logging.basicConfig(
@@ -222,14 +222,14 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# FLASK
+# FLASK[cite: 5]
 # ============================================================
 
 app = Flask(__name__)
 
 
 # ============================================================
-# EXCHANGE
+# EXCHANGE[cite: 5]
 # ============================================================
 
 exchange = ccxt.binance({
@@ -244,7 +244,7 @@ exchange = ccxt.binance({
 
 
 # ============================================================
-# GLOBAL STATE
+# GLOBAL STATE[cite: 5]
 # ============================================================
 
 state_lock = threading.RLock()
@@ -292,7 +292,7 @@ stats = {
 
 
 # ============================================================
-# HELPERS
+# HELPERS[cite: 5]
 # ============================================================
 
 def now_utc():
@@ -365,7 +365,7 @@ def symbol_clean(
 
 
 # ============================================================
-# DURATION
+# DURATION[cite: 5]
 # ============================================================
 
 def calculate_duration_seconds(
@@ -445,7 +445,7 @@ def format_duration(
 
 
 # ============================================================
-# SYMBOL FILTER
+# SYMBOL FILTER[cite: 5]
 # ============================================================
 
 def valid_symbol(
@@ -521,7 +521,7 @@ def valid_symbol(
 
 
 # ============================================================
-# MARKETS
+# MARKETS[cite: 5]
 # ============================================================
 
 def load_markets():
@@ -541,7 +541,7 @@ def load_markets():
 
 
 # ============================================================
-# TICKERS
+# TICKERS[cite: 5]
 # ============================================================
 
 def get_futures_tickers():
@@ -671,7 +671,7 @@ def get_futures_tickers():
 
 
 # ============================================================
-# RANK LISTS
+# RANK LISTS[cite: 5]
 # ============================================================
 
 def build_rank_lists(
@@ -703,7 +703,7 @@ def build_rank_lists(
     )
 
     # --------------------------------------------------------
-    # GAINERS / LOSERS: ilk RANK_END (varsayılan 1-50)
+    # GAINERS / LOSERS: ilk RANK_END (varsayılan 1-50)[cite: 5]
     # --------------------------------------------------------
 
     gainers = gainers[
@@ -717,7 +717,7 @@ def build_rank_lists(
     ]
 
     # --------------------------------------------------------
-    # VOLUME: ilk VOLUME_LIMIT
+    # VOLUME: ilk VOLUME_LIMIT[cite: 5]
     # --------------------------------------------------------
 
     volumes = volumes[
@@ -732,7 +732,7 @@ def build_rank_lists(
 
 
 # ============================================================
-# CANDIDATE POOL
+# CANDIDATE POOL[cite: 5]
 # ============================================================
 
 def build_candidate_pool(
@@ -843,7 +843,7 @@ def build_candidate_pool(
 
 
 # ============================================================
-# OHLCV CACHE
+# OHLCV CACHE[cite: 5]
 # ============================================================
 
 def fetch_ohlcv_cached(
@@ -951,7 +951,7 @@ def fetch_ohlcv_cached(
 
 
 # ============================================================
-# BASIC PRICE ACTION HELPERS
+# BASIC PRICE ACTION HELPERS[cite: 5]
 # ============================================================
 
 def candle_stats(
@@ -1036,7 +1036,7 @@ def candle_stats(
 
 
 # ============================================================
-# SWING DETECTION
+# SWING DETECTION[cite: 5]
 # ============================================================
 
 def find_swing_highs(
@@ -1158,7 +1158,7 @@ def find_swing_lows(
 
 
 # ============================================================
-# MARKET STRUCTURE
+# MARKET STRUCTURE[cite: 5]
 # ============================================================
 
 def market_structure(
@@ -1265,7 +1265,7 @@ def market_structure(
 
 
 # ============================================================
-# CANDLE PATTERNS
+# CANDLE PATTERNS[cite: 5]
 # ============================================================
 
 def bullish_engulfing(
@@ -1451,7 +1451,7 @@ def strong_bearish_candle(
 
 
 # ============================================================
-# VOLUME PRICE ACTION CONFIRMATION
+# VOLUME PRICE ACTION CONFIRMATION[cite: 5]
 # ============================================================
 
 def volume_confirmation(
@@ -1491,7 +1491,7 @@ def volume_confirmation(
 
 
 # ============================================================
-# IMPULSE DETECTION
+# IMPULSE DETECTION[cite: 5]
 # ============================================================
 
 def bullish_impulse(
@@ -1577,7 +1577,7 @@ def bearish_impulse(
 
 
 # ============================================================
-# COMPRESSION
+# COMPRESSION[cite: 5]
 # ============================================================
 
 def compression_detected(
@@ -1630,7 +1630,7 @@ def compression_detected(
 
 
 # ============================================================
-# BREAKOUT ANALYSIS
+# BREAKOUT ANALYSIS[cite: 5]
 # ============================================================
 
 def breakout_analysis(
@@ -1711,7 +1711,7 @@ def breakout_analysis(
 
 
 # ============================================================
-# RETEST DETECTION
+# RETEST DETECTION[cite: 5]
 # ============================================================
 
 def bullish_retest(
@@ -1849,7 +1849,7 @@ def bearish_retest(
 
 
 # ============================================================
-# FAILED BREAKOUT / BREAKDOWN
+# FAILED BREAKOUT / BREAKDOWN[cite: 5]
 # ============================================================
 
 def failed_bull_breakout(
@@ -1913,7 +1913,7 @@ def failed_bear_breakdown(
 
 
 # ============================================================
-# PRICE POSITION
+# PRICE POSITION[cite: 5]
 # ============================================================
 
 def move_position(
@@ -1957,7 +1957,7 @@ def move_position(
 
 
 # ============================================================
-# LATE ENTRY / EXHAUSTION
+# LATE ENTRY / EXHAUSTION[cite: 5]
 # ============================================================
 
 def late_long_move(
@@ -2021,7 +2021,7 @@ def late_short_move(
 
 
 # ============================================================
-# PRICE ACTION SCORE - LONG
+# PRICE ACTION SCORE - LONG[cite: 5]
 # ============================================================
 
 def score_long(
@@ -2371,7 +2371,7 @@ def score_long(
         )
 
     # --------------------------------------------------------
-    # BTC MARKET CONTEXT  (YENİ)
+    # BTC MARKET CONTEXT  (YENİ)[cite: 5]
     # --------------------------------------------------------
 
     if btc_context:
@@ -2400,7 +2400,7 @@ def score_long(
 
 
 # ============================================================
-# PRICE ACTION SCORE - SHORT
+# PRICE ACTION SCORE - SHORT[cite: 5]
 # ============================================================
 
 def score_short(
@@ -2750,7 +2750,7 @@ def score_short(
         )
 
     # --------------------------------------------------------
-    # BTC MARKET CONTEXT  (YENİ)
+    # BTC MARKET CONTEXT  (YENİ)[cite: 5]
     # --------------------------------------------------------
 
     if btc_context:
@@ -2779,7 +2779,7 @@ def score_short(
 
 
 # ============================================================
-# FUNDING
+# FUNDING[cite: 5]
 # ============================================================
 
 def get_funding(
@@ -2804,7 +2804,7 @@ def get_funding(
 
 
 # ============================================================
-# PRE SCORE
+# PRE SCORE[cite: 5]
 # ============================================================
 
 def preliminary_score(
@@ -2860,7 +2860,7 @@ def preliminary_score(
 
 
 # ============================================================
-# COOLDOWN
+# COOLDOWN[cite: 5]
 # ============================================================
 
 def is_cooldown(
@@ -2895,7 +2895,7 @@ def set_cooldown(
 
 
 # ============================================================
-# POSITION COUNT
+# POSITION COUNT[cite: 5]
 # ============================================================
 
 def current_position_count():
@@ -2908,7 +2908,7 @@ def current_position_count():
 
 
 # ============================================================
-# SIDE COUNT
+# SIDE COUNT[cite: 5]
 # ============================================================
 
 def side_count(
@@ -2926,7 +2926,7 @@ def side_count(
 
 
 # ============================================================
-# LEVERAGE
+# LEVERAGE[cite: 5]
 # ============================================================
 
 def choose_leverage(
@@ -2976,7 +2976,7 @@ def choose_leverage(
 
 
 # ============================================================
-# CAN OPEN
+# CAN OPEN[cite: 5]
 # ============================================================
 
 def can_open_position(
@@ -3010,7 +3010,7 @@ def can_open_position(
 
 
 # ============================================================
-# QUANTITY
+# QUANTITY[cite: 5]
 # ============================================================
 
 def calculate_quantity(
@@ -3044,7 +3044,7 @@ def calculate_quantity(
 
 
 # ============================================================
-# TARGET ROI (GÜNCELLENDİ)
+# TARGET ROI (GÜNCELLENDİ)[cite: 5]
 # ============================================================
 
 def calculate_target_roi(
@@ -3071,7 +3071,7 @@ def calculate_target_roi(
 
 
 # ============================================================
-# DRY RUN OPEN
+# DRY RUN OPEN[cite: 5]
 # ============================================================
 
 def dry_run_open(
@@ -3252,7 +3252,7 @@ def dry_run_open(
 
 
 # ============================================================
-# LIVE OPEN
+# LIVE OPEN[cite: 5]
 # ============================================================
 
 def live_open_position(
@@ -3460,7 +3460,7 @@ def live_open_position(
 
 
 # ============================================================
-# PNL
+# PNL[cite: 5]
 # ============================================================
 
 def calculate_pnl(
@@ -3514,7 +3514,7 @@ def calculate_pnl(
 
 
 # ============================================================
-# UPDATE TRAILING (GÜNCELLENDİ)
+# UPDATE TRAILING (GÜNCELLENDİ)[cite: 5]
 # ============================================================
 
 def update_trailing_stop(
@@ -3621,7 +3621,7 @@ def update_trailing_stop(
 
 
 # ============================================================
-# SAVE CLOSED TRADE
+# SAVE CLOSED TRADE[cite: 5]
 # ============================================================
 
 def save_closed_trade(
@@ -3791,7 +3791,7 @@ def save_closed_trade(
 
 
 # ============================================================
-# POZİSYON KAPANIŞ ÖZETİ  (YENİ)
+# POZİSYON KAPANIŞ ÖZETİ  (YENİ)[cite: 5]
 # ============================================================
 
 def log_position_close_summary(
@@ -3847,7 +3847,7 @@ def log_position_close_summary(
 
 
 # ============================================================
-# DRY RUN CLOSE
+# DRY RUN CLOSE[cite: 5]
 # ============================================================
 
 def dry_run_close(
@@ -3898,7 +3898,7 @@ def dry_run_close(
 
 
 # ============================================================
-# LIVE CLOSE
+# LIVE CLOSE[cite: 5]
 # ============================================================
 
 def live_close(
@@ -3991,7 +3991,7 @@ def live_close(
 
 
 # ============================================================
-# POSITION MONITOR
+# POSITION MONITOR[cite: 5]
 # ============================================================
 
 def position_monitor():
@@ -4149,7 +4149,7 @@ def position_monitor():
 
 
 # ============================================================
-# HOURLY REPORT  (KISA ÖZET — YENİ)
+# HOURLY REPORT  (KISA ÖZET — YENİ)[cite: 5]
 # ============================================================
 
 def generate_hourly_report():
@@ -4274,7 +4274,7 @@ def generate_hourly_report():
 
 
 # ============================================================
-# HOURLY REPORT THREAD
+# HOURLY REPORT THREAD[cite: 5]
 # ============================================================
 
 def hourly_report_loop():
@@ -4347,7 +4347,7 @@ def hourly_report_loop():
 
 
 # ============================================================
-# BTC MARKET CONTEXT  (YENİ)
+# BTC MARKET CONTEXT  (YENİ)[cite: 5]
 # ============================================================
 
 BTC_SYMBOL = "BTC/USDT"
@@ -4426,7 +4426,7 @@ def get_btc_context():
 
 
 # ============================================================
-# KORELASYON KONTROLÜ  (YENİ)
+# KORELASYON KONTROLÜ  (YENİ)[cite: 5]
 # ============================================================
 
 def get_recent_returns(symbol, timeframe="1h", n=30):
@@ -4476,7 +4476,7 @@ def is_correlation_blocked(symbol):
 
 
 # ============================================================
-# ANALYZE SYMBOL
+# ANALYZE SYMBOL[cite: 5]
 # ============================================================
 
 def analyze_symbol(
@@ -4819,7 +4819,7 @@ def analyze_symbol(
 
 
 # ============================================================
-# FIND BEST OPPORTUNITY
+# FIND BEST OPPORTUNITY[cite: 5]
 # ============================================================
 
 def find_best_signal(
@@ -4926,7 +4926,7 @@ def find_best_signal(
 
 
 # ============================================================
-# FINAL ENTRY VALIDATION
+# FINAL ENTRY VALIDATION (GÜNCELLENDİ: Ek İsabet Kontrolleri Eklendi)[cite: 5]
 # ============================================================
 
 def final_entry_validation(
@@ -4979,6 +4979,16 @@ def final_entry_validation(
                 "last"
             )
         )
+
+        bid = safe_float(ticker.get("bid"))
+        ask = safe_float(ticker.get("ask"))
+
+        # Ek Kontrol 1: Anlık Spread (Slippage Riski) Filtresi
+        if bid > 0 and ask > 0:
+            current_spread = ((ask - bid) / ((ask + bid) / 2)) * 100
+            if current_spread > MAX_SPREAD_PERCENT:
+                logger.info("ENTRY SKIP | %s | Anlık spread yüksek: %.3f%%", symbol, current_spread)
+                return False
 
         if fresh_price <= 0:
 
@@ -5036,6 +5046,17 @@ def final_entry_validation(
         df5 is None
     ):
 
+        return False
+
+    # Ek Kontrol 2: Anlık Hacim Desteği (Volume Confirmation) Kontrolü
+    vol_confirm = volume_confirmation(df5)
+    if vol_confirm < 1.10:
+        logger.info("ENTRY SKIP | %s | Giriş anında yeterli hacim ivmesi yok (oran: %.2f)", symbol, vol_confirm)
+        return False
+
+    # Ek Kontrol 3: Aşırı Volatilite / Kaotik Fiyat Hareketi (ATR) Filtresi
+    if signal.get("atr_percent", 0) > 4.5:
+        logger.info("ENTRY SKIP | %s | ATR çok yüksek (aşırı kaotik volatilite): %.2f%%", symbol, signal.get("atr_percent", 0))
         return False
 
     if side == "LONG":
@@ -5130,7 +5151,7 @@ def final_entry_validation(
 
 
 # ============================================================
-# EXECUTE SIGNAL
+# EXECUTE SIGNAL[cite: 5]
 # ============================================================
 
 def execute_signal(
@@ -5203,7 +5224,7 @@ def execute_signal(
 
 
 # ============================================================
-# SCAN CYCLE
+# SCAN CYCLE[cite: 5]
 # ============================================================
 
 def scan_cycle():
@@ -5390,7 +5411,7 @@ def scan_cycle():
 
 
 # ============================================================
-# BOT LOOP
+# BOT LOOP[cite: 5]
 # ============================================================
 
 def bot_loop():
@@ -5506,7 +5527,7 @@ def bot_loop():
 
 
 # ============================================================
-# STATUS
+# STATUS[cite: 5]
 # ============================================================
 
 @app.route("/")
@@ -5561,7 +5582,7 @@ def home():
 
 
 # ============================================================
-# STATUS API
+# STATUS API[cite: 5]
 # ============================================================
 
 @app.route("/status")
@@ -5679,7 +5700,7 @@ def status():
 
 
 # ============================================================
-# TRADE HISTORY API
+# TRADE HISTORY API[cite: 5]
 # ============================================================
 
 @app.route("/trades")
@@ -5702,7 +5723,7 @@ def trades():
 
 
 # ============================================================
-# HEALTH
+# HEALTH[cite: 5]
 # ============================================================
 
 @app.route("/health")
@@ -5720,7 +5741,7 @@ def health():
 
 
 # ============================================================
-# START BACKGROUND THREADS
+# START BACKGROUND THREADS[cite: 5]
 # ============================================================
 
 def start_background_bot():
@@ -5751,7 +5772,7 @@ def start_background_bot():
 
 
 # ============================================================
-# MAIN
+# MAIN[cite: 5]
 # ============================================================
 
 if __name__ == "__main__":
