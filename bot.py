@@ -112,7 +112,7 @@ TIMEFRAME_TREND = "1h"
 
 
 # ------------------------------------------------------------
-# BOT
+# BOT (İşlem İsabetini Artırmak İçin Güncellenen Eşikler)
 # ------------------------------------------------------------
 
 SCAN_INTERVAL = 20
@@ -126,18 +126,20 @@ MIN_LEVERAGE = 2
 
 MAX_POSITIONS = 2
 
-MIN_LONG_SCORE = 72
-MIN_SHORT_SCORE = 72
+# Sinyal kalitesini ve isabet oranını artırmak için eşikler yükseltildi
+MIN_LONG_SCORE = 76
+MIN_SHORT_SCORE = 76
 
-EARLY_ENTRY_SCORE = 72
+EARLY_ENTRY_SCORE = 76
 
 MAX_ABS_FUNDING = 0.0015
 
 COOLDOWN_MINUTES = 60
 
-MIN_QUOTE_VOLUME = 2_000_000
+# Likidite ve kayma (slippage) optimizasyonu için hacim ve spread filtreleri sıkılaştırıldı
+MIN_QUOTE_VOLUME = 3_000_000
 
-MAX_SPREAD_PERCENT = 0.15
+MAX_SPREAD_PERCENT = 0.12
 
 
 # ------------------------------------------------------------
@@ -173,7 +175,6 @@ MAX_DETAILED_CANDIDATES = 70
 # COIN POOL  (GENİŞLETİLDİ — YENİ)
 # ------------------------------------------------------------
 # Gainers / Losers / Volume artık ilk 50'şer coini kapsıyor
-# (önceki sürümde gainers/losers 10-35 aralığı, volume ilk 25'ti).
 
 RANK_START = 1
 RANK_END = 50
@@ -2372,9 +2373,6 @@ def score_long(
     # --------------------------------------------------------
     # BTC MARKET CONTEXT  (YENİ)
     # --------------------------------------------------------
-    # BTC işlem evresinde değildir; yalnızca piyasa yönü teyidi
-    # (context) olarak kullanılır. Sert bir veto DEĞİL, kalite
-    # puanına ekleme/çıkarma yapan bir bağlam modifikatörüdür.
 
     if btc_context:
 
@@ -3795,8 +3793,6 @@ def save_closed_trade(
 # ============================================================
 # POZİSYON KAPANIŞ ÖZETİ  (YENİ)
 # ============================================================
-# Her kapanan pozisyon için: coin, margin, kaldıraç, giriş/çıkış
-# fiyatı, hedeflenen ve gerçekleşen kazanç tek bir kompakt blokta.
 
 def log_position_close_summary(
     trade
@@ -4155,8 +4151,6 @@ def position_monitor():
 # ============================================================
 # HOURLY REPORT  (KISA ÖZET — YENİ)
 # ============================================================
-# Uzun, işlem işlem dökülen eski rapor yerine: kaç işlem açıldı,
-# kaçı kârla / kaçı zararla kapandı, net kâr/zarar — tek bakışta.
 
 def generate_hourly_report():
 
@@ -4355,10 +4349,6 @@ def hourly_report_loop():
 # ============================================================
 # BTC MARKET CONTEXT  (YENİ)
 # ============================================================
-# BTC işlem evreninden tamamen hariç tutulur (valid_symbol zaten
-# banned listesinde tutuyor). Burada BTC SADECE piyasa yönü
-# teyidi (context) ve korelasyon kontrolü için kullanılır — asla
-# doğrudan işlem alımı olmaz.
 
 BTC_SYMBOL = "BTC/USDT"
 
@@ -4373,9 +4363,6 @@ BTC_CONTEXT_CACHE_SECONDS = 30
 
 
 def compute_btc_context():
-    """BTC 1H market structure + kısa vadeli impulse'a göre basit
-    bir 'piyasa yönü' bağlamı üretir."""
-
     df1h = fetch_ohlcv_cached(
         BTC_SYMBOL,
         TIMEFRAME_TREND,
@@ -4418,9 +4405,6 @@ def compute_btc_context():
 
 
 def get_btc_context():
-    """BTC context'i her sembol için değil, tarama döngüsü başına
-    bir kez hesaplayıp kısa süreliğine cache'ler."""
-
     current = time.time()
 
     if (
@@ -4458,8 +4442,6 @@ def get_recent_returns(symbol, timeframe="1h", n=30):
 
 
 def is_correlation_blocked(symbol):
-    """Aday, açık pozisyonlardan biriyle çok yüksek korelasyonlu mu?"""
-
     candidate_returns = get_recent_returns(symbol)
 
     if candidate_returns is None:
