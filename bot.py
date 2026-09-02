@@ -2372,7 +2372,7 @@ def score_long(
     # --------------------------------------------------------
     # BTC MARKET CONTEXT  (YENİ)
     # --------------------------------------------------------
-    # BTC işlem evreninde değildir; yalnızca piyasa yönü teyidi
+    # BTC işlem evresinde değildir; yalnızca piyasa yönü teyidi
     # (context) olarak kullanılır. Sert bir veto DEĞİL, kalite
     # puanına ekleme/çıkarma yapan bir bağlam modifikatörüdür.
 
@@ -3577,16 +3577,17 @@ def update_trailing_stop(
             current_price
         )
 
-        steps_reached = int(roi // 0.01)
-        if steps_reached > 0:
-            step_stop = entry * (1.0 + (steps_reached * 0.01 / leverage))
-            position["stop_price"] = max(position["stop_price"], step_stop)
+        # DÜZELTME: Erken kilitlenmeyi önlemek için adım bazlı stop seviyesinin 
+        # devreye girmesi için ROI'nin anlamlı bir eşiği (hedefin en az %40'ı veya %3 minimum) aşması şartı eklendi.
+        activation_limit = max(0.03, target_roi * 0.40)
+        if roi >= activation_limit:
+            steps_reached = int(roi // 0.01)
+            if steps_reached > 0:
+                step_stop = entry * (1.0 + (steps_reached * 0.01 / leverage))
+                position["stop_price"] = max(position["stop_price"], step_stop)
 
-        if roi >= (target_roi * 0.40):
-            position["stop_price"] = max(position["stop_price"], entry)
             position["trailing_active"] = True
 
-        if position["trailing_active"] and roi >= (target_roi * 0.40):
             dynamic_atr_distance = atr_value * TRAIL_ATR_TIGHT
             dynamic_stop = position["highest"] - dynamic_atr_distance
             position["stop_price"] = max(position["stop_price"], dynamic_stop)
@@ -3602,16 +3603,15 @@ def update_trailing_stop(
             current_price
         )
 
-        steps_reached = int(roi // 0.01)
-        if steps_reached > 0:
-            step_stop = entry * (1.0 - (steps_reached * 0.01 / leverage))
-            position["stop_price"] = min(position["stop_price"], step_stop)
+        activation_limit = max(0.03, target_roi * 0.40)
+        if roi >= activation_limit:
+            steps_reached = int(roi // 0.01)
+            if steps_reached > 0:
+                step_stop = entry * (1.0 - (steps_reached * 0.01 / leverage))
+                position["stop_price"] = min(position["stop_price"], step_stop)
 
-        if roi >= (target_roi * 0.40):
-            position["stop_price"] = min(position["stop_price"], entry)
             position["trailing_active"] = True
 
-        if position["trailing_active"] and roi >= (target_roi * 0.40):
             dynamic_atr_distance = atr_value * TRAIL_ATR_TIGHT
             dynamic_stop = position["lowest"] + dynamic_atr_distance
             position["stop_price"] = min(position["stop_price"], dynamic_stop)
