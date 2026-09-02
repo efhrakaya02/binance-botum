@@ -142,6 +142,20 @@ MAX_SPREAD_PERCENT = 0.15
 
 
 # ------------------------------------------------------------
+# REGRESSION & SCORE CONFIG (HATA GİDERME İÇİN EKLENDİ)
+# ------------------------------------------------------------
+
+REGRESSION_CHANNEL_LOOKBACK = 50
+REGRESSION_CHANNEL_STD_MULT = 2.0
+REGRESSION_MIN_SLOPE_PERCENT = 0.02
+REGRESSION_MAX_DISTANCE_ATR = 2.5
+
+STRUCTURE_SCORE_MAX = 40
+SETUP_SCORE_MAX = 30
+TRIGGER_SCORE_MAX = 30
+
+
+# ------------------------------------------------------------
 # POSITION MANAGEMENT
 # ------------------------------------------------------------
 
@@ -5739,609 +5753,109 @@ def execute_signal(
     )
 
     return live_open_position(
-
-        symbol=signal[
-            "symbol"
-        ],
-
-        side=signal[
-            "side"
-        ],
-
-        price=signal[
-            "price"
-        ],
-
-        score=signal[
-            "score"
-        ],
-
-        reasons=signal[
-            "reasons"
-        ],
-
-        atr_value=signal[
-            "atr"
-        ],
-
-        leverage=signal[
-            "leverage"
-        ],
-
-        target_roi=signal[
-            "target_roi"
-        ]
+        signal["symbol"],
+        signal["side"],
+        signal["price"],
+        signal["score"],
+        signal["reasons"],
+        signal["atr"],
+        signal["leverage"],
+        signal["target_roi"]
     )
 
 
 # ============================================================
-# SCAN CYCLE
+# SCAN LOOP
 # ============================================================
 
-def scan_cycle():
+def scan_loop():
+    logger.info("Tarama döngüsü başlatıldı.")
+    try:
+        load_markets()
+    except Exception as e:
+        logger.error("Marketler yüklenemedi: %s", e)
 
     global last_scan_time
 
-    last_scan_time = (
-        now_utc()
-        .isoformat()
-    )
-
-    stats[
-        "scans"
-    ] += 1
-
-    logger.info("")
-
-    logger.info(
-        "=" * 75
-    )
-
-    logger.info(
-        "PURE PRICE ACTION ANALİZ BAŞLADI | %s",
-        last_scan_time
-    )
-
-    logger.info(
-        "=" * 75
-    )
-
-    tickers = (
-        get_futures_tickers()
-    )
-
-    if not tickers:
-
-        logger.warning(
-            "Ticker alınamadı."
-        )
-
-        return
-
-    (
-        gainers,
-        losers,
-        volumes
-    ) = build_rank_lists(
-        tickers
-    )
-
-    logger.info(
-        "GAINERS %s-%s: %s",
-        RANK_START,
-        RANK_END,
-        [
-            x["symbol"]
-            for x in gainers
-        ]
-    )
-
-    logger.info(
-        "LOSERS %s-%s: %s",
-        RANK_START,
-        RANK_END,
-        [
-            x["symbol"]
-            for x in losers
-        ]
-    )
-
-    logger.info(
-        "24H VOLUME 1-%s: %s",
-        VOLUME_LIMIT,
-        [
-            x["symbol"]
-            for x in volumes
-        ]
-    )
-
-    candidates = (
-        build_candidate_pool(
-            gainers,
-            losers,
-            volumes
-        )
-    )
-
-    logger.info(
-        "Benzersiz PA aday havuzu: %s",
-        len(candidates)
-    )
-
-    if (
-        current_position_count()
-        >=
-        MAX_POSITIONS
-    ):
-
-        logger.info(
-            "%s pozisyon zaten açık. "
-            "Yeni işlem aranmayacak.",
-            MAX_POSITIONS
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # BTC MARKET CONTEXT — döngü başına bir kez  (YENİ)
-    # --------------------------------------------------------
-
-    btc_context = get_btc_context()
-
-    logger.info(
-        "BTC CONTEXT | yön=%s | güç=%s",
-        btc_context["direction"],
-        btc_context["strength"]
-    )
-
-    signals = (
-        find_best_signal(
-            candidates,
-            btc_context
-        )
-    )
-
-    if not signals:
-
-        logger.info(
-            "Uygun price action sinyali bulunamadı."
-        )
-
-        return
-
-    logger.info(
-        "Toplam PA sinyali: %s",
-        len(signals)
-    )
-
-    for signal in signals[:5]:
-
-        logger.info(
-            "TOP PA SIGNAL | %s | %s | "
-            "score=%s | "
-            "1H=%s | "
-            "15M=%s | "
-            "5M=%s | "
-            "24h=%.2f%% | "
-            "move=%.2f | "
-            "target=%.2f%% | "
-            "sources=%s",
-            signal["side"],
-            signal["symbol"],
-            signal["score"],
-            signal["structure_1h"],
-            signal["structure_15m"],
-            signal["structure_5m"],
-            signal[
-                "ticker_percentage"
-            ],
-            signal[
-                "move_position"
-            ],
-            signal[
-                "target_roi"
-            ] * 100,
-            signal[
-                "sources"
-            ]
-        )
-
-    for signal in signals:
-
-        if (
-            current_position_count()
-            >=
-            MAX_POSITIONS
-        ):
-
-            break
-
-        if execute_signal(
-            signal
-        ):
-
-            time.sleep(
-                0.5
-            )
-
-
-# ============================================================
-# BOT LOOP
-# ============================================================
-
-def bot_loop():
-
-    logger.warning("")
-
-    logger.warning(
-        "=" * 75
-    )
-
-    logger.warning(
-        "PURE PRICE ACTION FUTURES BOT"
-    )
-
-    logger.warning(
-        "=" * 75
-    )
-
-    logger.warning(
-        "DRY_RUN = %s",
-        DRY_RUN
-    )
-
-    logger.warning(
-        "Margin = $%.2f",
-        MARGIN_PER_POSITION
-    )
-
-    logger.warning(
-        "Max leverage = %sx",
-        MAX_LEVERAGE
-    )
-
-    logger.warning(
-        "Max positions = %s",
-        MAX_POSITIONS
-    )
-
-    logger.warning(
-        "GAINERS = %s-%s",
-        RANK_START,
-        RANK_END
-    )
-
-    logger.warning(
-        "LOSERS = %s-%s",
-        RANK_START,
-        RANK_END
-    )
-
-    logger.warning(
-        "24H VOLUME = 1-%s",
-        VOLUME_LIMIT
-    )
-
-    logger.warning(
-        "SIGNAL ENGINE = PURE PRICE ACTION + BTC CONTEXT"
-    )
-
-    logger.warning(
-        "1H / 15M / 5M / 1M"
-    )
-
-    logger.warning(
-        "Hourly report = %s",
-        HOURLY_REPORT_ENABLED
-    )
-
-    logger.warning(
-        "=" * 75
-    )
-
-    load_markets()
-
     while True:
-
-        started = time.time()
-
         try:
+            start_time = time.time()
+            stats["scans"] += 1
 
-            scan_cycle()
+            tickers = get_futures_tickers()
+            if not tickers:
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            gainers, losers, volumes = build_rank_lists(tickers)
+            candidates = build_candidate_pool(gainers, losers, volumes)
+
+            btc_context = get_btc_context()
+            best_signals = find_best_signal(candidates, btc_context)
+
+            if best_signals:
+                for sig in best_signals:
+                    if current_position_count() >= MAX_POSITIONS:
+                        break
+                    execute_signal(sig)
+
+            last_scan_time = now_utc().isoformat()
+            elapsed = time.time() - start_time
+            sleep_time = max(1.0, SCAN_INTERVAL - elapsed)
+            time.sleep(sleep_time)
 
         except Exception as e:
-
-            logger.error(
-                "SCAN ERROR: %s",
-                e
-            )
-
+            logger.error("Scan loop error: %s", e)
             traceback.print_exc()
-
-        elapsed = (
-            time.time()
-            -
-            started
-        )
-
-        sleep_for = max(
-            1,
-            SCAN_INTERVAL
-            -
-            elapsed
-        )
-
-        logger.info(
-            "Next scan %.1f saniye sonra.",
-            sleep_for
-        )
-
-        time.sleep(
-            sleep_for
-        )
+            time.sleep(5)
 
 
 # ============================================================
-# STATUS
+# FLASK ROUTES
 # ============================================================
 
 @app.route("/")
-def home():
-
+def index():
     return jsonify({
-
-        "bot":
-            "PURE_PRICE_ACTION_FUTURES_BOT",
-
-        "status":
-            "running",
-
-        "dry_run":
-            DRY_RUN,
-
-        "positions":
-            len(
-                positions
-            ),
-
-        "max_positions":
-            MAX_POSITIONS,
-
-        "margin_per_position":
-            MARGIN_PER_POSITION,
-
-        "max_leverage":
-            MAX_LEVERAGE,
-
-        "gainers_range":
-            f"{RANK_START}-{RANK_END}",
-
-        "losers_range":
-            f"{RANK_START}-{RANK_END}",
-
-        "volume_range":
-            f"1-{VOLUME_LIMIT}",
-
-        "signal_engine":
-            "PURE_PRICE_ACTION + BTC_CONTEXT",
-
-        "last_scan":
-            last_scan_time,
-
-        "started_at":
-            bot_started_at,
-
-        "hourly_report":
-            HOURLY_REPORT_ENABLED,
+        "bot": "PURE PRICE ACTION BOT",
+        "started_at": bot_started_at,
+        "dry_run": DRY_RUN,
+        "positions_count": current_position_count(),
+        "max_positions": MAX_POSITIONS,
+        "stats": stats,
     })
 
 
-# ============================================================
-# STATUS API
-# ============================================================
-
-@app.route("/status")
-def status():
-
+@app.route("/positions")
+def positions_api():
     with state_lock:
-
-        position_data = {}
-
-        for symbol, position in (
-            positions.items()
-        ):
-
-            position_data[
-                symbol
-            ] = {
-
-                "side":
-                    position["side"],
-
-                "entry":
-                    position["entry"],
-
-                "current":
-                    position[
-                        "current_price"
-                    ],
-
-                "score":
-                    position["score"],
-
-                "leverage":
-                    position["leverage"],
-
-                "margin":
-                    position["margin"],
-
-                "notional":
-                    position["notional"],
-
-                "pnl":
-                    position[
-                        "unrealized_pnl"
-                    ],
-
-                "roi":
-                    position[
-                        "unrealized_roi"
-                    ] * 100,
-
-                "target_roi":
-                    position[
-                        "target_roi"
-                    ] * 100,
-
-                "stop":
-                    position[
-                        "stop_price"
-                    ],
-
-                "trailing":
-                    position[
-                        "trailing_active"
-                    ],
-
-                "peak_roi":
-                    position[
-                        "peak_roi"
-                    ] * 100,
-
-                "opened_at":
-                    position[
-                        "opened_at"
-                    ],
-            }
-
-        recent_trades = (
-            trade_history[
-                -20:
-            ]
-        )
-
-    return jsonify({
-
-        "dry_run":
-            DRY_RUN,
-
-        "signal_engine":
-            "PURE_PRICE_ACTION + BTC_CONTEXT",
-
-        "coin_pool": {
-
-            "gainers":
-                f"{RANK_START}-{RANK_END}",
-
-            "losers":
-                f"{RANK_START}-{RANK_END}",
-
-            "volume":
-                f"1-{VOLUME_LIMIT}",
-        },
-
-        "positions":
-            position_data,
-
-        "recent_trades":
-            recent_trades,
-
-        "stats":
-            stats,
-
-        "last_scan":
-            last_scan_time,
-    })
+        return jsonify(positions)
 
 
-# ============================================================
-# TRADE HISTORY API
-# ============================================================
+@app.route("/stats")
+def stats_api():
+    return jsonify(stats)
 
-@app.route("/trades")
-def trades():
 
+@app.route("/history")
+def history_api():
     with state_lock:
-
-        history = list(
-            trade_history
-        )
-
-    return jsonify({
-
-        "count":
-            len(history),
-
-        "trades":
-            history
-    })
+        return jsonify(trade_history[-100:])
 
 
 # ============================================================
-# HEALTH
-# ============================================================
-
-@app.route("/health")
-def health():
-
-    return jsonify({
-
-        "ok":
-            True,
-
-        "timestamp":
-            now_utc()
-            .isoformat()
-    })
-
-
-# ============================================================
-# START BACKGROUND THREADS
-# ============================================================
-
-def start_background_bot():
-
-    monitor = threading.Thread(
-        target=position_monitor,
-        daemon=True,
-        name="PositionMonitor"
-    )
-
-    monitor.start()
-
-    bot = threading.Thread(
-        target=bot_loop,
-        daemon=True,
-        name="AnalysisLoop"
-    )
-
-    bot.start()
-
-    report = threading.Thread(
-        target=hourly_report_loop,
-        daemon=True,
-        name="HourlyReport"
-    )
-
-    report.start()
-
-
-# ============================================================
-# MAIN
+# MAIN ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
+    monitor_thread = threading.Thread(target=position_monitor, daemon=True)
+    monitor_thread.start()
 
-    start_background_bot()
+    report_thread = threading.Thread(target=hourly_report_loop, daemon=True)
+    report_thread.start()
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "8080"
-        )
-    )
+    scan_thread = threading.Thread(target=scan_loop, daemon=True)
+    scan_thread.start()
 
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
