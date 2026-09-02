@@ -128,29 +128,29 @@ MARGIN_PER_POSITION = 10.0
 MAX_LEVERAGE = 5
 MIN_LEVERAGE = 2
 
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
 
 # Sinyal kalitesini ve isabet oranını artırmak için eşikler yükseltildi[cite: 5]
-MIN_LONG_SCORE = 76
-MIN_SHORT_SCORE = 76
+MIN_LONG_SCORE = 74
+MIN_SHORT_SCORE = 74
 
-EARLY_ENTRY_SCORE = 76
+EARLY_ENTRY_SCORE = 74
 
 MAX_ABS_FUNDING = 0.0015
 
 COOLDOWN_MINUTES = 60
 
 # Likidite ve kayma (slippage) optimizasyonu için hacim and spread filtreleri sıkılaştırıldı[cite: 5]
-MIN_QUOTE_VOLUME = 3_000_000
+MIN_QUOTE_VOLUME = 2_500_000
 
-MAX_SPREAD_PERCENT = 0.12
+MAX_SPREAD_PERCENT = 0.15
 
 
 # ------------------------------------------------------------
 # POSITION MANAGEMENT[cite: 5]
 # ------------------------------------------------------------
 
-MIN_PROFIT_TO_TRAIL = 0.004
+MIN_PROFIT_TO_TRAIL = 0.01
 
 HARD_STOP_ATR = 1.8
 
@@ -164,6 +164,25 @@ TRAIL_LEVEL_3 = 0.025
 EMERGENCY_REVERSE_THRESHOLD = 0.007
 
 MAX_CORRELATED_SIDE = 2
+
+# ------------------------------------------------------------
+# DYNAMIC TARGET / RISK / ATR MANAGEMENT
+# ------------------------------------------------------------
+# İşleme yalnızca en az %1 kaldıraçsız fiyat hareketi kapasitesi varsa girilir.
+# Hedef ROI sabit değildir; ATR + sinyal gücü + piyasa koşullarına göre hesaplanır.
+MIN_RAW_MOVE_PERCENT = 1.0
+MAX_TARGET_RAW_MOVE_PERCENT = 8.0
+MAX_TARGET_ROI = 0.40
+MAX_LOSS_OF_TARGET = 0.50
+PROFIT_LOCK_TRIGGER_FRACTION = 0.40
+STEP_ROI_PERCENT = 1.0
+STEP_LOCK_LAG_PERCENT = 1.0
+INITIAL_ATR_MULTIPLIER = 1.80
+DYNAMIC_ATR_MULTIPLIER = 1.35
+DYNAMIC_ATR_TIGHT = 1.05
+POSITION_ATR_REFRESH_SECONDS = 5
+ENTRY_MAX_PRICE_DRIFT_PERCENT = 1.20
+FINAL_ENTRY_MIN_TRIGGER_SCORE = 2
 
 
 # ------------------------------------------------------------
@@ -3038,45 +3057,34 @@ def choose_leverage(
     atr_percent,
     btc_context=None
 ):
-
-    leverage = 3
-
-    if score >= 88:
-
+    # Önce sinyal kalitesi, sonra volatilite.
+    if score >= 90:
         leverage = 5
-
-    elif score >= 82:
-
+    elif score >= 84:
         leverage = 4
-
-    elif score >= 76:
-
+    elif score >= 74:
         leverage = 3
-
     else:
-
         leverage = 2
 
-    if atr_percent >= 2.5:
-
+    if atr_percent >= 4.0:
+        leverage -= 2
+    elif atr_percent >= 2.5:
         leverage -= 1
-
-    if atr_percent >= 4:
-
-        leverage -= 1
-
-    if btc_context and btc_context.get("strength", 0) >= 70:
+    elif atr_percent <= 0.45 and score >= 84:
         leverage += 1
 
-    leverage = int(
-        clamp(
-            leverage,
-            MIN_LEVERAGE,
-            MAX_LEVERAGE
-        )
-    )
+    # BTC hard filter değildir; ters yön yalnızca kaldıraç/risk azaltır.
+    if btc_context:
+        direction = btc_context.get("direction", "NEUTRAL")
+        strength = safe_float(btc_context.get("strength", 0))
+        # Bu aşamada side bilinmediği için güçlü BTC context yalnızca
+        # genel volatilite avantajı sağlar; yön bazlı düzeltme analyze_symbol'da yapılır.
+        if direction != "NEUTRAL" and strength >= 80 and score >= 88:
+            leverage += 1
 
-    return leverage
+    return int(clamp(leverage, MIN_LEVERAGE, MAX_LEVERAGE))
+
 
 
 # ============================================================
@@ -3159,53 +3167,99 @@ def calculate_target_roi(
     side=None
 ):
     """
-    İşlem öncesi kademeli hedef ROI hesabı. 
-    Emir defteri (order book) derinliği ve likidite havuzu kontrolüyle dinamik optimize edilir.
+    Hedef ROI sabit değildir.
+    Önce beklenen kaldıraçsız fiyat hareketi kapasitesi tahmin edilir;
+    daha sonra bu hareket seçilen kaldıraçla ROI'ye çevrilir.
+
+    Taban: en az %1 ham fiyat hareketi.
+    Hedef; ATR, sinyal kalitesi ve likiditeye göre büyür/küçülür.
+    %1'in altındaki hareket kapasitesi olan işlemler sonradan leverage
+    nedeniyle yapay olarak cazip gösterilmez.
     """
-    base_move = max(abs(ticker_percentage) / 100.0, 0.01)
-    score_factor = score / 100.0
+    score_factor = clamp(score / 100.0, 0.0, 1.0)
+    atr_raw = max(0.0, atr_percent / 100.0)
+    ticker_raw = abs(safe_float(ticker_percentage)) / 100.0
 
-    # 1. Aşama: Kademeli Hedef ROI Temel Kurgusu
-    if score >= 88:
-        target = max(0.025, base_move * score_factor * 1.5)
-    elif score >= 82:
-        target = max(0.020, base_move * score_factor * 1.35)
-    else:
-        target = max(0.015, base_move * score_factor * 1.20)
+    # 5M ATR'nin birkaç katı, sinyal gücü arttıkça daha geniş bir hedef alanı.
+    atr_capacity = atr_raw * (2.20 + 1.80 * score_factor)
+    momentum_capacity = ticker_raw * (0.35 + 0.35 * score_factor)
+    raw_move = max(
+        MIN_RAW_MOVE_PERCENT / 100.0,
+        atr_capacity,
+        momentum_capacity
+    )
 
-    if atr_percent >= 2.5:
-        target += 0.008
+    # Çok uç hareketlerde hedefi sonsuza taşımamak için güvenli üst sınır.
+    raw_move = min(
+        raw_move,
+        MAX_TARGET_RAW_MOVE_PERCENT / 100.0
+    )
 
-    if atr_percent >= 4:
-        target += 0.010
-
-    # 2. Aşama: Emir Defteri ve Likidite Havuzu Kontrolü ile Dinamik Katsayı
+    liquidity_factor = 1.0
     if symbol and side:
         try:
             order_book = exchange.fetch_order_book(symbol, limit=25)
             bids = order_book.get("bids", [])
             asks = order_book.get("asks", [])
-            
-            if bids and asks:
-                bid_depth_val = sum([b[1] * b[0] for b in bids])
-                ask_depth_val = sum([a[1] * a[0] for a in asks])
-                
-                if side == "LONG" and bid_depth_val > 0 and ask_depth_val > 0:
-                    liquidity_ratio = bid_depth_val / ask_depth_val
-                    if liquidity_ratio > 1.5:
-                        target *= 1.15 # Alım tarafı baskınsa hedefi kademeli büyüt
-                    elif liquidity_ratio < 0.7:
-                        target *= 0.90 # Likidite daralmasında hedefi realize edilebilir kıl
-                elif side == "SHORT" and bid_depth_val > 0 and ask_depth_val > 0:
-                    liquidity_ratio = ask_depth_val / bid_depth_val
-                    if liquidity_ratio > 1.5:
-                        target *= 1.15
-                    elif liquidity_ratio < 0.7:
-                        target *= 0.90
+            bid_depth = sum(b[0] * b[1] for b in bids if len(b) >= 2)
+            ask_depth = sum(a[0] * a[1] for a in asks if len(a) >= 2)
+            if bid_depth > 0 and ask_depth > 0:
+                ratio = bid_depth / ask_depth if side == "LONG" else ask_depth / bid_depth
+                if ratio >= 1.50:
+                    liquidity_factor = 1.10
+                elif ratio <= 0.70:
+                    liquidity_factor = 0.92
         except Exception as e:
-            logger.debug("Calculate target ROI order book check error for %s: %s", symbol, e)
+            logger.debug("Target liquidity check error %s: %s", symbol, e)
 
-    return target
+    raw_move = clamp(
+        raw_move * liquidity_factor,
+        MIN_RAW_MOVE_PERCENT / 100.0,
+        MAX_TARGET_RAW_MOVE_PERCENT / 100.0
+    )
+
+    # Bu fonksiyon leverage bilmediği için ham hareketi döndürüyoruz.
+    # ROI dönüşümü analyze_symbol içinde seçilen leverage ile yapılır.
+    return raw_move
+
+
+
+# ============================================================
+# DYNAMIC ATR HELPERS
+# ============================================================
+
+def calculate_atr_from_df(df, period=14):
+    """True Range EMA tabanlı güncel ATR."""
+    if df is None or len(df) < period + 2:
+        return 0.0
+    true_range = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift(1)).abs(),
+            (df["low"] - df["close"].shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return safe_float(
+        true_range.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
+    )
+
+
+def refresh_position_atr(position):
+    """Pozisyon yönetiminde ATR'yi periyodik olarak günceller."""
+    now = time.time()
+    last_refresh = safe_float(position.get("atr_last_refresh_ts", 0.0))
+    if now - last_refresh < POSITION_ATR_REFRESH_SECONDS:
+        return safe_float(position.get("atr", 0.0))
+
+    symbol = position.get("symbol")
+    df5 = fetch_ohlcv_cached(symbol, TIMEFRAME_ENTRY, 120)
+    atr = calculate_atr_from_df(df5, 14)
+    if atr > 0:
+        position["atr"] = atr
+        position["atr_percent"] = (atr / max(position["current_price"], 1e-12)) * 100.0
+        position["atr_last_refresh_ts"] = now
+    return safe_float(position.get("atr", 0.0))
 
 
 # ============================================================
@@ -3222,171 +3276,76 @@ def dry_run_open(
     leverage,
     target_roi
 ):
-
-    quantity = calculate_quantity(
-        symbol,
-        price,
-        leverage
-    )
-
-    notional = (
-        quantity * price
-    )
-
+    quantity = calculate_quantity(symbol, price, leverage)
+    notional = quantity * price
     if quantity <= 0:
-
         return False
 
-    max_loss_pnl_fraction = 0.50
-    target_pnl_fraction = target_roi * leverage
-    allowed_max_loss_fraction = target_pnl_fraction * max_loss_pnl_fraction
+    # Maksimum zarar = hedef ROI'nin %50'si.
+    max_loss_roi = target_roi * MAX_LOSS_OF_TARGET
+    max_loss_raw = max_loss_roi / max(leverage, 1)
+    atr_stop_distance = atr_value * INITIAL_ATR_MULTIPLIER
+    risk_stop_distance = price * max_loss_raw
+    effective_stop_distance = min(atr_stop_distance, risk_stop_distance)
 
-    max_loss_stop_distance_pct = allowed_max_loss_fraction / leverage
+    if effective_stop_distance <= 0:
+        return False
 
-    calculated_hard_stop_distance = atr_value * HARD_STOP_ATR / price
-    if calculated_hard_stop_distance > max_loss_stop_distance_pct:
-        effective_hard_stop_distance = max_loss_stop_distance_pct * price
-    else:
-        effective_hard_stop_distance = atr_value * HARD_STOP_ATR
-
-    if side == "LONG":
-
-        stop_price = (
-            price
-            -
-            effective_hard_stop_distance
-        )
-
-    else:
-
-        stop_price = (
-            price
-            +
-            effective_hard_stop_distance
-        )
-
-    opened_at = (
-        now_utc()
-        .isoformat()
+    stop_price = (
+        price - effective_stop_distance
+        if side == "LONG"
+        else price + effective_stop_distance
     )
-
+    opened_at = now_utc().isoformat()
     position = {
-
-        "symbol":
-            symbol,
-
-        "side":
-            side,
-
-        "entry":
-            price,
-
-        "current_price":
-            price,
-
-        "margin":
-            MARGIN_PER_POSITION,
-
-        "leverage":
-            leverage,
-
-        "notional":
-            notional,
-
-        "quantity":
-            quantity,
-
-        "score":
-            score,
-
-        "entry_reason":
-            reasons,
-
-        "atr":
-            atr_value,
-
-        "highest":
-            price,
-
-        "lowest":
-            price,
-
-        "stop_price":
-            stop_price,
-
-        "initial_stop":
-            stop_price,
-
-        "trailing_active":
-            False,
-
-        "unrealized_pnl":
-            0.0,
-
-        "unrealized_roi":
-            0.0,
-
-        "opened_at":
-            opened_at,
-
-        "last_update":
-            opened_at,
-
-        "peak_roi":
-            0.0,
-
-        "target_roi":
-            target_roi,
-
-        "target_roi_percent":
-            target_roi * 100,
-
-        "entry_price":
-            price,
-
-        "entry_notional":
-            notional,
+        "symbol": symbol,
+        "side": side,
+        "entry": price,
+        "entry_price": price,
+        "current_price": price,
+        "margin": MARGIN_PER_POSITION,
+        "leverage": leverage,
+        "notional": notional,
+        "entry_notional": notional,
+        "quantity": quantity,
+        "score": score,
+        "entry_reason": reasons,
+        "atr": atr_value,
+        "atr_percent": (atr_value / max(price, 1e-12)) * 100.0,
+        "atr_last_refresh_ts": time.time(),
+        "highest": price,
+        "lowest": price,
+        "stop_price": stop_price,
+        "initial_stop": stop_price,
+        "trailing_active": False,
+        "profit_lock_active": False,
+        "locked_roi": 0.0,
+        "unrealized_pnl": 0.0,
+        "unrealized_roi": 0.0,
+        "opened_at": opened_at,
+        "last_update": opened_at,
+        "peak_roi": 0.0,
+        "target_roi": target_roi,
+        "target_roi_percent": target_roi * 100,
+        "max_loss_roi": max_loss_roi,
+        "profit_lock_trigger_roi": target_roi * PROFIT_LOCK_TRIGGER_FRACTION,
     }
-
     with state_lock:
-
-        positions[
-            symbol
-        ] = position
-
-    stats[
-        "simulated_entries"
-    ] += 1
-
-    stats[
-        "signals"
-    ] += 1
+        positions[symbol] = position
+    stats["simulated_entries"] += 1
+    stats["signals"] += 1
 
     logger.warning(
-        "DRY RUN ENTRY | %s | %s | "
-        "price=%.8f | score=%s | "
-        "lev=%sx | margin=$%.2f | "
-        "notional=$%.2f | qty=%s | "
-        "TARGET ROI=%.2f%%",
-        side,
-        symbol,
-        price,
-        score,
-        leverage,
-        MARGIN_PER_POSITION,
-        notional,
-        quantity,
-        target_roi * 100
+        "DRY RUN ENTRY | %s | %s | price=%.8f | score=%s | lev=%sx | "
+        "TARGET=%.2f%% | MAX_LOSS=%.2f%% | LOCK_TRIGGER=%.2f%% | ATR=%.6f | STOP=%.8f",
+        side, symbol, price, score, leverage,
+        target_roi * 100, max_loss_roi * 100,
+        target_roi * PROFIT_LOCK_TRIGGER_FRACTION * 100,
+        atr_value, stop_price
     )
-
-    logger.warning(
-        "ENTRY REASONS | %s",
-        " | ".join(
-            reasons[:20]
-        )
-    )
-
+    logger.warning("ENTRY REASONS | %s", " | ".join(reasons[:20]))
     return True
+
 
 
 # ============================================================
@@ -3403,198 +3362,82 @@ def live_open_position(
     leverage,
     target_roi
 ):
-
     if DRY_RUN:
-
-        return dry_run_open(
-            symbol,
-            side,
-            price,
-            score,
-            reasons,
-            atr_value,
-            leverage,
-            target_roi
-        )
+        return dry_run_open(symbol, side, price, score, reasons, atr_value, leverage, target_roi)
 
     try:
-
         try:
-
-            exchange.set_margin_mode(
-                "isolated",
-                symbol
-            )
-
+            exchange.set_margin_mode("isolated", symbol)
         except Exception as e:
+            logger.debug("Margin mode: %s", e)
 
-            logger.debug(
-                "Margin mode: %s",
-                e
-            )
-
-        exchange.set_leverage(
-            leverage,
-            symbol
-        )
-
-        quantity = calculate_quantity(
-            symbol,
-            price,
-            leverage
-        )
-
+        exchange.set_leverage(leverage, symbol)
+        quantity = calculate_quantity(symbol, price, leverage)
         if quantity <= 0:
-
             return False
 
-        order_side = (
-            "buy"
+        order_side = "buy" if side == "LONG" else "sell"
+        order = exchange.create_order(symbol, "market", order_side, quantity)
+        logger.warning("LIVE ENTRY | %s | %s | %s", side, symbol, order)
+
+        # Gerçekleşen market fiyatını mümkünse order cevabından kullan.
+        executed_price = safe_float(order.get("average")) or safe_float(order.get("price")) or price
+        opened_at = now_utc().isoformat()
+
+        max_loss_roi = target_roi * MAX_LOSS_OF_TARGET
+        max_loss_raw = max_loss_roi / max(leverage, 1)
+        atr_stop_distance = atr_value * INITIAL_ATR_MULTIPLIER
+        risk_stop_distance = executed_price * max_loss_raw
+        effective_stop_distance = min(atr_stop_distance, risk_stop_distance)
+        if effective_stop_distance <= 0:
+            return False
+
+        stop_price = (
+            executed_price - effective_stop_distance
             if side == "LONG"
-            else "sell"
+            else executed_price + effective_stop_distance
         )
-
-        order = exchange.create_order(
-            symbol,
-            "market",
-            order_side,
-            quantity
-        )
-
-        logger.warning(
-            "LIVE ENTRY | %s | %s | %s",
-            side,
-            symbol,
-            order
-        )
-
-        opened_at = (
-            now_utc()
-            .isoformat()
-        )
-
-        max_loss_pnl_fraction = 0.50
-        target_pnl_fraction = target_roi * leverage
-        allowed_max_loss_fraction = target_pnl_fraction * max_loss_pnl_fraction
-        max_loss_stop_distance_pct = allowed_max_loss_fraction / leverage
-
-        calculated_hard_stop_distance = atr_value * HARD_STOP_ATR / price
-        if calculated_hard_stop_distance > max_loss_stop_distance_pct:
-            effective_hard_stop_distance = max_loss_stop_distance_pct * price
-        else:
-            effective_hard_stop_distance = atr_value * HARD_STOP_ATR
-
-        if side == "LONG":
-
-            initial_stop = (
-                price
-                -
-                effective_hard_stop_distance
-            )
-
-        else:
-
-            initial_stop = (
-                price
-                +
-                effective_hard_stop_distance
-            )
 
         position = {
-
-            "symbol":
-                symbol,
-
-            "side":
-                side,
-
-            "entry":
-                price,
-
-            "current_price":
-                price,
-
-            "margin":
-                MARGIN_PER_POSITION,
-
-            "leverage":
-                leverage,
-
-            "notional":
-                quantity * price,
-
-            "quantity":
-                quantity,
-
-            "score":
-                score,
-
-            "entry_reason":
-                reasons,
-
-            "atr":
-                atr_value,
-
-            "highest":
-                price,
-
-            "lowest":
-                price,
-
-            "stop_price":
-                initial_stop,
-
-            "initial_stop":
-                initial_stop,
-
-            "trailing_active":
-                False,
-
-            "unrealized_pnl":
-                0.0,
-
-            "unrealized_roi":
-                0.0,
-
-            "opened_at":
-                opened_at,
-
-            "last_update":
-                opened_at,
-
-            "peak_roi":
-                0.0,
-
-            "target_roi":
-                target_roi,
-
-            "target_roi_percent":
-                target_roi * 100,
-
-            "entry_price":
-                price,
-
-            "entry_notional":
-                quantity * price,
+            "symbol": symbol,
+            "side": side,
+            "entry": executed_price,
+            "entry_price": executed_price,
+            "current_price": executed_price,
+            "margin": MARGIN_PER_POSITION,
+            "leverage": leverage,
+            "notional": quantity * executed_price,
+            "entry_notional": quantity * executed_price,
+            "quantity": quantity,
+            "score": score,
+            "entry_reason": reasons,
+            "atr": atr_value,
+            "atr_percent": (atr_value / max(executed_price, 1e-12)) * 100.0,
+            "atr_last_refresh_ts": time.time(),
+            "highest": executed_price,
+            "lowest": executed_price,
+            "stop_price": stop_price,
+            "initial_stop": stop_price,
+            "trailing_active": False,
+            "profit_lock_active": False,
+            "locked_roi": 0.0,
+            "unrealized_pnl": 0.0,
+            "unrealized_roi": 0.0,
+            "opened_at": opened_at,
+            "last_update": opened_at,
+            "peak_roi": 0.0,
+            "target_roi": target_roi,
+            "target_roi_percent": target_roi * 100,
+            "max_loss_roi": max_loss_roi,
+            "profit_lock_trigger_roi": target_roi * PROFIT_LOCK_TRIGGER_FRACTION,
         }
-
         with state_lock:
-
-            positions[
-                symbol
-            ] = position
-
+            positions[symbol] = position
         return True
-
     except Exception as e:
-
-        logger.error(
-            "LIVE ENTRY ERROR %s: %s",
-            symbol,
-            e
-        )
-
+        logger.error("LIVE ENTRY ERROR %s: %s", symbol, e)
         return False
+
 
 
 # ============================================================
@@ -3660,86 +3503,106 @@ def update_trailing_stop(
     current_price
 ):
     """
-    Kademeli hedef ROI seviyelerine göre optimize edilmiş akıllı trailing stop güncellemesi.
+    Gerçek dinamik ATR stop.
+
+    1) Pozitif hareket boyunca ATR yeniden hesaplanır.
+    2) İlk risk stopu hedefin %50 zarar sınırını aşamaz.
+    3) Her tam %1 ROI'de stop bir adım ileri taşınır.
+    4) Hedefin %40'ına gelince stop girişe çekilir.
+    5) Sonrasında stop yalnızca sıkılaşır ve anlık ATR + peak fiyat ile hareket eder.
+    6) 10%/20% gibi bir hedefe ulaşıldığında pozisyon otomatik kapanmaz; trend devam edebilir.
     """
     side = position["side"]
-    atr_value = position["atr"]
     entry = position["entry"]
-    target_roi = position.get("target_roi", 0.015)
-    leverage = position["leverage"]
-
-    pnl, roi = calculate_pnl(
-        position,
-        current_price
-    )
+    leverage = max(int(position.get("leverage", 1)), 1)
+    target_roi = max(safe_float(position.get("target_roi", 0.01)), leverage * 0.01)
 
     position["current_price"] = current_price
+    pnl, roi = calculate_pnl(position, current_price)
     position["unrealized_pnl"] = pnl
     position["unrealized_roi"] = roi
+    position["peak_roi"] = max(safe_float(position.get("peak_roi", 0.0)), roi)
 
-    position["peak_roi"] = max(
-        position.get("peak_roi", 0),
-        roi
-    )
+    atr_value = refresh_position_atr(position)
+    if atr_value <= 0:
+        atr_value = safe_float(position.get("atr", 0.0))
 
     if side == "LONG":
-        position["highest"] = max(
-            position["highest"],
-            current_price
-        )
+        position["highest"] = max(safe_float(position.get("highest", entry)), current_price)
+    else:
+        position["lowest"] = min(safe_float(position.get("lowest", entry)), current_price)
 
-        # Kademeli ROI Eşiklerine Göre Akıllı Trail Aktivasyonu
-        activation_limit = max(0.02, target_roi * 0.30)
-        if roi >= activation_limit:
-            # Kademeli Kar Kilitleme Mekanizması (Multi-tier Step Locking)
-            if roi >= target_roi * 0.85:
-                step_stop = entry * (1.0 + (target_roi * 0.55 / leverage))
-                position["stop_price"] = max(position["stop_price"], step_stop)
-            elif roi >= target_roi * 0.50:
-                step_stop = entry * (1.0 + (target_roi * 0.25 / leverage))
-                position["stop_price"] = max(position["stop_price"], step_stop)
+    old_stop = safe_float(position.get("stop_price", entry))
+    lock_trigger = target_roi * PROFIT_LOCK_TRIGGER_FRACTION
+
+    # Hedefin %40'ı: doğrudan break-even.
+    if roi >= lock_trigger:
+        if not position.get("profit_lock_active", False):
+            logger.info(
+                "PROFIT LOCK ACTIVATED | %s | %s | ROI=%.2f%% | target=%.2f%% | stop=ENTRY",
+                side, position.get("symbol"), roi * 100, target_roi * 100
+            )
+        position["profit_lock_active"] = True
+        position["trailing_active"] = True
+        position["locked_roi"] = max(safe_float(position.get("locked_roi", 0.0)), 0.0)
+
+        if side == "LONG":
+            position["stop_price"] = max(old_stop, entry)
+        else:
+            position["stop_price"] = min(old_stop, entry)
+
+        # Profit lock sonrasında ATR stopu sadece kâr tarafında çalışır.
+        if atr_value > 0:
+            atr_mult = DYNAMIC_ATR_TIGHT if roi < target_roi else max(0.85, DYNAMIC_ATR_TIGHT * 0.90)
+            if side == "LONG":
+                dynamic_stop = position["highest"] - atr_value * atr_mult
+                dynamic_stop = max(entry, dynamic_stop)
+                position["stop_price"] = max(position["stop_price"], dynamic_stop)
             else:
-                steps_reached = int(roi // 0.008)
-                if steps_reached > 0:
-                    step_stop = entry * (1.0 + (steps_reached * 0.008 / leverage))
-                    position["stop_price"] = max(position["stop_price"], step_stop)
-
-            position["trailing_active"] = True
-
-            # Volatiliteye Duyarlı Sıkılaştırılmış ATR Trailing Bandı
-            tightness_factor = TRAIL_ATR_TIGHT if roi < target_roi else (TRAIL_ATR_TIGHT * 0.8)
-            dynamic_atr_distance = atr_value * tightness_factor
-            dynamic_stop = position["highest"] - dynamic_atr_distance
-            position["stop_price"] = max(position["stop_price"], dynamic_stop)
+                dynamic_stop = position["lowest"] + atr_value * atr_mult
+                dynamic_stop = min(entry, dynamic_stop)
+                position["stop_price"] = min(position["stop_price"], dynamic_stop)
 
     else:
-        position["lowest"] = min(
-            position["lowest"],
-            current_price
-        )
+        # Her tam %1 ROI için bir basamak. Stop bir basamak geriden gelir:
+        # ROI=2% -> yaklaşık +1% ROI kilidi, ROI=3% -> +2% ROI vb.
+        roi_percent = roi * 100.0
+        steps_reached = int(max(0.0, roi_percent) // STEP_ROI_PERCENT)
+        locked_roi_percent = max(0.0, (steps_reached - STEP_LOCK_LAG_PERCENT) * STEP_ROI_PERCENT)
+        locked_roi = locked_roi_percent / 100.0
+        position["locked_roi"] = max(safe_float(position.get("locked_roi", 0.0)), locked_roi)
 
-        activation_limit = max(0.02, target_roi * 0.30)
-        if roi >= activation_limit:
-            if roi >= target_roi * 0.85:
-                step_stop = entry * (1.0 - (target_roi * 0.55 / leverage))
-                position["stop_price"] = min(position["stop_price"], step_stop)
-            elif roi >= target_roi * 0.50:
-                step_stop = entry * (1.0 - (target_roi * 0.25 / leverage))
-                position["stop_price"] = min(position["stop_price"], step_stop)
-            else:
-                steps_reached = int(roi // 0.008)
-                if steps_reached > 0:
-                    step_stop = entry * (1.0 - (steps_reached * 0.008 / leverage))
-                    position["stop_price"] = min(position["stop_price"], step_stop)
-
+        if locked_roi > 0:
             position["trailing_active"] = True
+            step_raw = locked_roi / leverage
+            if side == "LONG":
+                step_stop = entry * (1.0 + step_raw)
+                position["stop_price"] = max(old_stop, step_stop)
+            else:
+                step_stop = entry * (1.0 - step_raw)
+                position["stop_price"] = min(old_stop, step_stop)
 
-            tightness_factor = TRAIL_ATR_TIGHT if roi < target_roi else (TRAIL_ATR_TIGHT * 0.8)
-            dynamic_atr_distance = atr_value * tightness_factor
-            dynamic_stop = position["lowest"] + dynamic_atr_distance
-            position["stop_price"] = min(position["stop_price"], dynamic_stop)
+        # ATR trailing de her zaman tek yönde sıkılaşır ve risk sınırını aşamaz.
+        if atr_value > 0:
+            atr_stop_distance = atr_value * DYNAMIC_ATR_MULTIPLIER
+            max_loss_raw = target_roi * MAX_LOSS_OF_TARGET / leverage
+            max_loss_distance = entry * max_loss_raw
+            atr_stop_distance = min(atr_stop_distance, max_loss_distance)
+            if side == "LONG":
+                dynamic_stop = position["highest"] - atr_stop_distance
+                position["stop_price"] = max(position["stop_price"], dynamic_stop)
+            else:
+                dynamic_stop = position["lowest"] + atr_stop_distance
+                position["stop_price"] = min(position["stop_price"], dynamic_stop)
+
+    # Stop hiçbir zaman kötüleşmez.
+    if side == "LONG":
+        position["stop_price"] = max(position["stop_price"], safe_float(position.get("stop_price", old_stop)))
+    else:
+        position["stop_price"] = min(position["stop_price"], safe_float(position.get("stop_price", old_stop)))
 
     position["last_update"] = now_utc().isoformat()
+
 
 
 # ============================================================
@@ -4240,7 +4103,7 @@ def position_monitor():
                     "ROI=%.2f%% | "
                     "PNL=$%.3f | "
                     "target=%.2f%% | "
-                    "stop=%.8f | trail=%s",
+                    "stop=%.8f | trail=%s | lock=%s | ATR=%.6f | locked=%.2f%%",
                     side,
                     symbol,
                     position[
@@ -4255,7 +4118,10 @@ def position_monitor():
                         "target_roi"
                     ] * 100,
                     stop_price,
-                    trailing
+                    trailing,
+                    position.get("profit_lock_active", False),
+                    position.get("atr", 0.0),
+                    position.get("locked_roi", 0.0) * 100
                 )
 
         except Exception as e:
@@ -4605,352 +4471,130 @@ def analyze_symbol(
     candidate,
     btc_context=None
 ):
-
-    symbol = candidate[
-        "symbol"
-    ]
-
-    if is_cooldown(
-        symbol
-    ):
-
+    symbol = candidate["symbol"]
+    if is_cooldown(symbol):
+        logger.info("SKIP COOLDOWN | %s", symbol)
         return None
 
-    ticker = candidate[
-        "ticker"
-    ]
-
-    funding = get_funding(
-        symbol
-    )
-
-    if (
-        abs(funding)
-        >=
-        MAX_ABS_FUNDING
-    ):
-
-        logger.info(
-            "SKIP FUNDING | %s | %.6f",
-            symbol,
-            funding
-        )
-
+    ticker = candidate["ticker"]
+    funding = get_funding(symbol)
+    if abs(funding) >= MAX_ABS_FUNDING:
+        logger.info("SKIP FUNDING | %s | %.6f", symbol, funding)
         return None
 
-    df1 = fetch_ohlcv_cached(
-        symbol,
-        TIMEFRAME_FAST,
-        220
-    )
-
-    df5 = fetch_ohlcv_cached(
-        symbol,
-        TIMEFRAME_ENTRY,
-        220
-    )
-
-    df15 = fetch_ohlcv_cached(
-        symbol,
-        TIMEFRAME_CONFIRM,
-        220
-    )
-
-    df1h = fetch_ohlcv_cached(
-        symbol,
-        TIMEFRAME_TREND,
-        220
-    )
-
-    if any(
-        x is None
-        for x in [
-            df1,
-            df5,
-            df15,
-            df1h
-        ]
-    ):
-
+    df1 = fetch_ohlcv_cached(symbol, TIMEFRAME_FAST, 220)
+    df5 = fetch_ohlcv_cached(symbol, TIMEFRAME_ENTRY, 220)
+    df15 = fetch_ohlcv_cached(symbol, TIMEFRAME_CONFIRM, 220)
+    df1h = fetch_ohlcv_cached(symbol, TIMEFRAME_TREND, 220)
+    if any(x is None for x in [df1, df5, df15, df1h]) or any(len(x) < 80 for x in [df1, df5, df15, df1h]):
+        logger.info("SKIP DATA | %s", symbol)
         return None
 
-    if any(
-        len(x) < 80
-        for x in [
-            df1,
-            df5,
-            df15,
-            df1h
-        ]
-    ):
-
-        return None
-
-    # Volatilite / Genişleme (ATR-Band) Kontrolü
     if not atr_band_expansion_check(df5):
-        logger.info("SKIP ATR-BAND | %s | Volatilite bant genişlemesi aşırı/kaotik", symbol)
+        logger.info("SKIP ATR-BAND | %s | aşırı/kaotik volatilite", symbol)
         return None
 
-    price = safe_float(
-        ticker[
-            "last"
-        ]
-    )
-
+    price = safe_float(ticker.get("last"))
     if price <= 0:
-
         return None
 
-    true_range = pd.concat(
-        [
-            df5["high"]
-            -
-            df5["low"],
-
-            (
-                df5["high"]
-                -
-                df5["close"].shift(1)
-            ).abs(),
-
-            (
-                df5["low"]
-                -
-                df5["close"].shift(1)
-            ).abs(),
-        ],
-        axis=1
-    ).max(
-        axis=1
-    )
-
-    atr_value = safe_float(
-        true_range.ewm(
-            alpha=1 / 14,
-            adjust=False
-        ).mean().iloc[-1]
-    )
-
+    atr_value = calculate_atr_from_df(df5, 14)
     if atr_value <= 0:
+        return None
+    atr_percent = (atr_value / price) * 100.0
 
+    long_score, long_reasons = score_long(df1, df5, df15, df1h, btc_context)
+    short_score, short_reasons = score_short(df1, df5, df15, df1h, btc_context)
+
+    if long_score >= MIN_LONG_SCORE and long_score > short_score + 6:
+        side, score, reasons = "LONG", long_score, long_reasons
+    elif short_score >= MIN_SHORT_SCORE and short_score > long_score + 6:
+        side, score, reasons = "SHORT", short_score, short_reasons
+    else:
+        logger.info("SKIP SCORE | %s | long=%s short=%s", symbol, long_score, short_score)
         return None
 
-    atr_percent = (
-        atr_value
-        /
-        price
-    ) * 100
-
-    long_score, long_reasons = (
-        score_long(
-            df1,
-            df5,
-            df15,
-            df1h,
-            btc_context
-        )
-    )
-
-    short_score, short_reasons = (
-        score_short(
-            df1,
-            df5,
-            df15,
-            df1h,
-            btc_context
-        )
-    )
-
-    side = None
-
-    score = 0
-
-    reasons = []
-
-    if (
-        long_score
-        >=
-        MIN_LONG_SCORE
-
-        and
-
-        long_score
-        >
-        short_score + 7
-    ):
-
-        side = "LONG"
-
-        score = long_score
-
-        reasons = long_reasons
-
-    elif (
-        short_score
-        >=
-        MIN_SHORT_SCORE
-
-        and
-
-        short_score
-        >
-        long_score + 7
-    ):
-
-        side = "SHORT"
-
-        score = short_score
-
-        reasons = short_reasons
-
-    else:
-
+    # Aşırı tek yönlü 24h hareketlerde doğrudan trendi kovalamayı azalt.
+    if side == "LONG" and ticker["percentage"] < -7:
         return None
-
-    if side == "LONG":
-
-        if ticker[
-            "percentage"
-        ] < -5:
-
-            return None
-
-    else:
-
-        if ticker[
-            "percentage"
-        ] > 5:
-
-            return None
+    if side == "SHORT" and ticker["percentage"] > 7:
+        return None
 
     if is_correlation_blocked(symbol):
         return None
 
-    # Likidite Havuzu / Emir Değeri Kontrolü
     if not check_order_book_liquidity(symbol, side):
-        logger.info("SKIP ORDER BOOK | %s | %s yönünde emir defteri likiditesi yetersiz", symbol, side)
+        logger.info("SKIP ORDER BOOK | %s | %s likiditesi yetersiz", symbol, side)
         return None
 
-    leverage = choose_leverage(
-        score,
-        atr_percent,
-        btc_context
-    )
+    leverage = choose_leverage(score, atr_percent, btc_context)
+    leverage = int(clamp(leverage, MIN_LEVERAGE, MAX_LEVERAGE))
 
-    # Güncellenmiş parametrik hedef ROI hesaplayıcısı
-    target_roi = (
-        calculate_target_roi(
-            score,
-            atr_percent,
-            ticker["percentage"],
-            symbol,
-            side
-        )
-    )
+    # BTC artık hard filter değil; yalnızca risk/leverage katsayısıdır.
+    btc_direction = (btc_context or {}).get("direction", "NEUTRAL")
+    btc_strength = safe_float((btc_context or {}).get("strength", 0))
+    if btc_direction == side:
+        btc_risk_factor = 1.0
+    elif btc_direction == "NEUTRAL":
+        btc_risk_factor = 0.90
+    else:
+        btc_risk_factor = max(0.55, 1.0 - btc_strength / 180.0)
+    leverage = int(clamp(round(leverage * btc_risk_factor), MIN_LEVERAGE, MAX_LEVERAGE))
 
-    if target_roi < 0.01:
+    # Dinamik hedef: ham fiyat hareketi kapasitesi * seçilen leverage.
+    raw_move = calculate_target_roi(score, atr_percent, ticker["percentage"], symbol, side)
+    minimum_raw_move = MIN_RAW_MOVE_PERCENT / 100.0
+    if raw_move < minimum_raw_move:
+        logger.info("SKIP MOVE CAPACITY | %s | raw_move=%.3f%%", symbol, raw_move * 100)
         return None
 
-    structure_1h = market_structure(
-        df1h
-    )
+    target_roi = raw_move * leverage
+    target_roi = clamp(target_roi, leverage * minimum_raw_move, MAX_TARGET_ROI)
 
-    structure_15 = market_structure(
-        df15
-    )
+    # Max loss / target R:R şartı sağlanamıyorsa işlem yok.
+    max_loss_roi = target_roi * MAX_LOSS_OF_TARGET
+    risk_reward = target_roi / max(max_loss_roi, 1e-12)
+    if risk_reward < 2.0:
+        return None
 
-    structure_5 = market_structure(
-        df5
-    )
+    structure_1h = market_structure(df1h)
+    structure_15 = market_structure(df15)
+    structure_5 = market_structure(df5)
+    position = move_position(df5, 50)
 
-    position = move_position(
-        df5,
-        50
-    )
+    # Entry için gerekli raw hareketin piyasa yapısına göre makul olduğundan emin ol.
+    if atr_percent * 1.0 / 100.0 > raw_move * 1.10:
+        logger.info("SKIP TARGET/ATR MISMATCH | %s", symbol)
+        return None
 
     return {
-
-        "symbol":
-            symbol,
-
-        "side":
-            side,
-
-        "score":
-            score,
-
-        "price":
-            price,
-
-        "atr":
-            atr_value,
-
-        "atr_percent":
-            atr_percent,
-
-        "leverage":
-            leverage,
-
-        "funding":
-            funding,
-
-        "target_roi":
-            target_roi,
-
-        "reasons":
-            reasons,
-
-        "long_score":
-            long_score,
-
-        "short_score":
-            short_score,
-
-        "ticker_percentage":
-            ticker[
-                "percentage"
-            ],
-
-        "volume":
-            ticker[
-                "quoteVolume"
-            ],
-
-        "sources":
-            candidate[
-                "sources"
-            ],
-
-        "structure_1h":
-            structure_1h[
-                "structure"
-            ],
-
-        "structure_15m":
-            structure_15[
-                "structure"
-            ],
-
-        "structure_5m":
-            structure_5[
-                "structure"
-            ],
-
-        "move_position":
-            position,
-
-        "breakout_5m":
-            breakout_analysis(
-                df5,
-                20
-            ),
-
-        "breakout_15m":
-            breakout_analysis(
-                df15,
-                20
-            ),
+        "symbol": symbol,
+        "side": side,
+        "score": score,
+        "price": price,
+        "atr": atr_value,
+        "atr_percent": atr_percent,
+        "leverage": leverage,
+        "btc_risk_factor": btc_risk_factor,
+        "funding": funding,
+        "target_roi": target_roi,
+        "target_raw_move": raw_move,
+        "max_loss_roi": max_loss_roi,
+        "risk_reward": risk_reward,
+        "reasons": reasons,
+        "long_score": long_score,
+        "short_score": short_score,
+        "ticker_percentage": ticker["percentage"],
+        "volume": ticker["quoteVolume"],
+        "sources": candidate["sources"],
+        "structure_1h": structure_1h["structure"],
+        "structure_15m": structure_15["structure"],
+        "structure_5m": structure_5["structure"],
+        "move_position": position,
+        "breakout_5m": breakout_analysis(df5, 20),
+        "breakout_15m": breakout_analysis(df15, 20),
     }
+
 
 
 # ============================================================
@@ -5067,222 +4711,120 @@ def find_best_signal(
 def final_entry_validation(
     signal
 ):
+    symbol = signal["symbol"]
+    side = signal["side"]
 
-    symbol = signal[
-        "symbol"
-    ]
-
-    side = signal[
-        "side"
-    ]
-
-    if not can_open_position(
-        symbol,
-        side
-    ):
-
+    if not can_open_position(symbol, side):
+        logger.info("ENTRY SKIP | %s | position/correlation limit", symbol)
         return False
 
-    if (
-        signal["score"]
-        <
-        EARLY_ENTRY_SCORE
-    ):
-
+    if signal["score"] < EARLY_ENTRY_SCORE:
+        logger.info("ENTRY SKIP | %s | score=%s", symbol, signal["score"])
         return False
 
-    if (
-        abs(
-            signal[
-                "funding"
-            ]
-        )
-        >=
-        MAX_ABS_FUNDING
-    ):
-
+    if abs(signal["funding"]) >= MAX_ABS_FUNDING:
         return False
 
     try:
-
-        ticker = exchange.fetch_ticker(
-            symbol
-        )
-
-        fresh_price = safe_float(
-            ticker.get(
-                "last"
-            )
-        )
-
+        ticker = exchange.fetch_ticker(symbol)
+        fresh_price = safe_float(ticker.get("last"))
         bid = safe_float(ticker.get("bid"))
         ask = safe_float(ticker.get("ask"))
-
-        # Ek Kontrol 1: Anlık Spread (Slippage Riski) Filtresi
         if bid > 0 and ask > 0:
-            current_spread = ((ask - bid) / ((ask + bid) / 2)) * 100
-            if current_spread > MAX_SPREAD_PERCENT:
-                logger.info("ENTRY SKIP | %s | Anlık spread yüksek: %.3f%%", symbol, current_spread)
+            spread = ((ask - bid) / ((ask + bid) / 2)) * 100
+            if spread > MAX_SPREAD_PERCENT:
+                logger.info("ENTRY SKIP | %s | spread=%.3f%%", symbol, spread)
                 return False
-
         if fresh_price <= 0:
-
             return False
 
-        original = signal[
-            "price"
-        ]
-
-        move = (
-            abs(
-                fresh_price
-                -
-                original
-            )
-            /
-            original
-        )
-
-        if move > 0.015:
-
-            logger.info(
-                "ENTRY SKIP | %s | "
-                "price moved %.2f%% "
-                "before entry",
-                symbol,
-                move * 100
-            )
-
+        original = safe_float(signal["price"])
+        drift = abs(fresh_price - original) / max(original, 1e-12) * 100
+        if drift > ENTRY_MAX_PRICE_DRIFT_PERCENT:
+            logger.info("ENTRY SKIP | %s | price drift %.2f%%", symbol, drift)
             return False
-
-        signal[
-            "price"
-        ] = fresh_price
-
-    except Exception:
-
+        signal["price"] = fresh_price
+    except Exception as e:
+        logger.info("ENTRY SKIP | %s | fresh ticker error: %s", symbol, e)
         return False
 
-    df1 = fetch_ohlcv_cached(
-        symbol,
-        TIMEFRAME_FAST,
-        80
-    )
-
-    df5 = fetch_ohlcv_cached(
-        symbol,
-        TIMEFRAME_ENTRY,
-        120
-    )
-
-    if (
-        df1 is None
-        or
-        df5 is None
-    ):
-
+    df1 = fetch_ohlcv_cached(symbol, TIMEFRAME_FAST, 100)
+    df5 = fetch_ohlcv_cached(symbol, TIMEFRAME_ENTRY, 120)
+    df15 = fetch_ohlcv_cached(symbol, TIMEFRAME_CONFIRM, 100)
+    if df1 is None or df5 is None or df15 is None:
         return False
 
-    # Ek Kontrol 2: Anlık Hacim Desteği (Volume Confirmation) Kontrolü
+    if signal.get("atr_percent", 0) > 5.5:
+        logger.info("ENTRY SKIP | %s | ATR aşırı yüksek %.2f%%", symbol, signal.get("atr_percent", 0))
+        return False
+
     vol_confirm = volume_confirmation(df5)
-    if vol_confirm < 1.10:
-        logger.info("ENTRY SKIP | %s | Giriş anında yeterli hacim ivmesi yok (oran: %.2f)", symbol, vol_confirm)
-        return False
+    volume_ok = vol_confirm >= 1.05
+    if not volume_ok:
+        logger.info("ENTRY WARN | %s | volume=%.2f, fiyat yapısı güçlü ise devam edilebilir", symbol, vol_confirm)
 
-    # Ek Kontrol 3: Aşırı Volatilite / Kaotik Fiyat Hareketi (ATR) Filtresi
-    if signal.get("atr_percent", 0) > 4.5:
-        logger.info("ENTRY SKIP | %s | ATR çok yüksek (aşırı kaotik volatilite): %.2f%%", symbol, signal.get("atr_percent", 0))
-        return False
+    br5 = signal.get("breakout_5m", {})
+    br15 = signal.get("breakout_15m", {})
 
     if side == "LONG":
-
-        trigger = (
-
-            bullish_engulfing(
-                df1
-            )
-
-            or
-
-            bullish_rejection(
-                df1
-            )
-
-            or
-
-            strong_bullish_candle(
-                df1
-            )
-
-            or
-
-            bullish_engulfing(
-                df5
-            )
-
-            or
-
-            bullish_rejection(
-                df5
-            )
-
-        )
-
-        if not trigger:
-
-            logger.info(
-                "ENTRY SKIP | %s | "
-                "final LONG price action trigger yok",
-                symbol
-            )
-
-            return False
-
+        confirmations = [
+            bullish_engulfing(df1),
+            bullish_rejection(df1),
+            strong_bullish_candle(df1),
+            bullish_engulfing(df5),
+            bullish_rejection(df5),
+            strong_bullish_candle(df5),
+            bool(br5.get("bull_breakout")),
+            bool(br15.get("bull_breakout")),
+            bool(br5.get("bull_attempt")),
+        ]
+        # 5M/15M yapı + 1M yön uyumu, tam mum paterni yokken de erken girişe izin verir.
+        directional_1m = safe_float(df1["close"].iloc[-1]) > safe_float(df1["open"].iloc[-1])
+        directional_5m = safe_float(df5["close"].iloc[-1]) > safe_float(df5["open"].iloc[-1])
     else:
+        confirmations = [
+            bearish_engulfing(df1),
+            bearish_rejection(df1),
+            strong_bearish_candle(df1),
+            bearish_engulfing(df5),
+            bearish_rejection(df5),
+            strong_bearish_candle(df5),
+            bool(br5.get("bear_breakdown")),
+            bool(br15.get("bear_breakdown")),
+            bool(br5.get("bear_attempt")),
+        ]
+        directional_1m = safe_float(df1["close"].iloc[-1]) < safe_float(df1["open"].iloc[-1])
+        directional_5m = safe_float(df5["close"].iloc[-1]) < safe_float(df5["open"].iloc[-1])
 
-        trigger = (
+    trigger_count = sum(bool(x) for x in confirmations)
+    structure_ok = signal.get("structure_1h") in ("BULLISH", "BEARISH", "BULLISH_WEAK", "BEARISH_WEAK")
+    breakout_ok = bool(br5.get("bull_breakout" if side == "LONG" else "bear_breakdown")) or bool(
+        br15.get("bull_breakout" if side == "LONG" else "bear_breakdown")
+    )
 
-            bearish_engulfing(
-                df1
-            )
-
-            or
-
-            bearish_rejection(
-                df1
-            )
-
-            or
-
-            strong_bearish_candle(
-                df1
-            )
-
-            or
-
-            bearish_engulfing(
-                df5
-            )
-
-            or
-
-            bearish_rejection(
-                df5
-            )
-
+    # Kaliteli giriş için en az iki PA teyidi + yönsel mum uyumu gerekir.
+    # Breakout/retest varsa hacim tek başına zorunlu değildir.
+    trigger_score = trigger_count + int(volume_ok) + int(structure_ok) + int(breakout_ok)
+    directional_ok = directional_1m or directional_5m
+    if trigger_count < FINAL_ENTRY_MIN_TRIGGER_SCORE or not directional_ok:
+        logger.info(
+            "ENTRY SKIP | %s | trigger_count=%s directional=%s volume=%.2f breakout=%s",
+            symbol, trigger_count, directional_ok, vol_confirm, breakout_ok
         )
+        return False
 
-        if not trigger:
+    # Sinyal güçlü fakat tam breakout yoksa, en azından skor/structure yeterli olmalı.
+    if not breakout_ok and signal["score"] < 80:
+        logger.info("ENTRY SKIP | %s | breakout yok ve skor yeterli değil: %s", symbol, signal["score"])
+        return False
 
-            logger.info(
-                "ENTRY SKIP | %s | "
-                "final SHORT price action trigger yok",
-                symbol
-            )
-
-            return False
-
+    logger.info(
+        "FINAL ENTRY OK | %s | %s | score=%s | triggers=%s | volume=%.2f | breakout=%s | BTC risk=%.2f",
+        side, symbol, signal["score"], trigger_count, vol_confirm, breakout_ok,
+        signal.get("btc_risk_factor", 1.0)
+    )
     return True
+
 
 
 # ============================================================
@@ -5772,6 +5314,16 @@ def status():
                     position[
                         "target_roi"
                     ] * 100,
+
+                "profit_lock_active":
+                    position.get("profit_lock_active", False),
+
+                "locked_roi":
+                    position.get("locked_roi", 0) * 100,
+
+                "atr":
+                    position.get("atr", 0),
+
 
                 "stop":
                     position[
