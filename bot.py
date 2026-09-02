@@ -140,7 +140,7 @@ MAX_ABS_FUNDING = 0.0015
 
 COOLDOWN_MINUTES = 60
 
-# Likidite ve kayma (slippage) optimizasyonu için hacim ve spread filtreleri sıkılaştırıldı[cite: 5]
+# Likidite ve kayma (slippage) optimizasyonu için hacim and spread filtreleri sıkılaştırıldı[cite: 5]
 MIN_QUOTE_VOLUME = 3_000_000
 
 MAX_SPREAD_PERCENT = 0.12
@@ -3148,28 +3148,62 @@ def calculate_quantity(
 
 
 # ============================================================
-# TARGET ROI (GÜNCELLENDİ)[cite: 5]
+# TARGET ROI (KADEMELİ HEDEF ROI VE LİKİDİTE/EMİR DEFTERİ KONTROLÜ İLE GÜNCELLENDİ)
 # ============================================================
 
 def calculate_target_roi(
     score,
     atr_percent,
-    ticker_percentage
+    ticker_percentage,
+    symbol=None,
+    side=None
 ):
-
+    """
+    İşlem öncesi kademeli hedef ROI hesabı. 
+    Emir defteri (order book) derinliği ve likidite havuzu kontrolüyle dinamik optimize edilir.
+    """
     base_move = max(abs(ticker_percentage) / 100.0, 0.01)
-
     score_factor = score / 100.0
 
-    target = max(0.015, base_move * score_factor * 1.25)
+    # 1. Aşama: Kademeli Hedef ROI Temel Kurgusu
+    if score >= 88:
+        target = max(0.025, base_move * score_factor * 1.5)
+    elif score >= 82:
+        target = max(0.020, base_move * score_factor * 1.35)
+    else:
+        target = max(0.015, base_move * score_factor * 1.20)
 
     if atr_percent >= 2.5:
-
         target += 0.008
 
     if atr_percent >= 4:
-
         target += 0.010
+
+    # 2. Aşama: Emir Defteri ve Likidite Havuzu Kontrolü ile Dinamik Katsayı
+    if symbol and side:
+        try:
+            order_book = exchange.fetch_order_book(symbol, limit=25)
+            bids = order_book.get("bids", [])
+            asks = order_book.get("asks", [])
+            
+            if bids and asks:
+                bid_depth_val = sum([b[1] * b[0] for b in bids])
+                ask_depth_val = sum([a[1] * a[0] for a in asks])
+                
+                if side == "LONG" and bid_depth_val > 0 and ask_depth_val > 0:
+                    liquidity_ratio = bid_depth_val / ask_depth_val
+                    if liquidity_ratio > 1.5:
+                        target *= 1.15 # Alım tarafı baskınsa hedefi kademeli büyüt
+                    elif liquidity_ratio < 0.7:
+                        target *= 0.90 # Likidite daralmasında hedefi realize edilebilir kıl
+                elif side == "SHORT" and bid_depth_val > 0 and ask_depth_val > 0:
+                    liquidity_ratio = ask_depth_val / bid_depth_val
+                    if liquidity_ratio > 1.5:
+                        target *= 1.15
+                    elif liquidity_ratio < 0.7:
+                        target *= 0.90
+        except Exception as e:
+            logger.debug("Calculate target ROI order book check error for %s: %s", symbol, e)
 
     return target
 
@@ -3618,26 +3652,19 @@ def calculate_pnl(
 
 
 # ============================================================
-# UPDATE TRAILING (GÜNCELLENDİ)[cite: 5]
+# UPDATE TRAILING (KADEMELİ HEDEF VE AKILLI TRAILING STOP STRATEJİSİ İLE GÜNCELLENDİ)
 # ============================================================
 
 def update_trailing_stop(
     position,
     current_price
 ):
-
-    side = position[
-        "side"
-    ]
-
-    atr_value = position[
-        "atr"
-    ]
-
-    entry = position[
-        "entry"
-    ]
-
+    """
+    Kademeli hedef ROI seviyelerine göre optimize edilmiş akıllı trailing stop güncellemesi.
+    """
+    side = position["side"]
+    atr_value = position["atr"]
+    entry = position["entry"]
     target_roi = position.get("target_roi", 0.015)
     leverage = position["leverage"]
 
@@ -3646,82 +3673,73 @@ def update_trailing_stop(
         current_price
     )
 
-    position[
-        "current_price"
-    ] = current_price
+    position["current_price"] = current_price
+    position["unrealized_pnl"] = pnl
+    position["unrealized_roi"] = roi
 
-    position[
-        "unrealized_pnl"
-    ] = pnl
-
-    position[
-        "unrealized_roi"
-    ] = roi
-
-    position[
-        "peak_roi"
-    ] = max(
-        position.get(
-            "peak_roi",
-            0
-        ),
+    position["peak_roi"] = max(
+        position.get("peak_roi", 0),
         roi
     )
 
     if side == "LONG":
-
-        position[
-            "highest"
-        ] = max(
-            position[
-                "highest"
-            ],
+        position["highest"] = max(
+            position["highest"],
             current_price
         )
 
-        activation_limit = max(0.025, target_roi * 0.35)
+        # Kademeli ROI Eşiklerine Göre Akıllı Trail Aktivasyonu
+        activation_limit = max(0.02, target_roi * 0.30)
         if roi >= activation_limit:
-            steps_reached = int(roi // 0.008)
-            if steps_reached > 0:
-                step_stop = entry * (1.0 + (steps_reached * 0.008 / leverage))
+            # Kademeli Kar Kilitleme Mekanizması (Multi-tier Step Locking)
+            if roi >= target_roi * 0.85:
+                step_stop = entry * (1.0 + (target_roi * 0.55 / leverage))
                 position["stop_price"] = max(position["stop_price"], step_stop)
+            elif roi >= target_roi * 0.50:
+                step_stop = entry * (1.0 + (target_roi * 0.25 / leverage))
+                position["stop_price"] = max(position["stop_price"], step_stop)
+            else:
+                steps_reached = int(roi // 0.008)
+                if steps_reached > 0:
+                    step_stop = entry * (1.0 + (steps_reached * 0.008 / leverage))
+                    position["stop_price"] = max(position["stop_price"], step_stop)
 
             position["trailing_active"] = True
 
-            dynamic_atr_distance = atr_value * TRAIL_ATR_TIGHT
+            # Volatiliteye Duyarlı Sıkılaştırılmış ATR Trailing Bandı
+            tightness_factor = TRAIL_ATR_TIGHT if roi < target_roi else (TRAIL_ATR_TIGHT * 0.8)
+            dynamic_atr_distance = atr_value * tightness_factor
             dynamic_stop = position["highest"] - dynamic_atr_distance
             position["stop_price"] = max(position["stop_price"], dynamic_stop)
 
     else:
-
-        position[
-            "lowest"
-        ] = min(
-            position[
-                "lowest"
-            ],
+        position["lowest"] = min(
+            position["lowest"],
             current_price
         )
 
-        activation_limit = max(0.025, target_roi * 0.35)
+        activation_limit = max(0.02, target_roi * 0.30)
         if roi >= activation_limit:
-            steps_reached = int(roi // 0.008)
-            if steps_reached > 0:
-                step_stop = entry * (1.0 - (steps_reached * 0.008 / leverage))
+            if roi >= target_roi * 0.85:
+                step_stop = entry * (1.0 - (target_roi * 0.55 / leverage))
                 position["stop_price"] = min(position["stop_price"], step_stop)
+            elif roi >= target_roi * 0.50:
+                step_stop = entry * (1.0 - (target_roi * 0.25 / leverage))
+                position["stop_price"] = min(position["stop_price"], step_stop)
+            else:
+                steps_reached = int(roi // 0.008)
+                if steps_reached > 0:
+                    step_stop = entry * (1.0 - (steps_reached * 0.008 / leverage))
+                    position["stop_price"] = min(position["stop_price"], step_stop)
 
             position["trailing_active"] = True
 
-            dynamic_atr_distance = atr_value * TRAIL_ATR_TIGHT
+            tightness_factor = TRAIL_ATR_TIGHT if roi < target_roi else (TRAIL_ATR_TIGHT * 0.8)
+            dynamic_atr_distance = atr_value * tightness_factor
             dynamic_stop = position["lowest"] + dynamic_atr_distance
             position["stop_price"] = min(position["stop_price"], dynamic_stop)
 
-    position[
-        "last_update"
-    ] = (
-        now_utc()
-        .isoformat()
-    )
+    position["last_update"] = now_utc().isoformat()
 
 
 # ============================================================
@@ -4819,11 +4837,14 @@ def analyze_symbol(
         btc_context
     )
 
+    # Güncellenmiş parametrik hedef ROI hesaplayıcısı
     target_roi = (
         calculate_target_roi(
             score,
             atr_percent,
-            ticker["percentage"]
+            ticker["percentage"],
+            symbol,
+            side
         )
     )
 
