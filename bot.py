@@ -18,11 +18,12 @@ from flask import Flask, jsonify
 #
 # COIN HAVUZU
 #
-# GAINERS  : 10 - 35. sıralar
-# LOSERS   : 10 - 35. sıralar
-# VOLUME   : ilk 25
+# GAINERS  : ilk 50
+# LOSERS   : ilk 50
+# VOLUME   : ilk 50
 #
-# BTC / XAU hariç
+# BTC / XAU işlem evreninden hariç (yalnızca BTC piyasa yönü
+# teyidi ve korelasyon kontrolü için kullanılır)
 #
 # İŞLEM KURALLARI
 #
@@ -165,22 +166,23 @@ MAX_CORRELATED_SIDE = 2
 
 OHLCV_CACHE_SECONDS = 12
 
-MAX_DETAILED_CANDIDATES = 45
+MAX_DETAILED_CANDIDATES = 70
 
 
 # ------------------------------------------------------------
-# COIN POOL
+# COIN POOL  (GENİŞLETİLDİ — YENİ)
 # ------------------------------------------------------------
+# Gainers / Losers / Volume artık ilk 50'şer coini kapsıyor
+# (önceki sürümde gainers/losers 10-35 aralığı, volume ilk 25'ti).
 
-# Gainers / losers 10-35
-RANK_START = 10
-RANK_END = 35
+RANK_START = 1
+RANK_END = 50
 
-# Volume ilk 25
-VOLUME_LIMIT = 25
+# Volume ilk 50
+VOLUME_LIMIT = 50
 
-# Binance'den en az 35 coin çek
-LIST_LIMIT = 35
+# Binance'den en az bu kadar coin çek
+LIST_LIMIT = 50
 
 
 LOG_LEVEL = os.getenv(
@@ -679,10 +681,6 @@ def build_rank_lists(
         tickers.values()
     )
 
-    # --------------------------------------------------------
-    # ÖNCE 35 COINİ SIRALA
-    # --------------------------------------------------------
-
     gainers = sorted(
         data,
         key=lambda x:
@@ -704,11 +702,7 @@ def build_rank_lists(
     )
 
     # --------------------------------------------------------
-    # GAINERS / LOSERS:
-    # 10 - 35
-    #
-    # Yani ilk 25 değil.
-    # 10. sıradan 35. sıraya kadar.
+    # GAINERS / LOSERS: ilk RANK_END (varsayılan 1-50)
     # --------------------------------------------------------
 
     gainers = gainers[
@@ -722,8 +716,7 @@ def build_rank_lists(
     ]
 
     # --------------------------------------------------------
-    # VOLUME:
-    # İLK 25
+    # VOLUME: ilk VOLUME_LIMIT
     # --------------------------------------------------------
 
     volumes = volumes[
@@ -827,7 +820,6 @@ def build_candidate_pool(
                     "volume_rank"
                 ] = actual_rank
 
-    # 10-35 aralığı
     add(
         gainers,
         "GAINER",
@@ -840,7 +832,6 @@ def build_candidate_pool(
         RANK_START - 1
     )
 
-    # İlk 25
     add(
         volumes,
         "VOLUME",
@@ -2036,16 +2027,13 @@ def score_long(
     df1,
     df5,
     df15,
-    df1h
+    df1h,
+    btc_context=None
 ):
 
     score = 0
 
     reasons = []
-
-    # --------------------------------------------------------
-    # 1H MARKET STRUCTURE
-    # --------------------------------------------------------
 
     structure_1h = market_structure(
         df1h
@@ -2081,10 +2069,6 @@ def score_long(
             "1H bearish structure"
         )
 
-    # --------------------------------------------------------
-    # 15M STRUCTURE
-    # --------------------------------------------------------
-
     structure_15 = market_structure(
         df15
     )
@@ -2119,10 +2103,6 @@ def score_long(
             "15M bearish structure"
         )
 
-    # --------------------------------------------------------
-    # 5M STRUCTURE
-    # --------------------------------------------------------
-
     structure_5 = market_structure(
         df5
     )
@@ -2146,10 +2126,6 @@ def score_long(
         reasons.append(
             "5M bullish structure"
         )
-
-    # --------------------------------------------------------
-    # 15M BREAKOUT
-    # --------------------------------------------------------
 
     br15 = breakout_analysis(
         df15,
@@ -2176,10 +2152,6 @@ def score_long(
             "15M breakout attempt"
         )
 
-    # --------------------------------------------------------
-    # 5M BREAKOUT
-    # --------------------------------------------------------
-
     br5 = breakout_analysis(
         df5,
         20
@@ -2204,10 +2176,6 @@ def score_long(
         reasons.append(
             "5M breakout attempt"
         )
-
-    # --------------------------------------------------------
-    # RETEST
-    # --------------------------------------------------------
 
     retest_5 = False
 
@@ -2246,10 +2214,6 @@ def score_long(
         reasons.append(
             "15M breakout retest"
         )
-
-    # --------------------------------------------------------
-    # CANDLE CONFIRMATION
-    # --------------------------------------------------------
 
     if bullish_engulfing(
         df5
@@ -2301,10 +2265,6 @@ def score_long(
             "1M bullish rejection"
         )
 
-    # --------------------------------------------------------
-    # IMPULSE
-    # --------------------------------------------------------
-
     if bullish_impulse(
         df5
     ):
@@ -2315,10 +2275,6 @@ def score_long(
             "5M bullish impulse"
         )
 
-    # --------------------------------------------------------
-    # COMPRESSION
-    # --------------------------------------------------------
-
     if compression_detected(
         df5
     ):
@@ -2328,10 +2284,6 @@ def score_long(
         reasons.append(
             "5M compression"
         )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
 
     volume_ratio = volume_confirmation(
         df5
@@ -2352,10 +2304,6 @@ def score_long(
         reasons.append(
             "Volume confirmation"
         )
-
-    # --------------------------------------------------------
-    # MOVE POSITION
-    # --------------------------------------------------------
 
     position = move_position(
         df5,
@@ -2386,10 +2334,6 @@ def score_long(
             "Long entry too late"
         )
 
-    # --------------------------------------------------------
-    # LATE MOVE PENALTY
-    # --------------------------------------------------------
-
     if late_long_move(
         df5
     ):
@@ -2399,10 +2343,6 @@ def score_long(
         reasons.append(
             "Late long move penalty"
         )
-
-    # --------------------------------------------------------
-    # FAILED BREAKOUT PENALTY
-    # --------------------------------------------------------
 
     if failed_bull_breakout(
         df5,
@@ -2414,10 +2354,6 @@ def score_long(
         reasons.append(
             "Failed bullish breakout"
         )
-
-    # --------------------------------------------------------
-    # 1M FINAL PRICE ACTION
-    # --------------------------------------------------------
 
     last_1m = df1.iloc[-1]
 
@@ -2433,6 +2369,35 @@ def score_long(
             "1M bullish close"
         )
 
+    # --------------------------------------------------------
+    # BTC MARKET CONTEXT  (YENİ)
+    # --------------------------------------------------------
+    # BTC işlem evreninde değildir; yalnızca piyasa yönü teyidi
+    # (context) olarak kullanılır. Sert bir veto DEĞİL, kalite
+    # puanına ekleme/çıkarma yapan bir bağlam modifikatörüdür.
+
+    if btc_context:
+
+        if btc_context["direction"] == "LONG":
+
+            bonus = round(btc_context["strength"] / 100 * 10)
+
+            score += bonus
+
+            reasons.append(
+                f"BTC context destekliyor (+{bonus})"
+            )
+
+        elif btc_context["direction"] == "SHORT":
+
+            penalty = round(btc_context["strength"] / 100 * 10)
+
+            score -= penalty
+
+            reasons.append(
+                f"BTC context ters yönde (-{penalty})"
+            )
+
     return score, reasons
 
 
@@ -2444,16 +2409,13 @@ def score_short(
     df1,
     df5,
     df15,
-    df1h
+    df1h,
+    btc_context=None
 ):
 
     score = 0
 
     reasons = []
-
-    # --------------------------------------------------------
-    # 1H MARKET STRUCTURE
-    # --------------------------------------------------------
 
     structure_1h = market_structure(
         df1h
@@ -2489,10 +2451,6 @@ def score_short(
             "1H bullish structure"
         )
 
-    # --------------------------------------------------------
-    # 15M
-    # --------------------------------------------------------
-
     structure_15 = market_structure(
         df15
     )
@@ -2527,10 +2485,6 @@ def score_short(
             "15M bullish structure"
         )
 
-    # --------------------------------------------------------
-    # 5M
-    # --------------------------------------------------------
-
     structure_5 = market_structure(
         df5
     )
@@ -2554,10 +2508,6 @@ def score_short(
         reasons.append(
             "5M bearish structure"
         )
-
-    # --------------------------------------------------------
-    # 15M BREAKDOWN
-    # --------------------------------------------------------
 
     br15 = breakout_analysis(
         df15,
@@ -2584,10 +2534,6 @@ def score_short(
             "15M breakdown attempt"
         )
 
-    # --------------------------------------------------------
-    # 5M BREAKDOWN
-    # --------------------------------------------------------
-
     br5 = breakout_analysis(
         df5,
         20
@@ -2612,10 +2558,6 @@ def score_short(
         reasons.append(
             "5M breakdown attempt"
         )
-
-    # --------------------------------------------------------
-    # RETEST
-    # --------------------------------------------------------
 
     retest_5 = False
 
@@ -2654,10 +2596,6 @@ def score_short(
         reasons.append(
             "15M breakdown retest"
         )
-
-    # --------------------------------------------------------
-    # CANDLE
-    # --------------------------------------------------------
 
     if bearish_engulfing(
         df5
@@ -2709,10 +2647,6 @@ def score_short(
             "1M bearish rejection"
         )
 
-    # --------------------------------------------------------
-    # IMPULSE
-    # --------------------------------------------------------
-
     if bearish_impulse(
         df5
     ):
@@ -2723,10 +2657,6 @@ def score_short(
             "5M bearish impulse"
         )
 
-    # --------------------------------------------------------
-    # COMPRESSION
-    # --------------------------------------------------------
-
     if compression_detected(
         df5
     ):
@@ -2736,10 +2666,6 @@ def score_short(
         reasons.append(
             "5M compression"
         )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
 
     volume_ratio = volume_confirmation(
         df5
@@ -2760,10 +2686,6 @@ def score_short(
         reasons.append(
             "Volume confirmation"
         )
-
-    # --------------------------------------------------------
-    # MOVE POSITION
-    # --------------------------------------------------------
 
     position = move_position(
         df5,
@@ -2794,10 +2716,6 @@ def score_short(
             "Short entry too late"
         )
 
-    # --------------------------------------------------------
-    # LATE SHORT
-    # --------------------------------------------------------
-
     if late_short_move(
         df5
     ):
@@ -2807,10 +2725,6 @@ def score_short(
         reasons.append(
             "Late short move penalty"
         )
-
-    # --------------------------------------------------------
-    # FAILED BREAKDOWN
-    # --------------------------------------------------------
 
     if failed_bear_breakdown(
         df5,
@@ -2822,10 +2736,6 @@ def score_short(
         reasons.append(
             "Failed bearish breakdown"
         )
-
-    # --------------------------------------------------------
-    # 1M
-    # --------------------------------------------------------
 
     last_1m = df1.iloc[-1]
 
@@ -2840,6 +2750,32 @@ def score_short(
         reasons.append(
             "1M bearish close"
         )
+
+    # --------------------------------------------------------
+    # BTC MARKET CONTEXT  (YENİ)
+    # --------------------------------------------------------
+
+    if btc_context:
+
+        if btc_context["direction"] == "SHORT":
+
+            bonus = round(btc_context["strength"] / 100 * 10)
+
+            score += bonus
+
+            reasons.append(
+                f"BTC context destekliyor (+{bonus})"
+            )
+
+        elif btc_context["direction"] == "LONG":
+
+            penalty = round(btc_context["strength"] / 100 * 10)
+
+            score -= penalty
+
+            reasons.append(
+                f"BTC context ters yönde (-{penalty})"
+            )
 
     return score, reasons
 
@@ -3914,6 +3850,64 @@ def save_closed_trade(
 
 
 # ============================================================
+# POZİSYON KAPANIŞ ÖZETİ  (YENİ)
+# ============================================================
+# Her kapanan pozisyon için: coin, margin, kaldıraç, giriş/çıkış
+# fiyatı, hedeflenen ve gerçekleşen kazanç tek bir kompakt blokta.
+
+def log_position_close_summary(
+    trade
+):
+
+    result = (
+        "KAR"
+        if trade["pnl"] >= 0
+        else "ZARAR"
+    )
+
+    logger.warning(
+        "┌─ POZİSYON KAPANDI [%s] ─────────────────────────",
+        result
+    )
+
+    logger.warning(
+        "│ Coin        : %s (%s)",
+        trade["symbol"],
+        trade["side"]
+    )
+
+    logger.warning(
+        "│ Margin      : $%.2f | Kaldıraç: %sx",
+        trade["margin"],
+        trade["leverage"]
+    )
+
+    logger.warning(
+        "│ Giriş       : %.8f  →  Çıkış: %.8f",
+        trade["entry_price"],
+        trade["exit_price"]
+    )
+
+    logger.warning(
+        "│ Hedef ROI   : %.2f%%  |  Gerçekleşen ROI: %.2f%%  |  Peak: %.2f%%",
+        trade["target_roi_percent"],
+        trade["realized_roi_percent"],
+        trade["peak_roi_percent"]
+    )
+
+    logger.warning(
+        "│ PNL         : $%.4f  |  Süre: %s  |  Sebep: %s",
+        trade["pnl"],
+        trade["duration"],
+        trade["exit_reason"]
+    )
+
+    logger.warning(
+        "└──────────────────────────────────────────────────"
+    )
+
+
+# ============================================================
 # DRY RUN CLOSE
 # ============================================================
 
@@ -3959,25 +3953,8 @@ def dry_run_close(
         symbol
     )
 
-    logger.warning(
-        "DRY RUN EXIT | %s | %s | "
-        "exit=%.8f | PNL=$%.4f | "
-        "ROI=%.2f%% | target=%.2f%% | "
-        "duration=%s | reason=%s",
-        trade["side"],
-        symbol,
-        trade["exit_price"],
-        trade["pnl"],
-        trade[
-            "realized_roi_percent"
-        ],
-        trade[
-            "target_roi_percent"
-        ],
-        trade[
-            "duration"
-        ],
-        reason
+    log_position_close_summary(
+        trade
     )
 
 
@@ -4061,22 +4038,8 @@ def live_close(
             symbol
         )
 
-        logger.warning(
-            "LIVE EXIT | %s | %s | "
-            "ROI=%.2f%% | PNL=$%.4f | "
-            "duration=%s | reason=%s",
-            side,
-            symbol,
-            trade[
-                "realized_roi_percent"
-            ],
-            trade[
-                "pnl"
-            ],
-            trade[
-                "duration"
-            ],
-            reason
+        log_position_close_summary(
+            trade
         )
 
     except Exception as e:
@@ -4247,8 +4210,10 @@ def position_monitor():
 
 
 # ============================================================
-# HOURLY REPORT
+# HOURLY REPORT  (KISA ÖZET — YENİ)
 # ============================================================
+# Uzun, işlem işlem dökülen eski rapor yerine: kaç işlem açıldı,
+# kaçı kârla / kaçı zararla kapandı, net kâr/zarar — tek bakışta.
 
 def generate_hourly_report():
 
@@ -4280,10 +4245,9 @@ def generate_hourly_report():
             trade_history
         )
 
-        open_positions_snapshot = [
-            dict(p)
-            for p in positions.values()
-        ]
+        open_count = len(
+            positions
+        )
 
     hourly_trades = []
 
@@ -4313,50 +4277,6 @@ def generate_hourly_report():
 
             continue
 
-    logger.warning("")
-
-    logger.warning(
-        "╔══════════════════════════════════════════════════════════════════════╗"
-    )
-
-    logger.warning(
-        "║                 SAATLİK İŞLEM ÖZET RAPORU                         ║"
-    )
-
-    logger.warning(
-        "╚══════════════════════════════════════════════════════════════════════╝"
-    )
-
-    logger.warning(
-        "Rapor zamanı : %s",
-        report_time.strftime(
-            "%Y-%m-%d %H:%M:%S UTC"
-        )
-    )
-
-    logger.warning(
-        "Rapor dönemi : %s → %s UTC",
-        previous_hour_start.strftime(
-            "%H:%M"
-        ),
-        previous_hour_end.strftime(
-            "%H:%M"
-        )
-    )
-
-    logger.warning(
-        "DRY RUN      : %s",
-        DRY_RUN
-    )
-
-    logger.warning(
-        "Açık işlem   : %s / %s",
-        len(
-            open_positions_snapshot
-        ),
-        MAX_POSITIONS
-    )
-
     hourly_count = len(
         hourly_trades
     )
@@ -4380,327 +4300,21 @@ def generate_hourly_report():
         in hourly_trades
     )
 
-    hourly_volume = sum(
-        t["notional"]
-        for t
-        in hourly_trades
-    )
-
-    if hourly_count > 0:
-
-        hourly_win_rate = (
-            hourly_wins
-            /
-            hourly_count
-        ) * 100
-
-        avg_hourly_roi = (
-            sum(
-                t[
-                    "realized_roi"
-                ]
-                for t
-                in hourly_trades
-            )
-            /
-            hourly_count
-        ) * 100
-
-        avg_duration = (
-            sum(
-                t[
-                    "duration_seconds"
-                ]
-                for t
-                in hourly_trades
-            )
-            /
-            hourly_count
-        )
-
-    else:
-
-        hourly_win_rate = 0.0
-
-        avg_hourly_roi = 0.0
-
-        avg_duration = 0.0
-
-    logger.warning("")
-
     logger.warning(
-        "SAATLİK ÖZET"
+        "═══ SAATLİK ÖZET | %s → %s UTC ═══",
+        previous_hour_start.strftime("%H:%M"),
+        previous_hour_end.strftime("%H:%M")
     )
 
     logger.warning(
-        "İşlem sayısı       : %s",
-        hourly_count
+        "İşlem: %s açıldı | %s kâr, %s zarar | Net PNL: $%.4f | Açık pozisyon: %s/%s",
+        hourly_count,
+        hourly_wins,
+        hourly_losses,
+        hourly_pnl,
+        open_count,
+        MAX_POSITIONS
     )
-
-    logger.warning(
-        "Kazanan            : %s",
-        hourly_wins
-    )
-
-    logger.warning(
-        "Kaybeden           : %s",
-        hourly_losses
-    )
-
-    logger.warning(
-        "Win rate           : %.2f%%",
-        hourly_win_rate
-    )
-
-    logger.warning(
-        "Saatlik PNL        : $%.4f",
-        hourly_pnl
-    )
-
-    logger.warning(
-        "Saatlik işlem hacmi: $%.2f",
-        hourly_volume
-    )
-
-    logger.warning(
-        "Ortalama ROI       : %.2f%%",
-        avg_hourly_roi
-    )
-
-    logger.warning(
-        "Ortalama süre      : %s",
-        format_duration(
-            avg_duration
-        )
-    )
-
-    logger.warning("")
-
-    logger.warning(
-        "SON SAATTE KAPANAN İŞLEMLER"
-    )
-
-    if not hourly_trades:
-
-        logger.warning(
-            "Son 1 saatte kapanan işlem yok."
-        )
-
-    else:
-
-        for index, trade in enumerate(
-            hourly_trades,
-            start=1
-        ):
-
-            result_symbol = (
-                "KAR"
-                if trade["pnl"] >= 0
-                else "ZARAR"
-            )
-
-            logger.warning("")
-
-            logger.warning(
-                "[%s] %s",
-                index,
-                result_symbol
-            )
-
-            logger.warning(
-                "Coin              : %s",
-                trade["symbol"]
-            )
-
-            logger.warning(
-                "Yön               : %s",
-                trade["side"]
-            )
-
-            logger.warning(
-                "Margin            : $%.2f",
-                trade["margin"]
-            )
-
-            logger.warning(
-                "Kaldıraç          : %sx",
-                trade["leverage"]
-            )
-
-            logger.warning(
-                "İşlem büyüklüğü   : $%.2f",
-                trade["notional"]
-            )
-
-            logger.warning(
-                "Giriş fiyatı      : %.10f",
-                trade["entry_price"]
-            )
-
-            logger.warning(
-                "Çıkış fiyatı      : %.10f",
-                trade["exit_price"]
-            )
-
-            logger.warning(
-                "Hedef ROI         : %.2f%%",
-                trade[
-                    "target_roi_percent"
-                ]
-            )
-
-            logger.warning(
-                "Gerçekleşen ROI   : %.2f%%",
-                trade[
-                    "realized_roi_percent"
-                ]
-            )
-
-            logger.warning(
-                "En yüksek ROI     : %.2f%%",
-                trade[
-                    "peak_roi_percent"
-                ]
-            )
-
-            logger.warning(
-                "PNL               : $%.4f",
-                trade["pnl"]
-            )
-
-            logger.warning(
-                "İşlem süresi      : %s",
-                trade["duration"]
-            )
-
-            logger.warning(
-                "Sinyal skoru      : %s",
-                trade["score"]
-            )
-
-            logger.warning(
-                "Kapanış nedeni    : %s",
-                trade["exit_reason"]
-            )
-
-            logger.warning(
-                "Açılış            : %s",
-                trade["opened_at"]
-            )
-
-            logger.warning(
-                "Kapanış            : %s",
-                trade["closed_at"]
-            )
-
-    logger.warning("")
-
-    logger.warning(
-        "HALEN AÇIK POZİSYONLAR"
-    )
-
-    if not open_positions_snapshot:
-
-        logger.warning(
-            "Açık pozisyon yok."
-        )
-
-    else:
-
-        for p in open_positions_snapshot:
-
-            current_pnl = (
-                p[
-                    "unrealized_pnl"
-                ]
-            )
-
-            current_roi = (
-                p[
-                    "unrealized_roi"
-                ] * 100
-            )
-
-            logger.warning("")
-
-            logger.warning(
-                "Coin            : %s",
-                p["symbol"]
-            )
-
-            logger.warning(
-                "Yön             : %s",
-                p["side"]
-            )
-
-            logger.warning(
-                "Margin          : $%.2f",
-                p["margin"]
-            )
-
-            logger.warning(
-                "Leverage        : %sx",
-                p["leverage"]
-            )
-
-            logger.warning(
-                "Giriş           : %.10f",
-                p["entry"]
-            )
-
-            logger.warning(
-                "Son fiyat       : %.10f",
-                p["current_price"]
-            )
-
-            logger.warning(
-                "Hedef ROI       : %.2f%%",
-                p["target_roi"] * 100
-            )
-
-            logger.warning(
-                "Anlık ROI       : %.2f%%",
-                current_roi
-            )
-
-            logger.warning(
-                "Anlık PNL       : $%.4f",
-                current_pnl
-            )
-
-            logger.warning(
-                "Peak ROI        : %.2f%%",
-                p["peak_roi"] * 100
-            )
-
-            logger.warning(
-                "Trailing aktif  : %s",
-                p["trailing_active"]
-            )
-
-            logger.warning(
-                "Stop            : %.10f",
-                p["stop_price"]
-            )
-
-            opened = datetime.fromisoformat(
-                p["opened_at"]
-            )
-
-            open_duration = (
-                report_time - opened
-            ).total_seconds()
-
-            logger.warning(
-                "Açık kalma süresi: %s",
-                format_duration(
-                    open_duration
-                )
-            )
-
-    # --------------------------------------------------------
-    # GENEL İSTATİSTİK
-    # --------------------------------------------------------
 
     total_trades = (
         stats["wins"]
@@ -4708,98 +4322,18 @@ def generate_hourly_report():
         stats["losses"]
     )
 
-    if total_trades > 0:
-
-        total_win_rate = (
-            stats["wins"]
-            /
-            total_trades
-        ) * 100
-
-        avg_trade_duration = (
-            stats[
-                "total_trade_seconds"
-            ]
-            /
-            total_trades
-        )
-
-    else:
-
-        total_win_rate = 0.0
-
-        avg_trade_duration = 0.0
-
-    logger.warning("")
-
-    logger.warning(
-        "TOPLAM BOT İSTATİSTİĞİ"
+    total_win_rate = (
+        (stats["wins"] / total_trades * 100)
+        if total_trades > 0
+        else 0.0
     )
 
     logger.warning(
-        "Toplam kapanan işlem : %s",
-        total_trades
+        "TOPLAM (bot başlangıcından beri): %s işlem | win rate %.1f%% | net PNL $%.4f",
+        total_trades,
+        total_win_rate,
+        stats["total_realized_pnl"]
     )
-
-    logger.warning(
-        "Toplam kazanan       : %s",
-        stats["wins"]
-    )
-
-    logger.warning(
-        "Toplam kaybeden      : %s",
-        stats["losses"]
-    )
-
-    logger.warning(
-        "Toplam win rate      : %.2f%%",
-        total_win_rate
-    )
-
-    logger.warning(
-        "Toplam gerçekleşen PNL: $%.4f",
-        stats[
-            "total_realized_pnl"
-        ]
-    )
-
-    logger.warning(
-        "Toplam işlem hacmi   : $%.2f",
-        stats[
-            "total_volume"
-        ]
-    )
-
-    logger.warning(
-        "Ort. işlem süresi    : %s",
-        format_duration(
-            avg_trade_duration
-        )
-    )
-
-    logger.warning(
-        "Toplam tarama        : %s",
-        stats["scans"]
-    )
-
-    logger.warning(
-        "Toplam sinyal        : %s",
-        stats["signals"]
-    )
-
-    logger.warning(
-        "╔══════════════════════════════════════════════════════════════════════╗"
-    )
-
-    logger.warning(
-        "║                       RAPOR SONU                                   ║"
-    )
-
-    logger.warning(
-        "╚══════════════════════════════════════════════════════════════════════╝"
-    )
-
-    logger.warning("")
 
 
 # ============================================================
@@ -4876,11 +4410,161 @@ def hourly_report_loop():
 
 
 # ============================================================
+# BTC MARKET CONTEXT  (YENİ)
+# ============================================================
+# BTC işlem evreninden tamamen hariç tutulur (valid_symbol zaten
+# banned listesinde tutuyor). Burada BTC SADECE piyasa yönü
+# teyidi (context) ve korelasyon kontrolü için kullanılır — asla
+# doğrudan işlem adayı olmaz.
+
+BTC_SYMBOL = "BTC/USDT"
+
+CORRELATION_MAX_ALLOWED = 0.85
+
+_btc_context_cache = {
+    "timestamp": 0,
+    "context": {"direction": "NEUTRAL", "strength": 0},
+}
+
+BTC_CONTEXT_CACHE_SECONDS = 30
+
+
+def compute_btc_context():
+    """BTC 1H market structure + kısa vadeli impulse'a göre basit
+    bir 'piyasa yönü' bağlamı üretir. Sert bir veto değildir —
+    score_long/score_short içinde küçük bir bonus/penalty olarak
+    kullanılır."""
+
+    df1h = fetch_ohlcv_cached(
+        BTC_SYMBOL,
+        TIMEFRAME_TREND,
+        220
+    )
+
+    df15 = fetch_ohlcv_cached(
+        BTC_SYMBOL,
+        TIMEFRAME_CONFIRM,
+        220
+    )
+
+    if df1h is None or df15 is None:
+        return {"direction": "NEUTRAL", "strength": 0}
+
+    structure_1h = market_structure(df1h)
+
+    direction = "NEUTRAL"
+    strength = 0
+
+    if structure_1h["structure"] == "BULLISH":
+        direction = "LONG"
+        strength = 70
+    elif structure_1h["structure"] == "BULLISH_WEAK":
+        direction = "LONG"
+        strength = 35
+    elif structure_1h["structure"] == "BEARISH":
+        direction = "SHORT"
+        strength = 70
+    elif structure_1h["structure"] == "BEARISH_WEAK":
+        direction = "SHORT"
+        strength = 35
+
+    if direction == "LONG" and bullish_impulse(df15):
+        strength = min(100, strength + 20)
+    elif direction == "SHORT" and bearish_impulse(df15):
+        strength = min(100, strength + 20)
+
+    return {"direction": direction, "strength": strength}
+
+
+def get_btc_context():
+    """BTC context'i her sembol için değil, tarama döngüsü başına
+    bir kez hesaplayıp kısa süreliğine cache'ler (gereksiz API
+    yükünü azaltmak için)."""
+
+    current = time.time()
+
+    if (
+        current - _btc_context_cache["timestamp"]
+        < BTC_CONTEXT_CACHE_SECONDS
+    ):
+        return _btc_context_cache["context"]
+
+    try:
+        context = compute_btc_context()
+    except Exception as e:
+        logger.warning("BTC context hesaplanamadı: %s", e)
+        context = {"direction": "NEUTRAL", "strength": 0}
+
+    _btc_context_cache["timestamp"] = current
+    _btc_context_cache["context"] = context
+
+    return context
+
+
+# ============================================================
+# KORELASYON KONTROLÜ  (YENİ)
+# ============================================================
+# BTC ve açık pozisyonlarla yüksek korelasyonlu yeni işlem
+# açılmasını engeller — aynı hareketin tekrar tekrar
+# fiyatlanmasını önlemeye çalışır.
+
+def get_recent_returns(symbol, timeframe="1h", n=30):
+    try:
+        df = fetch_ohlcv_cached(symbol, timeframe, n + 5)
+        if df is None or len(df) < n:
+            return None
+        closes = df["close"].tail(n).values
+        returns = np.diff(closes) / closes[:-1]
+        return returns
+    except Exception:
+        return None
+
+
+def is_correlation_blocked(symbol):
+    """Aday, açık pozisyonlardan biriyle çok yüksek korelasyonlu
+    mu? (Aynı BTC hareketine bağımlı çoklu pozisyon açmayı önlemek
+    için.)"""
+
+    candidate_returns = get_recent_returns(symbol)
+
+    if candidate_returns is None:
+        return False
+
+    with state_lock:
+        open_symbols = list(positions.keys())
+
+    for open_symbol in open_symbols:
+
+        if open_symbol == symbol:
+            continue
+
+        other_returns = get_recent_returns(open_symbol)
+
+        if other_returns is None or len(other_returns) != len(candidate_returns):
+            continue
+
+        try:
+            corr = np.corrcoef(candidate_returns, other_returns)[0, 1]
+        except Exception:
+            continue
+
+        if not math.isnan(corr) and corr >= CORRELATION_MAX_ALLOWED:
+            logger.info(
+                "KORELASYON RED | %s açık pozisyon %s ile yüksek korelasyonlu (%.2f)",
+                symbol, open_symbol, corr
+            )
+            return True
+
+    return False
+
+
+# ============================================================
 # ANALYZE SYMBOL
 # ============================================================
 
 def analyze_symbol(
-    candidate
+    candidate,
+    btc_context=None
 ):
 
     symbol = candidate[
@@ -4896,13 +4580,6 @@ def analyze_symbol(
     ticker = candidate[
         "ticker"
     ]
-
-    # --------------------------------------------------------
-    # FUNDING KORUMASI
-    #
-    # Bu fiyat analizi değildir.
-    # Mevcut işlem güvenlik kuralı korunmuştur.
-    # --------------------------------------------------------
 
     funding = get_funding(
         symbol
@@ -4921,10 +4598,6 @@ def analyze_symbol(
         )
 
         return None
-
-    # --------------------------------------------------------
-    # OHLCV
-    # --------------------------------------------------------
 
     df1 = fetch_ohlcv_cached(
         symbol,
@@ -4984,12 +4657,6 @@ def analyze_symbol(
 
         return None
 
-    # --------------------------------------------------------
-    # ATR SADECE POZİSYON STOP YÖNETİMİ İÇİN
-    #
-    # SİNYAL ÜRETİMİNDE KULLANILMIYOR.
-    # --------------------------------------------------------
-
     true_range = pd.concat(
         [
             df5["high"]
@@ -5030,16 +4697,13 @@ def analyze_symbol(
         price
     ) * 100
 
-    # --------------------------------------------------------
-    # PURE PRICE ACTION
-    # --------------------------------------------------------
-
     long_score, long_reasons = (
         score_long(
             df1,
             df5,
             df15,
-            df1h
+            df1h,
+            btc_context
         )
     )
 
@@ -5048,7 +4712,8 @@ def analyze_symbol(
             df1,
             df5,
             df15,
-            df1h
+            df1h,
+            btc_context
         )
     )
 
@@ -5057,10 +4722,6 @@ def analyze_symbol(
     score = 0
 
     reasons = []
-
-    # --------------------------------------------------------
-    # SIDE SELECTION
-    # --------------------------------------------------------
 
     if (
         long_score
@@ -5102,12 +4763,6 @@ def analyze_symbol(
 
         return None
 
-    # --------------------------------------------------------
-    # EXTREME 24H MOVE KORUMASI
-    #
-    # Mevcut işlem mantığındaki koruma korunmuştur.
-    # --------------------------------------------------------
-
     if side == "LONG":
 
         if ticker[
@@ -5125,17 +4780,16 @@ def analyze_symbol(
             return None
 
     # --------------------------------------------------------
-    # LEVERAGE
+    # KORELASYON KONTROLÜ  (YENİ)
     # --------------------------------------------------------
+
+    if is_correlation_blocked(symbol):
+        return None
 
     leverage = choose_leverage(
         score,
         atr_percent
     )
-
-    # --------------------------------------------------------
-    # TARGET
-    # --------------------------------------------------------
 
     target_roi = (
         calculate_target_roi(
@@ -5143,10 +4797,6 @@ def analyze_symbol(
             atr_percent
         )
     )
-
-    # --------------------------------------------------------
-    # PRICE ACTION DIAGNOSTICS
-    # --------------------------------------------------------
 
     structure_1h = market_structure(
         df1h
@@ -5255,7 +4905,8 @@ def analyze_symbol(
 # ============================================================
 
 def find_best_signal(
-    candidates
+    candidates,
+    btc_context=None
 ):
 
     ranked = []
@@ -5296,7 +4947,8 @@ def find_best_signal(
         try:
 
             result = analyze_symbol(
-                candidate
+                candidate,
+                btc_context
             )
 
             if result:
@@ -5398,10 +5050,6 @@ def final_entry_validation(
 
         return False
 
-    # --------------------------------------------------------
-    # FRESH PRICE
-    # --------------------------------------------------------
-
     try:
 
         ticker = exchange.fetch_ticker(
@@ -5432,9 +5080,6 @@ def final_entry_validation(
             original
         )
 
-        # Fiyat analizden sonra %1.2'den fazla kaçtıysa
-        # peşinden koşma.
-
         if move > 0.012:
 
             logger.info(
@@ -5455,10 +5100,6 @@ def final_entry_validation(
 
         return False
 
-    # --------------------------------------------------------
-    # SON PRICE ACTION TRIGGER
-    # --------------------------------------------------------
-
     df1 = fetch_ohlcv_cached(
         symbol,
         TIMEFRAME_FAST,
@@ -5478,10 +5119,6 @@ def final_entry_validation(
     ):
 
         return False
-
-    # --------------------------------------------------------
-    # LONG FINAL TRIGGER
-    # --------------------------------------------------------
 
     if side == "LONG":
 
@@ -5526,10 +5163,6 @@ def final_entry_validation(
             )
 
             return False
-
-    # --------------------------------------------------------
-    # SHORT FINAL TRIGGER
-    # --------------------------------------------------------
 
     else:
 
@@ -5703,36 +5336,29 @@ def scan_cycle():
         tickers
     )
 
-    # --------------------------------------------------------
-    # GAINERS 10-35
-    # --------------------------------------------------------
-
     logger.info(
-        "GAINERS 10-35: %s",
+        "GAINERS %s-%s: %s",
+        RANK_START,
+        RANK_END,
         [
             x["symbol"]
             for x in gainers
         ]
     )
 
-    # --------------------------------------------------------
-    # LOSERS 10-35
-    # --------------------------------------------------------
-
     logger.info(
-        "LOSERS 10-35: %s",
+        "LOSERS %s-%s: %s",
+        RANK_START,
+        RANK_END,
         [
             x["symbol"]
             for x in losers
         ]
     )
 
-    # --------------------------------------------------------
-    # VOLUME 1-25
-    # --------------------------------------------------------
-
     logger.info(
-        "24H VOLUME 1-25: %s",
+        "24H VOLUME 1-%s: %s",
+        VOLUME_LIMIT,
         [
             x["symbol"]
             for x in volumes
@@ -5759,15 +5385,29 @@ def scan_cycle():
     ):
 
         logger.info(
-            "2 pozisyon zaten açık. "
-            "Yeni işlem aranmayacak."
+            "%s pozisyon zaten açık. "
+            "Yeni işlem aranmayacak.",
+            MAX_POSITIONS
         )
 
         return
 
+    # --------------------------------------------------------
+    # BTC MARKET CONTEXT — döngü başına bir kez  (YENİ)
+    # --------------------------------------------------------
+
+    btc_context = get_btc_context()
+
+    logger.info(
+        "BTC CONTEXT | yön=%s | güç=%s",
+        btc_context["direction"],
+        btc_context["strength"]
+    )
+
     signals = (
         find_best_signal(
-            candidates
+            candidates,
+            btc_context
         )
     )
 
@@ -5815,10 +5455,6 @@ def scan_cycle():
                 "sources"
             ]
         )
-
-    # --------------------------------------------------------
-    # EN İYİLERDEN BAŞLA
-    # --------------------------------------------------------
 
     for signal in signals:
 
@@ -5880,19 +5516,24 @@ def bot_loop():
     )
 
     logger.warning(
-        "GAINERS = 10-35"
+        "GAINERS = %s-%s",
+        RANK_START,
+        RANK_END
     )
 
     logger.warning(
-        "LOSERS = 10-35"
+        "LOSERS = %s-%s",
+        RANK_START,
+        RANK_END
     )
 
     logger.warning(
-        "24H VOLUME = 1-25"
+        "24H VOLUME = 1-%s",
+        VOLUME_LIMIT
     )
 
     logger.warning(
-        "SIGNAL ENGINE = PURE PRICE ACTION"
+        "SIGNAL ENGINE = PURE PRICE ACTION + BTC CONTEXT"
     )
 
     logger.warning(
@@ -5983,16 +5624,16 @@ def home():
             MAX_LEVERAGE,
 
         "gainers_range":
-            "10-35",
+            f"{RANK_START}-{RANK_END}",
 
         "losers_range":
-            "10-35",
+            f"{RANK_START}-{RANK_END}",
 
         "volume_range":
-            "1-25",
+            f"1-{VOLUME_LIMIT}",
 
         "signal_engine":
-            "PURE_PRICE_ACTION",
+            "PURE_PRICE_ACTION + BTC_CONTEXT",
 
         "last_scan":
             last_scan_time,
@@ -6095,18 +5736,18 @@ def status():
             DRY_RUN,
 
         "signal_engine":
-            "PURE_PRICE_ACTION",
+            "PURE_PRICE_ACTION + BTC_CONTEXT",
 
         "coin_pool": {
 
             "gainers":
-                "10-35",
+                f"{RANK_START}-{RANK_END}",
 
             "losers":
-                "10-35",
+                f"{RANK_START}-{RANK_END}",
 
             "volume":
-                "1-25",
+                f"1-{VOLUME_LIMIT}",
         },
 
         "positions":
@@ -6170,10 +5811,6 @@ def health():
 
 def start_background_bot():
 
-    # --------------------------------------------------------
-    # POZİSYON MONITOR
-    # --------------------------------------------------------
-
     monitor = threading.Thread(
         target=position_monitor,
         daemon=True,
@@ -6182,10 +5819,6 @@ def start_background_bot():
 
     monitor.start()
 
-    # --------------------------------------------------------
-    # ANALYSIS LOOP
-    # --------------------------------------------------------
-
     bot = threading.Thread(
         target=bot_loop,
         daemon=True,
@@ -6193,10 +5826,6 @@ def start_background_bot():
     )
 
     bot.start()
-
-    # --------------------------------------------------------
-    # HOURLY REPORT
-    # --------------------------------------------------------
 
     report = threading.Thread(
         target=hourly_report_loop,
