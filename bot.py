@@ -62,6 +62,10 @@ from flask import Flask, jsonify
 #   Continuation[cite: 5]
 #   Volume confirmation[cite: 5]
 #   Move position / exhaustion[cite: 5]
+#   Regression Channel[cite: 5]
+#   Candle Confirmation[cite: 5]
+#   ATR-Band Control[cite: 5]
+#   Order Book & Liquidity Pool[cite: 5]
 #
 # KULLANILMAYANLAR:
 #
@@ -1033,6 +1037,76 @@ def candle_stats(
                 lower_wick
             ),
     }
+
+
+# ============================================================
+# YENİ ÖZELLİK: REGRESYON KANALI, MUM TEYİDİ, ATR-BAND VE LİKİDİTE
+# ============================================================
+
+def regression_channel_direction(df, period=50):
+    if df is None or len(df) < period:
+        return "NEUTRAL", 0.0
+    sub = df.tail(period).reset_index(drop=True)
+    y = sub["close"].values
+    x = np.arange(len(y))
+    slope, intercept = np.polyfit(x, y, 1)
+    price_range = y.max() - y.min()
+    if price_range == 0:
+        return "NEUTRAL", 0.0
+    normalized_slope = (slope * len(y)) / price_range
+    if slope > 0 and normalized_slope > 0.03:
+        return "BULLISH", slope
+    elif slope < 0 and normalized_slope < -0.03:
+        return "BEARISH", slope
+    return "NEUTRAL", slope
+
+
+def advanced_candle_confirmation(df):
+    if df is None or len(df) < 5:
+        return False, False
+    c1 = df.iloc[-1]
+    c2 = df.iloc[-2]
+    s1 = candle_stats(c1)
+    s2 = candle_stats(c2)
+    bullish = (c1["close"] > c1["open"] and s1["body_ratio"] > 0.50 and c1["close"] >= c2["close"])
+    bearish = (c1["close"] < c1["open"] and s1["body_ratio"] > 0.50 and c1["close"] <= c2["close"])
+    return bullish, bearish
+
+
+def atr_band_expansion_check(df, period=20):
+    if df is None or len(df) < period + 5:
+        return True
+    high_low = df["high"] - df["low"]
+    atr = high_low.rolling(window=period).mean()
+    current_atr = atr.iloc[-1]
+    avg_atr = atr.iloc[-period:].mean()
+    if avg_atr <= 0:
+        return True
+    ratio = current_atr / avg_atr
+    if ratio > 2.5:
+        return False
+    return True
+
+
+def check_order_book_liquidity(symbol, side, depth=20):
+    try:
+        order_book = exchange.fetch_order_book(symbol, limit=depth)
+        bids = order_book.get("bids", [])
+        asks = order_book.get("asks", [])
+        
+        bid_liquidity = sum([bid[1] * bid[0] for bid in bids])
+        ask_liquidity = sum([ask[1] * ask[0] for ask in asks])
+        
+        if bid_liquidity <= 0 or ask_liquidity <= 0:
+            return True
+            
+        if side == "LONG" and bid_liquidity < ask_liquidity * 0.4:
+            return False
+        if side == "SHORT" and ask_liquidity < bid_liquidity * 0.4:
+            return False
+        return True
+    except Exception:
+        return True
 
 
 # ============================================================
@@ -2128,6 +2202,21 @@ def score_long(
             "5M bullish structure"
         )
 
+    # Regresyon Kanalı Teyidi
+    reg_dir, _ = regression_channel_direction(df15, 50)
+    if reg_dir == "BULLISH":
+        score += 8
+        reasons.append("Regression channel bullish confirmation")
+    elif reg_dir == "BEARISH":
+        score -= 8
+        reasons.append("Regression channel bearish contradiction")
+
+    # Gelişmiş Mum Teyidi
+    adv_bull, _ = advanced_candle_confirmation(df5)
+    if adv_bull:
+        score += 6
+        reasons.append("Advanced candle confirmation bullish")
+
     br15 = breakout_analysis(
         df15,
         20
@@ -2506,6 +2595,21 @@ def score_short(
         reasons.append(
             "5M bearish structure"
         )
+
+    # Regresyon Kanalı Teyidi
+    reg_dir, _ = regression_channel_direction(df15, 50)
+    if reg_dir == "BEARISH":
+        score += 8
+        reasons.append("Regression channel bearish confirmation")
+    elif reg_dir == "BULLISH":
+        score -= 8
+        reasons.append("Regression channel bullish contradiction")
+
+    # Gelişmiş Mum Teyidi
+    _, adv_bear = advanced_candle_confirmation(df5)
+    if adv_bear:
+        score += 6
+        reasons.append("Advanced candle confirmation bearish")
 
     br15 = breakout_analysis(
         df15,
@@ -4564,6 +4668,11 @@ def analyze_symbol(
 
         return None
 
+    # Volatilite / Genişleme (ATR-Band) Kontrolü
+    if not atr_band_expansion_check(df5):
+        logger.info("SKIP ATR-BAND | %s | Volatilite bant genişlemesi aşırı/kaotik", symbol)
+        return None
+
     price = safe_float(
         ticker[
             "last"
@@ -4697,6 +4806,11 @@ def analyze_symbol(
             return None
 
     if is_correlation_blocked(symbol):
+        return None
+
+    # Likidite Havuzu / Emir Değeri Kontrolü
+    if not check_order_book_liquidity(symbol, side):
+        logger.info("SKIP ORDER BOOK | %s | %s yönünde emir defteri likiditesi yetersiz", symbol, side)
         return None
 
     leverage = choose_leverage(
