@@ -122,27 +122,33 @@ class StrategyEngine:
         nearest_resistance = max(highs[-20:])
         nearest_support = min(lows[-20:])
         
+        # 1. Kazanç Alanı (Runway) Kontrolü: En az %1 ve üzeri olmalı (5x kaldıraç ile en az %5 ROI)
         distance_to_res_pct = (nearest_resistance - last_close) / last_close * 100
-        
-        if distance_to_res_pct < 0.4:
+        if distance_to_res_pct < 1.0:
             return {"action": "SKIP_TIGHT_RUNWAY"}
 
         btc_risk = self.evaluate_btc_risk_factor()
 
+        # Dengeli SL ve TP Kurulumu
         sl = nearest_support * (1 - 0.005 * btc_risk)
-        tp = last_close + (nearest_resistance - last_close) * 1.2
+        tp = nearest_resistance
 
         risk_distance = last_close - sl
         reward_distance = tp - last_close
 
-        if reward_distance <= 0 or (risk_distance / reward_distance) > 0.5:
+        # Güvenlik Kontrolü: Giriş fiyatı hatalı seviyedeyse pas geç
+        if risk_distance <= 0 or reward_distance <= 0:
+            return {"action": "SKIP_INVALID_PRICES"}
+
+        # 2. Risk / Ödül Oranı Kuralı: Risk, hedef kazancın (ödülün) %50'sini aşamaz (Reward >= 2 * Risk)
+        if (risk_distance / reward_distance) > 0.5:
             return {"action": "SKIP_RISK_REWARD_VIOLATION"}
 
         decision_explanation = (
             f"İşlem Kararı [LONG]: {self.symbol} paritesinde 4H makro trend uyumlu, "
             f"1H kurulum ve 15M momentum tetiklendi. Giriş Fiyatı: {last_close:.4f}, "
             f"Stop-Loss: {sl:.4f}, Dinamik Hedef (TP): {tp:.4f}. "
-            f"Kazanç Alanı (Runway): %{distance_to_res_pct:.2f} | Risk/Ödül Oranı Kuralı Sağlandı."
+            f"Kazanç Alanı (Runway): %{distance_to_res_pct:.2f} | Risk/Ödül Oranı Kuralı Sağlandı (<= %50)."
         )
 
         return {
@@ -166,7 +172,7 @@ async def main():
 
     try:
         while True:
-            # 1. Aktif İşlem Takibi, Aktif Süpürme Kontrolü ve Kademeli Trailing Stop Yönetimi
+            # 1. Aktif İşlem Takibi, Süpürme Kontrolü ve Kademeli Trailing Stop Yönetimi
             current_symbols = list(active_trades.keys())
             for symbol in current_symbols:
                 current_price = await exchange.get_current_price(symbol)
@@ -175,7 +181,7 @@ async def main():
                 
                 trade = active_trades[symbol]
                 
-                # Anlık 15m verilerini çekerek aktif süpürme ve yapı kontrolü yapalım
+                # Anlık 15m verileriyle yapısal kontrol ve süpürme denetimi
                 df_exec_live = await exchange.fetch_ohlcv(symbol, settings.EXEC_TF, 30)
                 if not df_exec_live.empty:
                     recent_lows = df_exec_live['low'].values
@@ -185,7 +191,7 @@ async def main():
                     
                     # Dinamik Hedef Güncellemesi (Fiyat yeni direnç kırdıkça TP'yi yukarı kaydır)
                     if active_resistance > trade['tp']:
-                        trade['tp'] = active_resistance * 1.05
+                        trade['tp'] = active_resistance
                         logger.info(f"🚀 [DİNAMİK TP GÜNCELLEMESİ] {symbol} yeni direnç kırıldı. Yeni TP: {trade['tp']:.4f}")
 
                     # Aktif Süpürme Kontrolü: Fiyat ani bir şekilde ana desteğin altına iğne atıp süpürürse erken koruma
@@ -203,7 +209,7 @@ async def main():
                     trade['sl'] = trade['price']
                     logger.success(f"🛡️ [BREAKEVEN KİLİDİ] {symbol} kaldıraçlı %15 kâr aşıldı. Stop-Loss giriş seviyesine taşındı: {trade['sl']:.4f}")
 
-                # 2. Aşama: Kaldıraçlı kâr %30'u (Saf %6) geçtiyse Stop-Loss'u kârda tutacak şekilde yukarı kilitle
+                # 2. Aşama: Kaldıraçlı kâr %30'u (Saf %6) geçtiyse Stop-Loss'u karlı bölgeye taşı
                 elif pnl_pct >= 30.0 and trade['sl'] < trade['price'] * 1.015:
                     trade['sl'] = trade['price'] * 1.015
                     logger.success(f"🔒 [KÂR KİLİTLEME TRAILING] {symbol} kaldıraçlı %30 kâr aşıldı. Stop-Loss karlı bölgeye taşındı: {trade['sl']:.4f}")
