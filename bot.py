@@ -38,7 +38,6 @@ settings = Settings()
 # ==========================================
 class BinanceExchange:
     def __init__(self):
-        # Dry-run modundaysak imza hatası (-1022) almamak için anahtarları boş geçiyoruz
         api_key = settings.BINANCE_API_KEY if not settings.DRY_RUN else ""
         secret_key = settings.BINANCE_SECRET_KEY if not settings.DRY_RUN else ""
         
@@ -199,6 +198,11 @@ async def main():
                         f"----------------------------------------"
                     )
                     del active_trades[symbol]
+
+            # Eğer aktif işlem varsa döngü başı/sonu sade bir durum özeti geçelim
+            if active_trades:
+                status_msg = " | ".join([f"{s} (Giriş: {t['price']}, TP: {t['tp']}, SL: {t['sl']})" for s, t in active_trades.items()])
+                logger.info(f"📈 Aktif Pozisyonlar Takibi -> {status_msg}")
 
             # 2. Yeni Tarama Döngüsü
             pool = await exchange.get_dynamic_pool()
