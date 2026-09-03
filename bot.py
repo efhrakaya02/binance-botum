@@ -27,6 +27,19 @@ from flask import Flask, jsonify
 # Signal engine uses RAW OHLC only. No EMA/RSI/MACD/ADX/BB/etc.
 # ATR is used ONLY for post-entry protection/trailing.
 # ============================================================
+# FIXES (this revision):
+#  - trigger(d1) in pa_engine() was missing the 'side' arg -> crashed every
+#    analyze()/monitor() call (TypeError, silently swallowed by outer except).
+#  - liq_engine() used "with oblock.acquire():" (bool, not a context manager)
+#    -> crashed every call and leaked the lock. Now "with oblock:".
+#  - Removed a dead duplicate leverage() definition.
+#  - Hardened breach_age against a rare UnboundLocalError.
+#  - Added real exchange-side STOP_MARKET reduceOnly protective orders
+#    (placed on entry, synced as the trailing stop moves, cancelled on
+#    close) so a position stays protected even if this process stalls.
+#  - Added a single-line, low-frequency HEARTBEAT log (every
+#    POSITION_SUMMARY_INTERVAL sec) instead of adding per-tick log noise.
+# ============================================================
 
 DRY_RUN=os.getenv("DRY_RUN","true").lower()=="true"
 API_KEY=os.getenv("BINANCE_API_KEY",""); API_SECRET=os.getenv("BINANCE_API_SECRET","")
@@ -56,6 +69,12 @@ TIME_WARN=25; TIME_EXIT=90; EMERGENCY_ROI=-.35
 POSITIVE_HOLD_SCORE=62; MOMENTUM_HOLD_STATES=("STRONG_ACCELERATING","STRONG","BUILDING")
 MAX_HISTORY=1000; REPORT_INTERVAL=5
 
+# Exchange-side protective stop (safety net if the app itself stalls/crashes)
+STOP_ORDER_MIN_UPDATE_PCT=0.05  # only replace the resting stop order if it moves >= this % (avoids order spam)
+
+# Low-noise periodic activity summary (does not add per-tick log lines)
+POSITION_SUMMARY_INTERVAL=60
+
 logging.basicConfig(level=getattr(logging,os.getenv("LOG_LEVEL","INFO").upper(),logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
 log=logging.getLogger("PA_ORDERFLOW_BOT")
@@ -64,7 +83,7 @@ ex=ccxt.binance({"apiKey":API_KEY,"secret":API_SECRET,"enableRateLimit":True,
                  "options":{"defaultType":"future","adjustForTimeDifference":True}})
 lock=threading.RLock(); oblock=threading.RLock()
 positions={}; cooldowns={}; cache={}; obstate={}; history=[]
-last_scan=None; last_report_hour=None; started=datetime.now(timezone.utc).isoformat()
+last_scan=None; last_report_hour=None; last_heartbeat=0.0; started=datetime.now(timezone.utc).isoformat()
 stats={"scans":0,"signals":0,"entries":0,"exits":0,"wins":0,"losses":0,
        "realized_pnl":0.0,"volume":0.0,"trade_seconds":0.0}
 
@@ -250,7 +269,7 @@ def pa_engine(side,d1,d5,d15,d1h,d4h=None):
     if s15==wanted: score+=8; rs.append(f"15M {wanted} structure")
     elif s15=="RANGE": score+=4; rs.append("15M range")
     else: ws.append("15M opposing structure")
-    b,bl=breakout(d5,side); r,rl=retest(d5,side); tr,tq=trigger(d1)
+    b,bl=breakout(d5,side); r,rl=retest(d5,side); tr,tq=trigger(d1,side)
     if b: score+=7; rs.append(f"5M fresh breakout @ {bl:.8g}")
     if r: score+=6; rs.append(f"5M breakout-retest held @ {rl:.8g}")
     if s5==wanted: score+=4; rs.append("5M structure aligned")
@@ -303,7 +322,7 @@ def restbook(s):
     except:return None
 
 def liq_engine(s,side,price):
-    with oblock.acquire():
+    with oblock:
         st=obstate.get(s,{}); ob=st.get("book") if time.time()-st.get("ts",0)<2.5 else None
     if ob is None: ob=restbook(s)
     if not ob or not ob["bids"] or not ob["asks"]:
@@ -378,9 +397,6 @@ def qty(s,price,lev):
         q=f(ex.amount_to_precision(s,q)); mn=f(m.get("limits",{}).get("amount",{}).get("min"))
         return max(q,mn)
     except:return 0
-def leverage(score,state):
-    return 5 if score>=90 and state=="STRONG_ACCELERATING" else 4 if score>=84 else 3 if score>=78 else 2
-
 def btc_risk_factor():
     try:
         d=ohlcv("BTC/USDT",TF1H,80)
@@ -473,14 +489,19 @@ def openpos(sig,lev):
             order=ex.create_order(s,"market","buy" if side=="LONG" else "sell",q,None,{})
             entry=f(order.get("average"),p)
         except: log.exception("Live entry %s",s); return None
-    tg=sig["target"]; target_roi=tg["target_raw"]*lev; max_loss=min(target_roi*MAX_LOSS_TARGET_RATIO,target_roi*.50)
+    tg=sig["target"]; target_roi=tg["target_raw"]*lev; max_loss=target_roi*MAX_LOSS_TARGET_RATIO
     pos={"id":f"{s}_{int(time.time()*1000)}","symbol":s,"side":side,"entry_price":entry,"current_price":entry,
          "margin":MARGIN,"leverage":lev,"quantity":q,"opened_at":now().isoformat(),"opened_ts":time.time(),
          "max_roi":0.0,"min_roi":0.0,"peak_price":entry,"peak_ts":time.time(),"stop_price":None,
          "stage":"INITIAL","signal_class":sig["signal_class"],"entry_score":sig["score"],
          "target_raw":tg["target_raw"],"target_roi":target_roi,"max_loss_roi":max_loss,"btc_factor":sig.get("btc_factor",1.0),
          "decision_summary":decision(sig),"last_orderflow_status":sig.get("liquidity_final",sig["liquidity"])["status"],
-         "entry_order_id":order.get("id") if order else None,"last_hold_check":0.0,"last_stop_update":0.0,"stop_breach_since":None}
+         "entry_order_id":order.get("id") if order else None,"last_hold_check":0.0,"last_stop_update":0.0,"stop_breach_since":None,
+         "stop_order_id":None,"exchange_stop_price":None}
+    raw_stop=max_loss/lev
+    init_stop=entry*(1-raw_stop/100) if side=="LONG" else entry*(1+raw_stop/100)
+    if not DRY_RUN:
+        pos["stop_order_id"]=place_stop_order(pos,init_stop); pos["exchange_stop_price"]=init_stop if pos["stop_order_id"] else None
     with lock: positions[s]=pos; stats["signals"]+=1; stats["entries"]+=1; stats["volume"]+=MARGIN*lev
     log.info("ENTRY | %s %s | %.8g | %dx | score %.1f | target %.2f%% | risk <= %.2f%% | %s",
              s,side,entry,lev,sig["score"],target_roi,max_loss,sig["signal_class"])
@@ -488,6 +509,34 @@ def openpos(sig,lev):
     return pos
 
 # ---------------- POSITION PROTECTION ENGINE ----------------
+def place_stop_order(p,stop_price):
+    """Place a STOP_MARKET reduceOnly order on the exchange as a hard safety net.
+    This is independent of our own polling loop, so the position stays protected
+    even if this process stalls, loses connectivity, or crashes."""
+    if DRY_RUN or stop_price is None or stop_price<=0: return None
+    try:
+        side="sell" if p["side"]=="LONG" else "buy"
+        order=ex.create_order(p["symbol"],"STOP_MARKET",side,p["quantity"],None,
+                               {"stopPrice":stop_price,"reduceOnly":True})
+        return order.get("id")
+    except Exception:
+        log.exception("Stop order placement failed %s",p["symbol"]); return None
+
+def cancel_stop_order(p):
+    if DRY_RUN or not p.get("stop_order_id"): return
+    try: ex.cancel_order(p["stop_order_id"],p["symbol"])
+    except Exception: log.debug("Stop order cancel failed %s",p["symbol"],exc_info=True)
+
+def sync_stop_order(p,stop_price):
+    """Replace the resting exchange stop only when it has moved meaningfully,
+    to avoid hammering the exchange with cancel/replace calls every tick."""
+    if DRY_RUN or stop_price is None or stop_price<=0: return
+    prev=p.get("exchange_stop_price")
+    if prev and abs(stop_price-prev)/prev*100<STOP_ORDER_MIN_UPDATE_PCT: return
+    cancel_stop_order(p)
+    oid=place_stop_order(p,stop_price)
+    p["stop_order_id"]=oid; p["exchange_stop_price"]=stop_price if oid else prev
+
 def atr(d,n=ATR_PERIOD):
     if d is None or len(d)<n+2:return 0
     pc=d.close.shift(1); tr=pd.concat([d.high-d.low,(d.high-pc).abs(),(d.low-pc).abs()],axis=1).max(axis=1)
@@ -536,6 +585,7 @@ def protection(p,price,a,mstate,hold_score=0,structure_ok=True):
 def close(p,price,reason):
     actual=price
     if not DRY_RUN:
+        cancel_stop_order(p)
         try:
             order=ex.create_order(p["symbol"],"market","sell" if p["side"]=="LONG" else "buy",p["quantity"],None,{"reduceOnly":True})
             actual=f(order.get("average"),price)
@@ -582,6 +632,7 @@ def monitor():
                     else:
                         structure_ok=True
                     st,stage,action=protection(p,price,a,mo["state"],hold_score,structure_ok); p["stop_price"]=st; p["stage"]=stage; p["hold_score"]=hold_score
+                    if not DRY_RUN: sync_stop_order(p,st)
                     of=liq_engine(p["symbol"],p["side"],price)
                     with lock:
                         if p["symbol"] in positions:p["last_orderflow_status"]=of["status"]
@@ -594,6 +645,7 @@ def monitor():
                     loss_cap=r<=-p.get("max_loss_roi",999)
                     positive_hold=(hold_score>=POSITIVE_HOLD_SCORE and mo["state"] in MOMENTUM_HOLD_STATES and structure_ok)
                     if hit:
+                        breach_age=0.0
                         with lock:
                             if p["symbol"] in positions:
                                 if p.get("stop_breach_since") is None: p["stop_breach_since"]=time.time()
@@ -610,6 +662,15 @@ def monitor():
                     elif action=="TIME_EXIT": close(p,price,"TIME_DECAY")
                     elif hit: close(p,price,f"TRAIL_{stage}")
                 except Exception: log.debug("position error",exc_info=True)
+            global last_heartbeat
+            if time.time()-last_heartbeat>=POSITION_SUMMARY_INTERVAL:
+                last_heartbeat=time.time()
+                with lock: snap=list(positions.values())
+                if snap:
+                    parts=[f"{q['symbol']} {q['side']} roi={pnl(q,q['current_price'])[0]:+.2f}% stage={q['stage']}" for q in snap]
+                    log.info("HEARTBEAT | %d pos | %s",len(snap)," ; ".join(parts))
+                else:
+                    log.info("HEARTBEAT | no open positions")
         except: log.exception("monitor")
         time.sleep(MONITOR_INTERVAL)
 
