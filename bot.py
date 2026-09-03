@@ -12,8 +12,8 @@ load_dotenv()
 # 1. KONFİGÜRASYON VE AYARLAR
 # ==========================================
 class Settings(BaseSettings):
-    BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "test_key")
-    BINANCE_SECRET_KEY: str = os.getenv("BINANCE_SECRET_KEY", "test_secret")
+    BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
+    BINANCE_SECRET_KEY: str = os.getenv("BINANCE_SECRET_KEY", "")
     
     DRY_RUN: bool = os.getenv("DRY_RUN", "True").lower() == "true"
     MAX_CONCURRENT_TRADES: int = int(os.getenv("MAX_CONCURRENT_TRADES", "3"))
@@ -38,9 +38,13 @@ settings = Settings()
 # ==========================================
 class BinanceExchange:
     def __init__(self):
+        # Dry-run modundaysak imza hatası (-1022) almamak için anahtarları boş geçiyoruz
+        api_key = settings.BINANCE_API_KEY if not settings.DRY_RUN else ""
+        secret_key = settings.BINANCE_SECRET_KEY if not settings.DRY_RUN else ""
+        
         self.exchange = ccxt.binance({
-            'apiKey': settings.BINANCE_API_KEY,
-            'secret': settings.BINANCE_SECRET_KEY,
+            'apiKey': api_key,
+            'secret': secret_key,
             'options': {'defaultType': 'future'},
             'enableRateLimit': True
         })
