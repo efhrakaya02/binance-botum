@@ -696,26 +696,31 @@ def scan():
     last_scan=now().isoformat()
     with lock: stats["scans"]+=1
     ts=tickers(); a,b,v,cands=pool(ts)
-    log.info("SCAN | pool g=%d l=%d v=%d | positions=%d/%d | BTC/XAU excluded",len(a),len(b),len(v),count(),MAX_POSITIONS)
-    if count()>=MAX_POSITIONS:return
-    signals=[]
+    scanned=len(cands)
+    if count()>=MAX_POSITIONS:
+        log.info("SCAN | taranan=%d | havuz(g=%d/l=%d/v=%d) | pozisyon=%d/%d DOLU, analiz atlandı",
+                 scanned,len(a),len(b),len(v),count(),MAX_POSITIONS)
+        return
+    signals=[]; errors=0
     for c in sorted(cands,key=priority,reverse=True):
         try:
             s=analyze(c)
             if s: signals.append(s)
-        except: log.debug("analyze %s",c["symbol"],exc_info=True)
+        except:
+            errors+=1; log.debug("analyze %s",c["symbol"],exc_info=True)
     signals.sort(key=lambda x:x["score"],reverse=True)
-    if signals:
-        top=signals[:3]
-        summary=" ; ".join(f"{x['symbol']} {x['side']} {x['score']:.0f} {x['signal_class']} cap={x['target']['target_raw']:.1f}%" for x in top)
-        log.info("SIGNALS | %d eligible | %s",len(signals),summary)
-    else:
-        log.info("SIGNALS | none")
+    opened=0
     for s in signals:
         if count()>=MAX_POSITIONS:break
         ok,reason=final(s)
         if not ok:continue
-        lev=leverage(s["score"],s["momentum"]["state"],s.get("btc_factor",1.0)); openpos(s,lev)
+        lev=leverage(s["score"],s["momentum"]["state"],s.get("btc_factor",1.0))
+        if openpos(s,lev): opened+=1
+    top=" ; ".join(f"{x['symbol']} {x['side']} {x['score']:.0f} {x['signal_class']} cap={x['target']['target_raw']:.1f}%" for x in signals[:3])
+    log.info("SCAN | taranan=%d | havuz(g=%d/l=%d/v=%d) | pozisyon=%d/%d | sinyal=%d | giriş=%d%s%s",
+             scanned,len(a),len(b),len(v),count(),MAX_POSITIONS,len(signals),opened,
+             f" | hata={errors}" if errors else "",
+             f" | top: {top}" if signals else "")
 
 def bot():
     log.info("BOT START | DRY_RUN=%s | maxpos=%d | margin=%.2f | lev=%d-%d | 4H+40/30/30+dynamic target | 3 signal classes",DRY_RUN,MAX_POSITIONS,MARGIN,MIN_LEV,MAX_LEV)
