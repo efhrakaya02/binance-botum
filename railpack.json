@@ -1,9 +1,8 @@
 {
-  "phases": {
-    "setup": {
-      "nixPkgs": [
-        "python312"
-      ]
+  "deploy": {
+    "builder": "nixpacks",
+    "variables": {
+      "PYTHON_VERSION": "3.12"
     }
   }
 }
