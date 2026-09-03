@@ -124,7 +124,7 @@ class StrategyEngine:
         nearest_resistance = max(highs[-20:])
         nearest_support = min(lows[-20:])
         
-        # Mesafe ve Runway Kontrolü
+        # Mesafe ve Runway (Kazanç Alanı) Kontrolü
         distance_to_res_pct = (nearest_resistance - last_close) / last_close * 100
         
         # Eğer hemen üstte kazanç alanı yoksa (çok darsa) pas geç
@@ -141,7 +141,7 @@ class StrategyEngine:
             f"İşlem Kararı [LONG]: {self.symbol} paritesinde 4H makro trend uyumlu, "
             f"1H kurulum ve 15M momentum tetiklendi. Giriş Fiyatı: {last_close:.4f}, "
             f"Stop-Loss: {sl:.4f}, Dinamik Hedef (TP): {tp:.4f}. "
-            f"Runway (Kazanç Alanı): %{distance_to_res_pct:.2f} (Yeterli marj var)."
+            f"Kazanç Alanı (Runway): %{distance_to_res_pct:.2f} (Yeterli marj var)."
         )
 
         return {
@@ -150,6 +150,7 @@ class StrategyEngine:
             "price": last_close,
             "sl": sl,
             "tp": tp,
+            "runway": distance_to_res_pct,
             "explanation": decision_explanation
         }
 
@@ -199,10 +200,17 @@ async def main():
                     )
                     del active_trades[symbol]
 
-            # Eğer aktif işlem varsa döngü başı/sonu sade bir durum özeti geçelim
+            # Aktif işlemler için detaylı anlık durum takibi raporu
             if active_trades:
-                status_msg = " | ".join([f"{s} (Giriş: {t['price']}, TP: {t['tp']}, SL: {t['sl']})" for s, t in active_trades.items()])
-                logger.info(f"📈 Aktif Pozisyonlar Takibi -> {status_msg}")
+                for symbol, t in active_trades.items():
+                    curr_price = await exchange.get_current_price(symbol)
+                    if curr_price > 0:
+                        pnl_pct = ((curr_price - t['price']) / t['price']) * 100 * settings.LEVERAGE
+                        logger.info(
+                            f"📈 [İŞLEM TAKİP] {symbol} | Giriş: {t['price']:.4f} | "
+                            f"Anlık Fiyat: {curr_price:.4f} | Anlık Kâr/Zarar: %{pnl_pct:+.2f} | "
+                            f"SL: {t['sl']:.4f} | TP: {t['tp']:.4f} | Kazanç Alanı: %{t['runway']:.2f}"
+                        )
 
             # 2. Yeni Tarama Döngüsü
             pool = await exchange.get_dynamic_pool()
@@ -241,7 +249,8 @@ async def main():
                     active_trades[symbol] = {
                         'price': result['price'],
                         'sl': result['sl'],
-                        'tp': result['tp']
+                        'tp': result['tp'],
+                        'runway': result['runway']
                     }
 
                 await asyncio.sleep(0.2)
