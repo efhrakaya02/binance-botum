@@ -1,492 +1,2526 @@
 import os
 import asyncio
+import time
+from datetime import datetime, timezone
+
 import pandas as pd
 import ccxt.async_support as ccxt
 from loguru import logger
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 
+
 load_dotenv()
 
-# ==========================================
-# 1. KONFİGÜRASYON VE AYARLAR
-# ==========================================
+
+# ============================================================
+# 1. KONFİGÜRASYON
+# ============================================================
+
 class Settings(BaseSettings):
+
     BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
     BINANCE_SECRET_KEY: str = os.getenv("BINANCE_SECRET_KEY", "")
-    
-    DRY_RUN: bool = os.getenv("DRY_RUN", "True").lower() == "true"
-    MAX_CONCURRENT_TRADES: int = int(os.getenv("MAX_CONCURRENT_TRADES", "3"))
-    LEVERAGE: int = int(os.getenv("LEVERAGE", "5"))
-    MARGIN_PER_TRADE: float = float(os.getenv("MARGIN_PER_TRADE", "10.0"))
-    MARGIN_MODE: str = os.getenv("MARGIN_MODE", "isolated")
-    
+
+    # ========================================================
+    # TEST MODU
+    # True  = GERÇEK VERİ + SANAL İŞLEM
+    # False = GERÇEK EMİR
+    # ========================================================
+
+    DRY_RUN: bool = (
+        os.getenv("DRY_RUN", "True").lower() == "true"
+    )
+
+    # ========================================================
+    # POZİSYON
+    # ========================================================
+
+    MAX_CONCURRENT_TRADES: int = int(
+        os.getenv("MAX_CONCURRENT_TRADES", "3")
+    )
+
+    LEVERAGE: int = int(
+        os.getenv("LEVERAGE", "5")
+    )
+
+    MARGIN_PER_TRADE: float = float(
+        os.getenv("MARGIN_PER_TRADE", "10.0")
+    )
+
+    MARGIN_MODE: str = os.getenv(
+        "MARGIN_MODE",
+        "isolated"
+    )
+
+    # ========================================================
+    # TIMEFRAME
+    # ========================================================
+
     MACRO_TF: str = "4h"
     SETUP_TF: str = "1h"
     EXEC_TF: str = "15m"
+
     CANDLE_LIMIT: int = 150
+
+    # ========================================================
+    # DİNAMİK HAVUZ
+    # ========================================================
+
+    GAINER_LIMIT: int = 50
+    LOSER_LIMIT: int = 50
+    VOLUME_LIMIT: int = 50
+
+    # ========================================================
+    # TARAMA
+    # ========================================================
+
+    SCAN_INTERVAL: int = 180
+
+    # ========================================================
+    # POZİSYON MONITOR
+    # ========================================================
+
+    POSITION_MONITOR_INTERVAL: int = 3
+    HEARTBEAT_INTERVAL: int = 60
 
     class Config:
         env_file = ".env"
         extra = "ignore"
 
+
 settings = Settings()
 
 
-# ==========================================
-# 2. BORSA VE GERÇEK EMİR / VERİ YÖNETİMİ
-# ==========================================
+# ============================================================
+# YARDIMCI FONKSİYONLAR
+# ============================================================
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def now_text():
+    return utc_now().strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+
+def safe_float(value, default=0.0):
+
+    try:
+
+        if value is None:
+            return default
+
+        return float(value)
+
+    except Exception:
+
+        return default
+
+
+# ============================================================
+# 2. BINANCE EXCHANGE
+# ============================================================
+
 class BinanceExchange:
+
     def __init__(self):
+
         self.exchange = ccxt.binance({
-            'apiKey': settings.BINANCE_API_KEY,
-            'secret': settings.BINANCE_SECRET_KEY,
-            'options': {'defaultType': 'future'},
-            'enableRateLimit': True
+
+            "apiKey":
+                settings.BINANCE_API_KEY,
+
+            "secret":
+                settings.BINANCE_SECRET_KEY,
+
+            "enableRateLimit":
+                True,
+
+            "options": {
+
+                "defaultType":
+                    "future",
+
+                "adjustForTimeDifference":
+                    True,
+            }
         })
 
-    async def get_dynamic_pool(self) -> list:
-        """Gainers, Losers ve Volume önceliğini (sıralamayı) bozmadan tekilleştirilmiş dinamik havuz."""
+    # --------------------------------------------------------
+    # MARKETLER
+    # --------------------------------------------------------
+
+    async def load_markets(self):
+
         try:
-            tickers = await self.exchange.fetch_tickers()
-            usdt_tickers = {s: t for s, t in tickers.items() if s.endswith('/USDT:USDT') or s.endswith('/USDT')}
-            
+
+            await self.exchange.load_markets()
+
+            logger.success(
+                f"Binance Futures marketleri yüklendi | "
+                f"{len(self.exchange.markets)} market"
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"Market yükleme hatası: {e}"
+            )
+
+            raise
+
+    # --------------------------------------------------------
+    # DINAMIK HAVUZ
+    # --------------------------------------------------------
+
+    async def get_dynamic_pool(self):
+
+        try:
+
+            tickers = (
+                await self.exchange.fetch_tickers()
+            )
+
             data = []
-            for symbol, t in usdt_tickers.items():
-                change = t.get('percentage', 0.0) or 0.0
-                quote_vol = t.get('quoteVolume', 0.0) or 0.0
-                data.append({'symbol': symbol, 'change': change, 'volume': quote_vol})
-                
+
+            for symbol, ticker in tickers.items():
+
+                if not (
+                    symbol.endswith("/USDT:USDT")
+                    or symbol.endswith("/USDT")
+                ):
+                    continue
+
+                upper_symbol = symbol.upper()
+
+                # İstenmeyen ürünleri çıkar
+                if any(
+                    token in upper_symbol
+                    for token in [
+                        "UP/",
+                        "DOWN/",
+                        "BULL/",
+                        "BEAR/",
+                        "_",
+                        "BID/",
+                        "ASK/"
+                    ]
+                ):
+                    continue
+
+                change = safe_float(
+                    ticker.get("percentage")
+                )
+
+                volume = safe_float(
+                    ticker.get("quoteVolume")
+                )
+
+                data.append({
+
+                    "symbol":
+                        symbol,
+
+                    "change":
+                        change,
+
+                    "volume":
+                        volume
+                })
+
             df = pd.DataFrame(data)
+
             if df.empty:
+
+                logger.warning(
+                    "Dinamik havuz boş."
+                )
+
                 return []
 
-            gainers = df.sort_values(by='change', ascending=False).head(50)['symbol'].tolist()
-            losers = df.sort_values(by='change', ascending=True).head(50)['symbol'].tolist()
-            vol_leaders = df.sort_values(by='volume', ascending=False).head(50)['symbol'].tolist()
-            
-            # dict.fromkeys ile sırayı koruyarak tekilleştirme
-            unique_pool = list(dict.fromkeys(gainers + losers + vol_leaders))
-            return unique_pool
+            gainers = (
+                df.sort_values(
+                    "change",
+                    ascending=False
+                )
+                .head(settings.GAINER_LIMIT)
+                ["symbol"]
+                .tolist()
+            )
+
+            losers = (
+                df.sort_values(
+                    "change",
+                    ascending=True
+                )
+                .head(settings.LOSER_LIMIT)
+                ["symbol"]
+                .tolist()
+            )
+
+            volume_leaders = (
+                df.sort_values(
+                    "volume",
+                    ascending=False
+                )
+                .head(settings.VOLUME_LIMIT)
+                ["symbol"]
+                .tolist()
+            )
+
+            # Öncelik sırasını koru
+            pool = list(
+                dict.fromkeys(
+                    gainers
+                    +
+                    losers
+                    +
+                    volume_leaders
+                )
+            )
+
+            logger.info(
+                f"📊 HAVUZ | "
+                f"Gainers={len(gainers)} | "
+                f"Losers={len(losers)} | "
+                f"Volume={len(volume_leaders)} | "
+                f"Unique={len(pool)}"
+            )
+
+            return pool
+
         except Exception as e:
-            logger.error(f"Havuz çekilirken hata: {e}")
+
+            logger.error(
+                f"Havuz çekme hatası: {e}"
+            )
+
             return []
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    # --------------------------------------------------------
+    # OHLCV
+    # --------------------------------------------------------
+
+    async def fetch_ohlcv(
+        self,
+        symbol,
+        timeframe,
+        limit
+    ):
+
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            ohlcv = (
+                await self.exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe,
+                    limit=limit
+                )
+            )
+
+            if not ohlcv:
+
+                return pd.DataFrame()
+
+            df = pd.DataFrame(
+                ohlcv,
+                columns=[
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume"
+                ]
+            )
+
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"],
+                unit="ms",
+                utc=True
+            )
+
+            for col in [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume"
+            ]:
+
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
+                )
+
+            df = df.dropna()
+
             return df
+
         except Exception as e:
+
+            logger.debug(
+                f"OHLCV hata | "
+                f"{symbol} {timeframe}: {e}"
+            )
+
             return pd.DataFrame()
 
-    async def get_current_price(self, symbol: str) -> float:
+    # --------------------------------------------------------
+    # ANLIK FİYAT
+    # --------------------------------------------------------
+
+    async def get_current_price(
+        self,
+        symbol
+    ):
+
         try:
-            ticker = await self.exchange.fetch_ticker(symbol)
-            return float(ticker['last'])
-        except Exception:
+
+            ticker = (
+                await self.exchange.fetch_ticker(
+                    symbol
+                )
+            )
+
+            return safe_float(
+                ticker.get("last")
+            )
+
+        except Exception as e:
+
+            logger.debug(
+                f"Fiyat alınamadı {symbol}: {e}"
+            )
+
             return 0.0
 
-    async def amount_to_precision(self, symbol: str, amount: float) -> float:
+    # --------------------------------------------------------
+    # MİKTAR
+    # --------------------------------------------------------
+
+    def amount_to_precision(
+        self,
+        symbol,
+        amount
+    ):
+
         try:
-            return float(self.exchange.amount_to_precision(symbol, amount))
+
+            return float(
+                self.exchange.amount_to_precision(
+                    symbol,
+                    amount
+                )
+            )
+
         except Exception:
+
             return amount
 
-    async def open_long(self, symbol: str, qty: float, sl_price: float) -> dict:
-        """Gerçek modda (DRY_RUN=False) kaldıraç, marjin modu, piyasa emri ve koruma amaçlı stop emri verir."""
+    # --------------------------------------------------------
+    # LONG AÇ
+    # --------------------------------------------------------
+
+    async def open_long(
+        self,
+        symbol,
+        qty,
+        sl_price
+    ):
+
         if settings.DRY_RUN:
-            current_price = await self.get_current_price(symbol)
-            logger.info(f"[DRY_RUN] Açık long emri simüle edildi: {symbol} | Miktar: {qty} | Fiyat: {current_price}")
-            return {"id": "dry_run_market_id", "price": current_price}
+
+            price = (
+                await self.get_current_price(
+                    symbol
+                )
+            )
+
+            logger.info(
+                f"🧪 [DRY_RUN] LONG SANAL GİRİŞ | "
+                f"{symbol} | "
+                f"Price={price:.8f} | "
+                f"Qty={qty} | "
+                f"SL={sl_price:.8f}"
+            )
+
+            return {
+
+                "id":
+                    "DRY_LONG",
+
+                "price":
+                    price,
+
+                "average":
+                    price,
+
+                "filled":
+                    qty
+            }
 
         try:
-            try:
-                await self.exchange.set_margin_mode(settings.MARGIN_MODE.upper(), symbol)
-            except Exception:
-                pass
-            
-            await self.exchange.set_leverage(settings.LEVERAGE, symbol)
-            
-            # 1. Ana Piyasaya Giriş Emri
-            market_order = await self.exchange.create_order(symbol, 'market', 'buy', qty)
-            exec_price = float(market_order.get('price') or await self.get_current_price(symbol))
-            
-            # 2. SL İçin Koruma Emri (Stop Market - reduceOnly=True)
-            try:
-                sl_rounded = float(self.exchange.price_to_precision(symbol, sl_price))
-                await self.exchange.create_order(
-                    symbol=symbol,
-                    type='stop_market',
-                    side='sell',
-                    amount=qty,
-                    price=None,
-                    params={'stopPrice': sl_rounded, 'reduceOnly': True}
-                )
-            except Exception as sl_err:
-                logger.error(f"Koruma amaçlı stop emri iletilemedi ({symbol}): {sl_err}")
 
-            return market_order
+            await self.exchange.set_margin_mode(
+                settings.MARGIN_MODE.upper(),
+                symbol
+            )
+
         except Exception as e:
-            logger.error(f"Gerçek emir açılış hatası ({symbol}): {e}")
-            raise e
 
-    async def close_position(self, symbol: str, qty: float):
-        """Pozisyonu kapatır ve açık bekleyen tüm koruma emirlerini iptal eder."""
+            logger.warning(
+                f"Margin mode uyarısı "
+                f"{symbol}: {e}"
+            )
+
+        await self.exchange.set_leverage(
+            settings.LEVERAGE,
+            symbol
+        )
+
+        order = (
+            await self.exchange.create_order(
+                symbol,
+                "market",
+                "buy",
+                qty
+            )
+        )
+
+        execution_price = safe_float(
+            order.get("average")
+            or order.get("price")
+        )
+
+        if execution_price <= 0:
+
+            execution_price = (
+                await self.get_current_price(
+                    symbol
+                )
+            )
+
+        # Gerçek koruma stopu
+        try:
+
+            sl_rounded = float(
+                self.exchange.price_to_precision(
+                    symbol,
+                    sl_price
+                )
+            )
+
+            await self.exchange.create_order(
+                symbol=symbol,
+                type="STOP_MARKET",
+                side="sell",
+                amount=qty,
+                price=None,
+                params={
+                    "stopPrice":
+                        sl_rounded,
+
+                    "reduceOnly":
+                        True
+                }
+            )
+
+            logger.success(
+                f"🛡️ LONG STOP gönderildi | "
+                f"{symbol} | SL={sl_rounded}"
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"LONG STOP gönderilemedi "
+                f"{symbol}: {e}"
+            )
+
+        return order
+
+    # --------------------------------------------------------
+    # SHORT AÇ
+    # --------------------------------------------------------
+
+    async def open_short(
+        self,
+        symbol,
+        qty,
+        sl_price
+    ):
+
         if settings.DRY_RUN:
-            logger.info(f"[DRY_RUN] Pozisyon kapatma simüle edildi: {symbol} | Miktar: {qty}")
+
+            price = (
+                await self.get_current_price(
+                    symbol
+                )
+            )
+
+            logger.info(
+                f"🧪 [DRY_RUN] SHORT SANAL GİRİŞ | "
+                f"{symbol} | "
+                f"Price={price:.8f} | "
+                f"Qty={qty} | "
+                f"SL={sl_price:.8f}"
+            )
+
+            return {
+
+                "id":
+                    "DRY_SHORT",
+
+                "price":
+                    price,
+
+                "average":
+                    price,
+
+                "filled":
+                    qty
+            }
+
+        try:
+
+            await self.exchange.set_margin_mode(
+                settings.MARGIN_MODE.upper(),
+                symbol
+            )
+
+        except Exception as e:
+
+            logger.warning(
+                f"Margin mode uyarısı "
+                f"{symbol}: {e}"
+            )
+
+        await self.exchange.set_leverage(
+            settings.LEVERAGE,
+            symbol
+        )
+
+        order = (
+            await self.exchange.create_order(
+                symbol,
+                "market",
+                "sell",
+                qty
+            )
+        )
+
+        execution_price = safe_float(
+            order.get("average")
+            or order.get("price")
+        )
+
+        if execution_price <= 0:
+
+            execution_price = (
+                await self.get_current_price(
+                    symbol
+                )
+            )
+
+        # SHORT stop = BUY
+        try:
+
+            sl_rounded = float(
+                self.exchange.price_to_precision(
+                    symbol,
+                    sl_price
+                )
+            )
+
+            await self.exchange.create_order(
+                symbol=symbol,
+                type="STOP_MARKET",
+                side="buy",
+                amount=qty,
+                price=None,
+                params={
+                    "stopPrice":
+                        sl_rounded,
+
+                    "reduceOnly":
+                        True
+                }
+            )
+
+            logger.success(
+                f"🛡️ SHORT STOP gönderildi | "
+                f"{symbol} | SL={sl_rounded}"
+            )
+
+        except Exception as e:
+
+            logger.error(
+                f"SHORT STOP gönderilemedi "
+                f"{symbol}: {e}"
+            )
+
+        return order
+
+    # --------------------------------------------------------
+    # POZİSYON KAPAT
+    # --------------------------------------------------------
+
+    async def close_position(
+        self,
+        symbol,
+        qty,
+        side
+    ):
+
+        if settings.DRY_RUN:
+
+            logger.info(
+                f"🧪 [DRY_RUN] "
+                f"{side.upper()} SANAL POZİSYON KAPATILIYOR | "
+                f"{symbol} | Qty={qty}"
+            )
+
             return
 
         try:
-            # Açık bekleyen stop emirlerini temizle
+
             try:
-                await self.exchange.cancel_all_orders(symbol)
+
+                await self.exchange.cancel_all_orders(
+                    symbol
+                )
+
             except Exception:
+
                 pass
 
-            # Pozisyonu kapatmak için ters yönde piyasa emri (reduceOnly=True)
+            # LONG kapat = SELL
+            # SHORT kapat = BUY
+            close_side = (
+                "sell"
+                if side == "long"
+                else "buy"
+            )
+
             await self.exchange.create_order(
                 symbol=symbol,
-                type='market',
-                side='sell',
+                type="market",
+                side=close_side,
                 amount=qty,
-                params={'reduceOnly': True}
+                params={
+                    "reduceOnly":
+                        True
+                }
             )
+
         except Exception as e:
-            logger.error(f"Pozisyon kapatma hatası ({symbol}): {e}")
+
+            logger.error(
+                f"Pozisyon kapatma hatası "
+                f"{symbol}: {e}"
+            )
+
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    async def close(self):
+
+        try:
+
+            await self.exchange.close()
+
+        except Exception as e:
+
+            logger.warning(
+                f"Exchange kapatma hatası: {e}"
+            )
 
 
-# ==========================================
-# 3. STRATEJİ VE ÇOKLU ZAMAN DİLİMLİ FİLTRE MOTORU
-# ==========================================
+# ============================================================
+# 3. STRATEJİ MOTORU
+# ============================================================
+
 class StrategyEngine:
-    def __init__(self, symbol: str, df_4h: pd.DataFrame, df_1h: pd.DataFrame, df_exec: pd.DataFrame, btc_df: pd.DataFrame):
+
+    def __init__(
+        self,
+        symbol,
+        df_4h,
+        df_1h,
+        df_exec,
+        btc_df
+    ):
+
         self.symbol = symbol
         self.df_4h = df_4h
         self.df_1h = df_1h
         self.df_exec = df_exec
         self.btc_df = btc_df
 
-    def evaluate_btc_risk_factor(self) -> float:
-        if self.btc_df.empty or len(self.btc_df) < 5:
-            return 1.0
-        btc_change = (self.btc_df['close'].iloc[-1] - self.btc_df['close'].iloc[-5]) / self.btc_df['close'].iloc[-5]
-        return 0.7 if btc_change < -0.03 else 1.0
+    # --------------------------------------------------------
+    # BTC MOMENTUM
+    # --------------------------------------------------------
 
-    def analyze(self) -> dict:
-        if self.df_exec.empty or len(self.df_exec) < 50 or self.df_4h.empty or self.df_1h.empty:
-            return {"action": "WAIT"}
+    def btc_change(self):
 
-        # 1. Gerçek 4H Makro Trend Süzgeci (4H EMA20 > EMA50 veya son 3 mumda yükselen slope kontrolü)
-        df_4h_closed = self.df_4h.iloc[:-1]
-        ema_20_4h = df_4h_closed['close'].ewm(span=20, adjust=False).mean().iloc[-1]
-        ema_50_4h = df_4h_closed['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-        macro_slope = df_4h_closed['close'].iloc[-1] - df_4h_closed['close'].iloc[-3]
-        if ema_20_4h <= ema_50_4h or macro_slope <= 0:
-            return {"action": "SKIP_MACRO_BEARISH"}
+        if (
+            self.btc_df.empty
+            or len(self.btc_df) < 5
+        ):
 
-        # 2. Gerçek 1H Kurulum Süzgeci (1H fiyatın son 20 mumluk ortalamanın üstünde veya desteğe yakın olması)
-        df_1h_closed = self.df_1h.iloc[:-1]
-        sma_20_1h = df_1h_closed['close'].rolling(20).mean().iloc[-1]
-        if df_1h_closed['close'].iloc[-1] < sma_20_1h * 0.995:
-            return {"action": "SKIP_1H_SETUP_WEAK"}
+            return 0.0
 
-        # 3. 15M Yapısal Destek / Direnç ve İnfaz (Kapanmış son 20 mum referans alınır)
-        df_exec_closed = self.df_exec.iloc[:-1]
-        last_close = df_exec_closed['close'].iloc[-1]
-        
-        highs = df_exec_closed['high'].values
-        lows = df_exec_closed['low'].values
-        nearest_resistance = max(highs[-20:])
-        nearest_support = min(lows[-20:])
-        
-        distance_to_res_pct = (nearest_resistance - last_close) / last_close * 100
-        if distance_to_res_pct < 1.0:
-            return {"action": "SKIP_TIGHT_RUNWAY"}
-
-        btc_risk = self.evaluate_btc_risk_factor()
-
-        sl = nearest_support * (1 - 0.005 * btc_risk)
-        tp = nearest_resistance
-
-        risk_distance = last_close - sl
-        reward_distance = tp - last_close
-
-        if risk_distance <= 0 or reward_distance <= 0:
-            return {"action": "SKIP_INVALID_PRICES"}
-
-        if (risk_distance / reward_distance) > 0.5:
-            return {"action": "SKIP_RISK_REWARD_VIOLATION"}
-
-        decision_explanation = (
-            f"İşlem Kararı [LONG]: {self.symbol} paritesinde 4H makro trend (EMA teyitli) uyumlu, "
-            f"1H kurulum süzgeci başarıyla geçti ve 15M momentum tetiklendi. Giriş Fiyatı: {last_close:.4f}, "
-            f"Stop-Loss: {sl:.4f}, Dinamik Hedef (TP): {tp:.4f}. "
-            f"Kazanç Alanı (Runway): %{distance_to_res_pct:.2f} | Risk/Ödül Oranı Sağlandı."
+        old_price = (
+            self.btc_df["close"].iloc[-5]
         )
 
+        new_price = (
+            self.btc_df["close"].iloc[-1]
+        )
+
+        if old_price <= 0:
+
+            return 0.0
+
+        return (
+            (
+                new_price
+                -
+                old_price
+            )
+            /
+            old_price
+            *
+            100
+        )
+
+    # --------------------------------------------------------
+    # ANA ANALİZ
+    # --------------------------------------------------------
+
+    def analyze(self):
+
+        # ====================================================
+        # VERİ KONTROLÜ
+        # ====================================================
+
+        if (
+            self.df_exec.empty
+            or len(self.df_exec) < 50
+            or self.df_4h.empty
+            or len(self.df_4h) < 20
+            or self.df_1h.empty
+            or len(self.df_1h) < 20
+        ):
+
+            return {
+                "action":
+                    "WAIT",
+
+                "reason":
+                    "Yetersiz veri"
+            }
+
+        # ====================================================
+        # SADECE KAPANMIŞ MUM
+        # ====================================================
+
+        df_4h = self.df_4h.iloc[:-1].copy()
+        df_1h = self.df_1h.iloc[:-1].copy()
+        df_15m = self.df_exec.iloc[:-1].copy()
+
+        # ====================================================
+        # 4H EMA
+        # ====================================================
+
+        df_4h["ema20"] = (
+            df_4h["close"]
+            .ewm(
+                span=20,
+                adjust=False
+            )
+            .mean()
+        )
+
+        df_4h["ema50"] = (
+            df_4h["close"]
+            .ewm(
+                span=50,
+                adjust=False
+            )
+            .mean()
+        )
+
+        ema20 = df_4h["ema20"].iloc[-1]
+        ema50 = df_4h["ema50"].iloc[-1]
+
+        current_4h = (
+            df_4h["close"].iloc[-1]
+        )
+
+        previous_4h = (
+            df_4h["close"].iloc[-3]
+        )
+
+        macro_slope = (
+            current_4h
+            -
+            previous_4h
+        )
+
+        # ====================================================
+        # 4H YÖNÜ
+        # ====================================================
+
+        bullish_macro = (
+            ema20 > ema50
+            and
+            macro_slope > 0
+        )
+
+        bearish_macro = (
+            ema20 < ema50
+            and
+            macro_slope < 0
+        )
+
+        # ====================================================
+        # 1H SETUP
+        # ====================================================
+
+        df_1h["sma20"] = (
+            df_1h["close"]
+            .rolling(20)
+            .mean()
+        )
+
+        sma20_1h = (
+            df_1h["sma20"].iloc[-1]
+        )
+
+        current_1h = (
+            df_1h["close"].iloc[-1]
+        )
+
+        bullish_1h = (
+            current_1h
+            >=
+            sma20_1h * 0.995
+        )
+
+        bearish_1h = (
+            current_1h
+            <=
+            sma20_1h * 1.005
+        )
+
+        # ====================================================
+        # 15M YAPI
+        # ====================================================
+
+        recent_20 = (
+            df_15m.iloc[-20:]
+        )
+
+        resistance = (
+            recent_20["high"].max()
+        )
+
+        support = (
+            recent_20["low"].min()
+        )
+
+        current_price = (
+            df_15m["close"].iloc[-1]
+        )
+
+        # ====================================================
+        # 15M MOMENTUM
+        # ====================================================
+
+        previous_close = (
+            df_15m["close"].iloc[-2]
+        )
+
+        momentum_pct = (
+            (
+                current_price
+                -
+                previous_close
+            )
+            /
+            previous_close
+            *
+            100
+        )
+
+        # ====================================================
+        # VOLUME
+        # ====================================================
+
+        volume_ma = (
+            df_15m["volume"]
+            .rolling(20)
+            .mean()
+            .iloc[-1]
+        )
+
+        current_volume = (
+            df_15m["volume"].iloc[-1]
+        )
+
+        volume_ratio = (
+            current_volume / volume_ma
+            if volume_ma > 0
+            else 0
+        )
+
+        # ====================================================
+        # BTC
+        # ====================================================
+
+        btc_pct = self.btc_change()
+
+        # ====================================================
+        # ====================================================
+        # LONG SETUP
+        # ====================================================
+        # ====================================================
+
+        if bullish_macro and bullish_1h:
+
+            runway_long = (
+                (
+                    resistance
+                    -
+                    current_price
+                )
+                /
+                current_price
+                *
+                100
+            )
+
+            if runway_long < 1.0:
+
+                long_reason = (
+                    f"LONG runway düşük "
+                    f"%{runway_long:.2f}"
+                )
+
+            else:
+
+                # BTC ciddi düşüyorsa LONG daha riskli
+                if btc_pct < -3.0:
+
+                    long_reason = (
+                        f"BTC risk yüksek "
+                        f"(%{btc_pct:.2f})"
+                    )
+
+                else:
+
+                    # LONG SL
+                    sl_long = (
+                        support
+                        *
+                        (
+                            1
+                            -
+                            (
+                                0.005
+                                *
+                                (
+                                    0.7
+                                    if btc_pct < -3
+                                    else 1.0
+                                )
+                            )
+                        )
+                    )
+
+                    tp_long = resistance
+
+                    risk_long = (
+                        current_price
+                        -
+                        sl_long
+                    )
+
+                    reward_long = (
+                        tp_long
+                        -
+                        current_price
+                    )
+
+                    if (
+                        risk_long <= 0
+                        or reward_long <= 0
+                    ):
+
+                        long_reason = (
+                            "LONG geçersiz fiyatlar"
+                        )
+
+                    else:
+
+                        rr_long = (
+                            risk_long
+                            /
+                            reward_long
+                        )
+
+                        if rr_long > 0.5:
+
+                            long_reason = (
+                                f"LONG R/R zayıf "
+                                f"{rr_long:.2f}"
+                            )
+
+                        else:
+
+                            logger.info(
+                                f"🟢 LONG ADAYI | "
+                                f"{self.symbol} | "
+                                f"4H bullish | "
+                                f"1H bullish | "
+                                f"Momentum=%{momentum_pct:+.2f} | "
+                                f"Volume={volume_ratio:.2f}x | "
+                                f"Runway=%{runway_long:.2f}"
+                            )
+
+                            return {
+
+                                "action":
+                                    "ENTER_LONG",
+
+                                "symbol":
+                                    self.symbol,
+
+                                "side":
+                                    "long",
+
+                                "price":
+                                    current_price,
+
+                                "sl":
+                                    sl_long,
+
+                                "tp":
+                                    tp_long,
+
+                                "runway":
+                                    runway_long,
+
+                                "risk_reward":
+                                    rr_long,
+
+                                "momentum":
+                                    momentum_pct,
+
+                                "volume_ratio":
+                                    volume_ratio,
+
+                                "btc_change":
+                                    btc_pct,
+
+                                "explanation":
+                                    (
+                                        f"\n"
+                                        f"╔══════════════════════════════════════╗\n"
+                                        f"║          🟢 LONG ONAYLANDI           ║\n"
+                                        f"╠══════════════════════════════════════╣\n"
+                                        f"║ Coin        : {self.symbol}\n"
+                                        f"║ Giriş       : {current_price:.8f}\n"
+                                        f"║ SL          : {sl_long:.8f}\n"
+                                        f"║ TP          : {tp_long:.8f}\n"
+                                        f"║ Runway      : %{runway_long:.2f}\n"
+                                        f"║ R/R         : {rr_long:.2f}\n"
+                                        f"║ 15M Momentum: %{momentum_pct:+.2f}\n"
+                                        f"║ Volume      : {volume_ratio:.2f}x\n"
+                                        f"║ BTC         : %{btc_pct:+.2f}\n"
+                                        f"╠══════════════════════════════════════╣\n"
+                                        f"║ 4H Trend    : BULLISH\n"
+                                        f"║ 1H Setup    : BULLISH\n"
+                                        f"║ 15M         : LONG EXECUTION\n"
+                                        f"╚══════════════════════════════════════╝"
+                                    )
+                            }
+
+        # ====================================================
+        # ====================================================
+        # SHORT SETUP
+        # ====================================================
+        # ====================================================
+
+        if bearish_macro and bearish_1h:
+
+            runway_short = (
+                (
+                    current_price
+                    -
+                    support
+                )
+                /
+                current_price
+                *
+                100
+            )
+
+            if runway_short < 1.0:
+
+                short_reason = (
+                    f"SHORT runway düşük "
+                    f"%{runway_short:.2f}"
+                )
+
+            else:
+
+                # BTC çok güçlü yükseliyorsa SHORT riskli
+                if btc_pct > 3.0:
+
+                    short_reason = (
+                        f"BTC risk yüksek "
+                        f"(%{btc_pct:+.2f})"
+                    )
+
+                else:
+
+                    # SHORT SL = direnç üstü
+                    sl_short = (
+                        resistance
+                        *
+                        (
+                            1
+                            +
+                            0.005
+                        )
+                    )
+
+                    tp_short = support
+
+                    risk_short = (
+                        sl_short
+                        -
+                        current_price
+                    )
+
+                    reward_short = (
+                        current_price
+                        -
+                        tp_short
+                    )
+
+                    if (
+                        risk_short <= 0
+                        or reward_short <= 0
+                    ):
+
+                        short_reason = (
+                            "SHORT geçersiz fiyatlar"
+                        )
+
+                    else:
+
+                        rr_short = (
+                            risk_short
+                            /
+                            reward_short
+                        )
+
+                        if rr_short > 0.5:
+
+                            short_reason = (
+                                f"SHORT R/R zayıf "
+                                f"{rr_short:.2f}"
+                            )
+
+                        else:
+
+                            logger.info(
+                                f"🔴 SHORT ADAYI | "
+                                f"{self.symbol} | "
+                                f"4H bearish | "
+                                f"1H bearish | "
+                                f"Momentum=%{momentum_pct:+.2f} | "
+                                f"Volume={volume_ratio:.2f}x | "
+                                f"Runway=%{runway_short:.2f}"
+                            )
+
+                            return {
+
+                                "action":
+                                    "ENTER_SHORT",
+
+                                "symbol":
+                                    self.symbol,
+
+                                "side":
+                                    "short",
+
+                                "price":
+                                    current_price,
+
+                                "sl":
+                                    sl_short,
+
+                                "tp":
+                                    tp_short,
+
+                                "runway":
+                                    runway_short,
+
+                                "risk_reward":
+                                    rr_short,
+
+                                "momentum":
+                                    momentum_pct,
+
+                                "volume_ratio":
+                                    volume_ratio,
+
+                                "btc_change":
+                                    btc_pct,
+
+                                "explanation":
+                                    (
+                                        f"\n"
+                                        f"╔══════════════════════════════════════╗\n"
+                                        f"║          🔴 SHORT ONAYLANDI          ║\n"
+                                        f"╠══════════════════════════════════════╣\n"
+                                        f"║ Coin        : {self.symbol}\n"
+                                        f"║ Giriş       : {current_price:.8f}\n"
+                                        f"║ SL          : {sl_short:.8f}\n"
+                                        f"║ TP          : {tp_short:.8f}\n"
+                                        f"║ Runway      : %{runway_short:.2f}\n"
+                                        f"║ R/R         : {rr_short:.2f}\n"
+                                        f"║ 15M Momentum: %{momentum_pct:+.2f}\n"
+                                        f"║ Volume      : {volume_ratio:.2f}x\n"
+                                        f"║ BTC         : %{btc_pct:+.2f}\n"
+                                        f"╠══════════════════════════════════════╣\n"
+                                        f"║ 4H Trend    : BEARISH\n"
+                                        f"║ 1H Setup    : BEARISH\n"
+                                        f"║ 15M         : SHORT EXECUTION\n"
+                                        f"╚══════════════════════════════════════╝"
+                                    )
+                            }
+
+        # ====================================================
+        # BEKLE
+        # ====================================================
+
         return {
-            "action": "ENTER_LONG",
-            "symbol": self.symbol,
-            "price": last_close,
-            "sl": sl,
-            "tp": tp,
-            "runway": distance_to_res_pct,
-            "explanation": decision_explanation
+
+            "action":
+                "WAIT",
+
+            "reason":
+                "LONG veya SHORT tüm trend koşulları aynı anda oluşmadı"
         }
 
 
-# ==========================================
-# 4. BAĞIMSIZ ASENKRON POZİSYON İZLEME GÖREVİ
-# ==========================================
-async def position_monitor_loop(exchange: BinanceExchange, active_trades: dict, trade_lock: asyncio.Lock):
-    """Tarama döngüsünden tamamen bağımsız, her 3 saniyede bir çalışan hassas pozisyon denetleyicisi."""
-    last_heartbeat_time = 0
+# ============================================================
+# 4. POZİSYON MONITOR
+# ============================================================
+
+async def position_monitor_loop(
+    exchange,
+    active_trades,
+    trade_lock
+):
+
+    last_heartbeat = time.time()
+
+    logger.info(
+        "👁️ Bağımsız pozisyon monitorü aktif."
+    )
 
     while True:
-        try:
-            await asyncio.sleep(3)
-            
-            async with trade_lock:
-                if not active_trades:
-                    continue
-                current_symbols = list(active_trades.keys())
 
-            for symbol in current_symbols:
+        try:
+
+            await asyncio.sleep(
+                settings.POSITION_MONITOR_INTERVAL
+            )
+
+            async with trade_lock:
+
+                symbols = list(
+                    active_trades.keys()
+                )
+
+            if not symbols:
+                continue
+
+            for symbol in symbols:
+
                 async with trade_lock:
+
                     if symbol not in active_trades:
                         continue
-                    trade = active_trades[symbol]
 
-                current_price = await exchange.get_current_price(symbol)
-                if current_price == 0.0:
+                    trade = dict(
+                        active_trades[symbol]
+                    )
+
+                side = trade["side"]
+
+                current_price = (
+                    await exchange.get_current_price(
+                        symbol
+                    )
+                )
+
+                if current_price <= 0:
                     continue
 
-                # 15m canlı verilerle süpürme (sweep) ve yapısal kontrol
-                df_exec_live = await exchange.fetch_ohlcv(symbol, settings.EXEC_TF, 30)
-                if not df_exec_live.empty:
-                    df_exec_closed = df_exec_live.iloc[:-1]
-                    recent_lows = df_exec_closed['low'].values
-                    active_support = min(recent_lows[-10:])
-                    recent_highs = df_exec_closed['high'].values
-                    active_resistance = max(recent_highs[-10:])
-                    
-                    new_runway_pct = (active_resistance - current_price) / current_price * 100
-                    if active_resistance > trade['tp'] and new_runway_pct >= 0.8:
-                        async with trade_lock:
-                            if symbol in active_trades:
-                                active_trades[symbol]['tp'] = active_resistance
-                        logger.info(f"🚀 [DİNAMİK TP & LİKİDİTE GÜNCELLEMESİ] {symbol} yeni direnç yakalandı. Yeni TP: {active_resistance:.4f}")
+                # =================================================
+                # POZİSYON YAŞI
+                # =================================================
 
-                    # Süpürme (Sweep) Kontrolü
-                    if current_price < active_support * 0.992:
-                        raw_gain_pct = (current_price - trade['price']) / trade['price']
-                        profit_usdt = settings.MARGIN_PER_TRADE * settings.LEVERAGE * raw_gain_pct
-                        
-                        await exchange.close_position(symbol, trade['qty'])
-                        
-                        logger.warning(
-                            f"\n📊 İŞLEM SONUÇ RAPORU (SÜPÜRME / GÜVENLİ ÇIKIŞ 🟠)\n"
-                            f"----------------------------------------\n"
-                            f"Sembol: {symbol} | Yön: LONG\n"
-                            f"Giriş Fiyatı: {trade['price']} | Çıkış Fiyatı: {current_price}\n"
-                            f"Kullanılan Margin: {settings.MARGIN_PER_TRADE} USDT ({settings.LEVERAGE}x)\n"
-                            f"Gerçekleşen PnL: ${profit_usdt:+.2f}\n"
-                            f"----------------------------------------"
+                hold_minutes = (
+                    (
+                        time.time()
+                        -
+                        trade["opened_at"]
+                    )
+                    /
+                    60
+                )
+
+                # =================================================
+                # 15M YAPI
+                # =================================================
+
+                df_live = (
+                    await exchange.fetch_ohlcv(
+                        symbol,
+                        settings.EXEC_TF,
+                        30
+                    )
+                )
+
+                active_support = None
+                active_resistance = None
+
+                if not df_live.empty:
+
+                    closed = (
+                        df_live.iloc[:-1]
+                    )
+
+                    if len(closed) >= 10:
+
+                        active_support = (
+                            closed[
+                                "low"
+                            ]
+                            .iloc[-10:]
+                            .min()
                         )
-                        async with trade_lock:
-                            if symbol in active_trades:
-                                del active_trades[symbol]
+
+                        active_resistance = (
+                            closed[
+                                "high"
+                            ]
+                            .iloc[-10:]
+                            .max()
+                        )
+
+                        # =================================================
+                        # DİNAMİK TP — LONG
+                        # =================================================
+
+                        if side == "long":
+
+                            new_runway = (
+                                (
+                                    active_resistance
+                                    -
+                                    current_price
+                                )
+                                /
+                                current_price
+                                *
+                                100
+                            )
+
+                            if (
+                                active_resistance
+                                >
+                                trade["tp"]
+                                and
+                                new_runway >= 0.8
+                            ):
+
+                                async with trade_lock:
+
+                                    if symbol in active_trades:
+
+                                        active_trades[
+                                            symbol
+                                        ]["tp"] = (
+                                            active_resistance
+                                        )
+
+                                trade["tp"] = (
+                                    active_resistance
+                                )
+
+                                logger.info(
+                                    f"🚀 [LONG DİNAMİK TP] "
+                                    f"{symbol} | "
+                                    f"TP={active_resistance:.8f}"
+                                )
+
+                        # =================================================
+                        # DİNAMİK TP — SHORT
+                        # =================================================
+
+                        else:
+
+                            new_runway = (
+                                (
+                                    current_price
+                                    -
+                                    active_support
+                                )
+                                /
+                                current_price
+                                *
+                                100
+                            )
+
+                            if (
+                                active_support
+                                <
+                                trade["tp"]
+                                and
+                                new_runway >= 0.8
+                            ):
+
+                                async with trade_lock:
+
+                                    if symbol in active_trades:
+
+                                        active_trades[
+                                            symbol
+                                        ]["tp"] = (
+                                            active_support
+                                        )
+
+                                trade["tp"] = (
+                                    active_support
+                                )
+
+                                logger.info(
+                                    f"🚀 [SHORT DİNAMİK TP] "
+                                    f"{symbol} | "
+                                    f"TP={active_support:.8f}"
+                                )
+
+                        # =================================================
+                        # SWEEP / YAPISAL BOZULMA
+                        # =================================================
+
+                        sweep_trigger = False
+
+                        if side == "long":
+
+                            if (
+                                current_price
+                                <
+                                active_support
+                                *
+                                0.992
+                            ):
+
+                                sweep_trigger = True
+
+                        else:
+
+                            if (
+                                current_price
+                                >
+                                active_resistance
+                                *
+                                1.008
+                            ):
+
+                                sweep_trigger = True
+
+                        if sweep_trigger:
+
+                            if side == "long":
+
+                                raw_change = (
+                                    (
+                                        current_price
+                                        -
+                                        trade["price"]
+                                    )
+                                    /
+                                    trade["price"]
+                                )
+
+                            else:
+
+                                raw_change = (
+                                    (
+                                        trade["price"]
+                                        -
+                                        current_price
+                                    )
+                                    /
+                                    trade["price"]
+                                )
+
+                            pnl_pct = (
+                                raw_change
+                                *
+                                100
+                                *
+                                settings.LEVERAGE
+                            )
+
+                            pnl_usdt = (
+                                settings.MARGIN_PER_TRADE
+                                *
+                                pnl_pct
+                                /
+                                100
+                            )
+
+                            await exchange.close_position(
+                                symbol,
+                                trade["qty"],
+                                side
+                            )
+
+                            logger.warning(
+                                f"\n"
+                                f"📊 SWEEP / GÜVENLİ ÇIKIŞ 🟠\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"Sembol : {symbol}\n"
+                                f"Yön    : {side.upper()}\n"
+                                f"Giriş  : {trade['price']:.8f}\n"
+                                f"Çıkış  : {current_price:.8f}\n"
+                                f"PnL    : ${pnl_usdt:+.2f}\n"
+                                f"Hold   : {hold_minutes:.1f} dk\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                            )
+
+                            async with trade_lock:
+
+                                active_trades.pop(
+                                    symbol,
+                                    None
+                                )
+
+                            continue
+
+                # =================================================
+                # PNL
+                # =================================================
+
+                if side == "long":
+
+                    raw_change_pct = (
+                        (
+                            current_price
+                            -
+                            trade["price"]
+                        )
+                        /
+                        trade["price"]
+                        *
+                        100
+                    )
+
+                else:
+
+                    raw_change_pct = (
+                        (
+                            trade["price"]
+                            -
+                            current_price
+                        )
+                        /
+                        trade["price"]
+                        *
+                        100
+                    )
+
+                pnl_pct = (
+                    raw_change_pct
+                    *
+                    settings.LEVERAGE
+                )
+
+                pnl_usdt = (
+                    settings.MARGIN_PER_TRADE
+                    *
+                    pnl_pct
+                    /
+                    100
+                )
+
+                # =================================================
+                # DİNAMİK KÂR KİLİTLEME
+                # =================================================
+
+                updated_sl = trade["sl"]
+
+                # -------------------------------------------------
+                # BREAKEVEN
+                # -------------------------------------------------
+
+                if (
+                    raw_change_pct >= 1.2
+                    and
+                    (
+                        (
+                            side == "long"
+                            and
+                            updated_sl
+                            <
+                            trade["price"]
+                        )
+                        or
+                        (
+                            side == "short"
+                            and
+                            updated_sl
+                            >
+                            trade["price"]
+                        )
+                    )
+                ):
+
+                    updated_sl = (
+                        trade["price"]
+                    )
+
+                    logger.success(
+                        f"🛡️ [BREAKEVEN] "
+                        f"{symbol} | "
+                        f"{side.upper()} | "
+                        f"Ham hareket=%{raw_change_pct:.2f}"
+                    )
+
+                # -------------------------------------------------
+                # KADEMELİ KÂR
+                # -------------------------------------------------
+
+                elif pnl_pct >= 7.0:
+
+                    excess = (
+                        pnl_pct - 7.0
+                    )
+
+                    step_index = int(
+                        excess // 3.0
+                    )
+
+                    locked_pnl = (
+                        7.0
+                        +
+                        step_index * 3.0
+                    )
+
+                    target_raw = (
+                        locked_pnl
+                        /
+                        settings.LEVERAGE
+                    )
+
+                    if side == "long":
+
+                        locked_price = (
+                            trade["price"]
+                            +
+                            (
+                                target_raw
+                                /
+                                100
+                                *
+                                trade["price"]
+                                *
+                                0.5
+                            )
+                        )
+
+                        if (
+                            locked_price
+                            >
+                            updated_sl
+                        ):
+
+                            updated_sl = (
+                                locked_price
+                            )
+
+                    else:
+
+                        locked_price = (
+                            trade["price"]
+                            -
+                            (
+                                target_raw
+                                /
+                                100
+                                *
+                                trade["price"]
+                                *
+                                0.5
+                            )
+                        )
+
+                        if (
+                            locked_price
+                            <
+                            updated_sl
+                        ):
+
+                            updated_sl = (
+                                locked_price
+                            )
+
+                    if updated_sl != trade["sl"]:
+
+                        logger.success(
+                            f"🔒 [KÂR KİLİDİ] "
+                            f"{symbol} | "
+                            f"{side.upper()} | "
+                            f"PnL=%{pnl_pct:.2f} | "
+                            f"Yeni SL={updated_sl:.8f}"
+                        )
+
+                # =================================================
+                # SL GÜNCELLE
+                # =================================================
+
+                if updated_sl != trade["sl"]:
+
+                    async with trade_lock:
+
+                        if symbol in active_trades:
+
+                            active_trades[
+                                symbol
+                            ]["sl"] = updated_sl
+
+                    trade["sl"] = updated_sl
+
+                # =================================================
+                # TP KONTROLÜ
+                # =================================================
+
+                tp_hit = False
+
+                if side == "long":
+
+                    if (
+                        current_price
+                        >=
+                        trade["tp"]
+                    ):
+
+                        tp_hit = True
+
+                else:
+
+                    if (
+                        current_price
+                        <=
+                        trade["tp"]
+                    ):
+
+                        tp_hit = True
+
+                if tp_hit:
+
+                    await exchange.close_position(
+                        symbol,
+                        trade["qty"],
+                        side
+                    )
+
+                    logger.success(
+                        f"\n"
+                        f"📊 TP KAPANIŞI 🟢\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Sembol : {symbol}\n"
+                        f"Yön    : {side.upper()}\n"
+                        f"Giriş  : {trade['price']:.8f}\n"
+                        f"Çıkış  : {current_price:.8f}\n"
+                        f"PnL    : ${pnl_usdt:+.2f}\n"
+                        f"PnL %  : %{pnl_pct:+.2f}\n"
+                        f"Hold   : {hold_minutes:.1f} dk\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
+
+                    async with trade_lock:
+
+                        active_trades.pop(
+                            symbol,
+                            None
+                        )
+
+                    continue
+
+                # =================================================
+                # SL KONTROLÜ
+                # =================================================
+
+                sl_hit = False
+
+                if side == "long":
+
+                    if (
+                        current_price
+                        <=
+                        trade["sl"]
+                    ):
+
+                        sl_hit = True
+
+                else:
+
+                    if (
+                        current_price
+                        >=
+                        trade["sl"]
+                    ):
+
+                        sl_hit = True
+
+                if sl_hit:
+
+                    profit_lock = (
+                        (
+                            side == "long"
+                            and
+                            trade["sl"]
+                            >
+                            trade["price"]
+                        )
+                        or
+                        (
+                            side == "short"
+                            and
+                            trade["sl"]
+                            <
+                            trade["price"]
+                        )
+                    )
+
+                    result = (
+                        "KÂRLI TRAILING KAPANIŞ 🟢"
+                        if profit_lock
+                        else
+                        "STOP 🔴"
+                    )
+
+                    await exchange.close_position(
+                        symbol,
+                        trade["qty"],
+                        side
+                    )
+
+                    logger.warning(
+                        f"\n"
+                        f"📊 {result}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Sembol : {symbol}\n"
+                        f"Yön    : {side.upper()}\n"
+                        f"Giriş  : {trade['price']:.8f}\n"
+                        f"Çıkış  : {current_price:.8f}\n"
+                        f"SL     : {trade['sl']:.8f}\n"
+                        f"PnL    : ${pnl_usdt:+.2f}\n"
+                        f"PnL %  : %{pnl_pct:+.2f}\n"
+                        f"Hold   : {hold_minutes:.1f} dk\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
+
+                    async with trade_lock:
+
+                        active_trades.pop(
+                            symbol,
+                            None
+                        )
+
+                    continue
+
+            # =================================================
+            # HEARTBEAT
+            # =================================================
+
+            if (
+                time.time()
+                -
+                last_heartbeat
+                >=
+                settings.HEARTBEAT_INTERVAL
+            ):
+
+                heartbeat = []
+
+                async with trade_lock:
+
+                    snapshot = dict(
+                        active_trades
+                    )
+
+                for symbol, trade in (
+                    snapshot.items()
+                ):
+
+                    current_price = (
+                        await exchange.get_current_price(
+                            symbol
+                        )
+                    )
+
+                    if current_price <= 0:
                         continue
 
-                raw_price_change_pct = ((current_price - trade['price']) / trade['price']) * 100
-                pnl_pct = raw_price_change_pct * settings.LEVERAGE
+                    if trade["side"] == "long":
 
-                # ==========================================
-                # DİNAMİK & KADEMELİ KÂR KİLİTLEME MİMARİSİ
-                # ==========================================
-                updated_sl = trade['sl']
-                # 1. Ham hareket %1.2 olduğunda Stop'u Giriş Fiyatına (Breakeven) taşı
-                if raw_price_change_pct >= 1.2 and updated_sl < trade['price']:
-                    updated_sl = trade['price']
-                    logger.success(f"🛡️ [BREAKEVEN KİLİDİ] {symbol} ham %1.2 hareket sağlandı. Stop giriş seviyesine çekildi: {updated_sl:.4f}")
-
-                # 2. Kaldıraçlı kâr %7'den itibaren her %3'lük artışta hesaplanan kademeli net kârın yarısını kilitle
-                elif pnl_pct >= 7.0:
-                    excess_pnl = pnl_pct - 7.0
-                    step_index = int(excess_pnl // 3.0)
-                    target_locked_pnl_pct = 7.0 + (step_index * 3.0)
-                    target_raw_gain_pct = target_locked_pnl_pct / settings.LEVERAGE
-                    
-                    # Kullanıcının talimatına göre tam hesaplanan kademeli hedefin yarısı
-                    half_gain_price = trade['price'] + (target_raw_gain_pct / 100.0 * trade['price'] * 0.5)
-                    
-                    if half_gain_price > updated_sl:
-                        updated_sl = half_gain_price
-                        logger.success(
-                            f"🔒 [KÂRIN YARISI KİLİTLENDİ] {symbol} Kaldıraçlı PnL: %{pnl_pct:.1f} | "
-                            f"Stop-Loss güncellendi: {updated_sl:.4f}"
+                        raw_pct = (
+                            (
+                                current_price
+                                -
+                                trade["price"]
+                            )
+                            /
+                            trade["price"]
+                            *
+                            100
                         )
 
-                if updated_sl != trade['sl']:
-                    async with trade_lock:
-                        if symbol in active_trades:
-                            active_trades[symbol]['sl'] = updated_sl
+                    else:
 
-                # TP / SL Kontrolleri
-                if current_price >= trade['tp']:
-                    raw_gain_pct = (current_price - trade['price']) / trade['price']
-                    profit_usdt = settings.MARGIN_PER_TRADE * settings.LEVERAGE * raw_gain_pct
-                    
-                    await exchange.close_position(symbol, trade['qty'])
-                    
-                    logger.success(
-                        f"\n📊 İŞLEM SONUÇ RAPORU (KÂRLI KAPANIŞ - TP 🟢)\n"
-                        f"----------------------------------------\n"
-                        f"Sembol: {symbol} | Yön: LONG\n"
-                        f"Giriş Fiyatı: {trade['price']} | Kapanış (TP): {current_price}\n"
-                        f"Kullanılan Margin: {settings.MARGIN_PER_TRADE} USDT ({settings.LEVERAGE}x)\n"
-                        f"Gerçekleşen Kâr: +${profit_usdt:.2f}\n"
-                        f"----------------------------------------"
-                    )
-                    async with trade_lock:
-                        if symbol in active_trades:
-                            del active_trades[symbol]
-                elif current_price <= trade['sl']:
-                    is_profit_lock = trade['sl'] > trade['price']
-                    result_text = "KÂRLI TRAILING KAPANIŞ 🟢" if is_profit_lock else "STOP OLDU 🔴"
-                    raw_gain_pct = (current_price - trade['price']) / trade['price']
-                    profit_usdt = settings.MARGIN_PER_TRADE * settings.LEVERAGE * raw_gain_pct
-                    
-                    await exchange.close_position(symbol, trade['qty'])
-                    
-                    logger.warning(
-                        f"\n📊 İŞLEM SONUÇ RAPORU ({result_text})\n"
-                        f"----------------------------------------\n"
-                        f"Sembol: {symbol} | Yön: LONG\n"
-                        f"Giriş Fiyatı: {trade['price']} | Kapanış (SL): {current_price}\n"
-                        f"Kullanılan Margin: {settings.MARGIN_PER_TRADE} USDT ({settings.LEVERAGE}x)\n"
-                        f"Gerçekleşen PnL: ${profit_usdt:+.2f}\n"
-                        f"----------------------------------------"
-                    )
-                    async with trade_lock:
-                        if symbol in active_trades:
-                            del active_trades[symbol]
+                        raw_pct = (
+                            (
+                                trade["price"]
+                                -
+                                current_price
+                            )
+                            /
+                            trade["price"]
+                            *
+                            100
+                        )
 
-            # Düşük Frekanslı Heartbeat Logu (Her 60 saniyede bir açık pozisyonların kısa özeti)
-            import time
-            now = time.time()
-            if now - last_heartbeat_time >= 60:
-                async with trade_lock:
-                    if active_trades:
-                        heartbeat_msgs = []
-                        for sym, trd in active_trades.items():
-                            curr_p = await exchange.get_current_price(sym)
-                            pnl_val = ((curr_p - trd['price']) / trd['price']) * 100 * settings.LEVERAGE if curr_p > 0 else 0.0
-                            heartbeat_msgs.append(f"{sym} (PnL: %{pnl_val:+.2f}, SL: {trd['sl']:.4f})")
-                        logger.info(f"💓 [HEARTBEAT] Açık Pozisyonlar: " + " | ".join(heartbeat_msgs))
-                last_heartbeat_time = now
+                    leveraged_pct = (
+                        raw_pct
+                        *
+                        settings.LEVERAGE
+                    )
+
+                    pnl_value = (
+                        settings.MARGIN_PER_TRADE
+                        *
+                        leveraged_pct
+                        /
+                        100
+                    )
+
+                    heartbeat.append(
+                        f"{symbol} "
+                        f"[{trade['side'].upper()}] "
+                        f"Price={current_price:.8f} "
+                        f"PnL=%{leveraged_pct:+.2f} "
+                        f"(${pnl_value:+.2f}) "
+                        f"SL={trade['sl']:.8f} "
+                        f"TP={trade['tp']:.8f}"
+                    )
+
+                if heartbeat:
+
+                    logger.info(
+                        "\n"
+                        f"💓 HEARTBEAT | {now_text()}\n"
+                        +
+                        "\n".join(
+                            heartbeat
+                        )
+                    )
+
+                last_heartbeat = time.time()
 
         except Exception as e:
-            logger.error(f"Pozisyon takip döngüsünde hata: {e}")
+
+            logger.exception(
+                f"Monitor hatası: {e}"
+            )
+
             await asyncio.sleep(5)
 
 
-# ==========================================
-# 5. ANA TARAMA VE KOORDİNASYON DÖNGÜSÜ
-# ==========================================
-async def scan_loop(exchange: BinanceExchange, active_trades: dict, trade_lock: asyncio.Lock):
-    """Havuz tarama ve sinyal arama döngüsü."""
+# ============================================================
+# 5. TARAMA LOOP
+# ============================================================
+
+async def scan_loop(
+    exchange,
+    active_trades,
+    trade_lock
+):
+
+    logger.info(
+        "🔎 Tarama motoru başlatıldı."
+    )
+
     while True:
+
+        start_time = time.time()
+
         try:
-            pool = await exchange.get_dynamic_pool()
+
+            logger.info(
+                "\n"
+                "════════════════════════════════════════\n"
+                f"🔎 YENİ ANALİZ | {now_text()}\n"
+                "════════════════════════════════════════"
+            )
+
+            pool = (
+                await exchange.get_dynamic_pool()
+            )
+
             if not pool:
+
                 await asyncio.sleep(30)
                 continue
 
-            btc_df = await exchange.fetch_ohlcv("BTC/USDT:USDT", settings.SETUP_TF, 50)
-            valid_setups_found = 0
+            btc_df = (
+                await exchange.fetch_ohlcv(
+                    "BTC/USDT:USDT",
+                    settings.SETUP_TF,
+                    50
+                )
+            )
+
+            signals = 0
+            checked = 0
+            skipped = 0
 
             for symbol in pool:
+
                 async with trade_lock:
-                    if len(active_trades) >= settings.MAX_CONCURRENT_TRADES:
+
+                    if (
+                        len(active_trades)
+                        >=
+                        settings.MAX_CONCURRENT_TRADES
+                    ):
+
+                        logger.info(
+                            "🛑 Maksimum pozisyon "
+                            "sayısına ulaşıldı."
+                        )
+
                         break
+
                     if symbol in active_trades:
+
                         continue
 
-                df_4h = await exchange.fetch_ohlcv(symbol, settings.MACRO_TF, 60)
-                df_1h = await exchange.fetch_ohlcv(symbol, settings.SETUP_TF, 60)
-                df_exec = await exchange.fetch_ohlcv(symbol, settings.EXEC_TF, settings.CANDLE_LIMIT)
+                checked += 1
 
-                if df_exec.empty or df_4h.empty or df_1h.empty:
-                    await asyncio.sleep(0.1)
+                # =================================================
+                # VERİ
+                # =================================================
+
+                df_4h = (
+                    await exchange.fetch_ohlcv(
+                        symbol,
+                        settings.MACRO_TF,
+                        60
+                    )
+                )
+
+                df_1h = (
+                    await exchange.fetch_ohlcv(
+                        symbol,
+                        settings.SETUP_TF,
+                        60
+                    )
+                )
+
+                df_15m = (
+                    await exchange.fetch_ohlcv(
+                        symbol,
+                        settings.EXEC_TF,
+                        settings.CANDLE_LIMIT
+                    )
+                )
+
+                if (
+                    df_4h.empty
+                    or df_1h.empty
+                    or df_15m.empty
+                ):
+
+                    skipped += 1
+
                     continue
 
-                strategy = StrategyEngine(symbol, df_4h, df_1h, df_exec, btc_df)
+                # =================================================
+                # STRATEJİ
+                # =================================================
+
+                strategy = StrategyEngine(
+                    symbol,
+                    df_4h,
+                    df_1h,
+                    df_15m,
+                    btc_df
+                )
+
                 result = strategy.analyze()
 
-                if result["action"] == "ENTER_LONG":
-                    valid_setups_found += 1
-                    current_price = result['price']
-                    
-                    notional_usdt = settings.MARGIN_PER_TRADE * settings.LEVERAGE
-                    raw_qty = notional_usdt / current_price
-                    qty = await exchange.amount_to_precision(symbol, raw_qty)
+                # =================================================
+                # LONG / SHORT
+                # =================================================
 
-                    logger.info(f"\n💡 İŞLEM KARARI AÇIKLAMASI:\n{result['explanation']}")
-                    
+                if result["action"] in [
+                    "ENTER_LONG",
+                    "ENTER_SHORT"
+                ]:
+
+                    signals += 1
+
+                    side = result["side"]
+
+                    current_price = (
+                        await exchange.get_current_price(
+                            symbol
+                        )
+                    )
+
+                    if current_price <= 0:
+
+                        continue
+
+                    # =================================================
+                    # NOTIONAL
+                    # =================================================
+
+                    notional = (
+                        settings.MARGIN_PER_TRADE
+                        *
+                        settings.LEVERAGE
+                    )
+
+                    raw_qty = (
+                        notional
+                        /
+                        current_price
+                    )
+
+                    qty = (
+                        exchange.amount_to_precision(
+                            symbol,
+                            raw_qty
+                        )
+                    )
+
+                    if qty <= 0:
+
+                        logger.warning(
+                            f"{symbol} qty geçersiz."
+                        )
+
+                        continue
+
+                    logger.info(
+                        result["explanation"]
+                    )
+
+                    # =================================================
+                    # EMİR
+                    # =================================================
+
                     try:
-                        order = await exchange.open_long(symbol, qty, result['sl'])
-                        if order:
-                            execution_price = float(order.get('price') or current_price)
-                            logger.success(
-                                f"[EMİR İLETİLDİ] {symbol} | LONG | "
-                                f"Fiyat: {execution_price} | Miktar: {qty} | Margin: {settings.MARGIN_PER_TRADE} USDT | Kaldıraç: {settings.LEVERAGE}x"
-                            )
-                            
-                            async with trade_lock:
-                                active_trades[symbol] = {
-                                    'price': execution_price,
-                                    'sl': result['sl'],
-                                    'tp': result['tp'],
-                                    'runway': result['runway'],
-                                    'qty': qty
-                                }
-                    except Exception as order_err:
-                        logger.error(f"Sinyal işlenirken emir hatası ({symbol}): {order_err}")
 
-                await asyncio.sleep(0.2)
+                        if side == "long":
+
+                            order = (
+                                await exchange.open_long(
+                                    symbol,
+                                    qty,
+                                    result["sl"]
+                                )
+                            )
+
+                        else:
+
+                            order = (
+                                await exchange.open_short(
+                                    symbol,
+                                    qty,
+                                    result["sl"]
+                                )
+                            )
+
+                        if not order:
+
+                            continue
+
+                        execution_price = safe_float(
+                            order.get("average")
+                            or order.get("price")
+                        )
+
+                        if execution_price <= 0:
+
+                            execution_price = (
+                                await exchange.get_current_price(
+                                    symbol
+                                )
+                            )
+
+                        # =================================================
+                        # AKTİF POZİSYON
+                        # =================================================
+
+                        async with trade_lock:
+
+                            # Son güvenlik kontrolü
+                            if (
+                                len(active_trades)
+                                <
+                                settings.MAX_CONCURRENT_TRADES
+                                and
+                                symbol
+                                not in
+                                active_trades
+                            ):
+
+                                active_trades[
+                                    symbol
+                                ] = {
+
+                                    "side":
+                                        side,
+
+                                    "price":
+                                        execution_price,
+
+                                    "sl":
+                                        result["sl"],
+
+                                    "tp":
+                                        result["tp"],
+
+                                    "runway":
+                                        result["runway"],
+
+                                    "risk_reward":
+                                        result["risk_reward"],
+
+                                    "qty":
+                                        qty,
+
+                                    "opened_at":
+                                        time.time(),
+
+                                    "opened_at_text":
+                                        now_text(),
+
+                                    "margin":
+                                        settings.MARGIN_PER_TRADE,
+
+                                    "leverage":
+                                        settings.LEVERAGE
+                                }
+
+                        logger.success(
+                            f"\n"
+                            f"🟢 POZİSYON AKTİF\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Sembol   : {symbol}\n"
+                            f"Yön      : {side.upper()}\n"
+                            f"Giriş    : {execution_price:.8f}\n"
+                            f"Qty      : {qty}\n"
+                            f"Margin   : {settings.MARGIN_PER_TRADE:.2f} USDT\n"
+                            f"Leverage : {settings.LEVERAGE}x\n"
+                            f"SL       : {result['sl']:.8f}\n"
+                            f"TP       : {result['tp']:.8f}\n"
+                            f"Runway   : %{result['runway']:.2f}\n"
+                            f"R/R      : {result['risk_reward']:.2f}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        )
+
+                    except Exception as order_error:
+
+                        logger.exception(
+                            f"Emir işleme hatası "
+                            f"{symbol}: {order_error}"
+                        )
+
+                else:
+
+                    logger.debug(
+                        f"⏭️ {symbol} | "
+                        f"{result.get('action')} | "
+                        f"{result.get('reason', '')}"
+                    )
+
+                await asyncio.sleep(
+                    0.15
+                )
+
+            # =================================================
+            # TARAMA RAPORU
+            # =================================================
 
             async with trade_lock:
-                active_count = len(active_trades)
-            logger.info(f"Tarama Tamamlandı. Havuz: {len(pool)} coin | Aktif İşlem: {active_count}/{settings.MAX_CONCURRENT_TRADES} | Yeni Sinyal: {valid_setups_found}")
-            
-            await asyncio.sleep(180)
 
-        except Exception as scan_err:
-            logger.error(f"Tarama döngüsü hatası: {scan_err}")
+                active_count = (
+                    len(active_trades)
+                )
+
+            elapsed = (
+                time.time()
+                -
+                start_time
+            )
+
+            logger.info(
+                "\n"
+                "════════════════════════════════════════\n"
+                f"📊 TARAMA TAMAMLANDI\n"
+                f"Havuz            : {len(pool)}\n"
+                f"Kontrol edilen   : {checked}\n"
+                f"Veri eksik       : {skipped}\n"
+                f"Yeni sinyal      : {signals}\n"
+                f"Aktif pozisyon   : "
+                f"{active_count}/{settings.MAX_CONCURRENT_TRADES}\n"
+                f"Süre             : {elapsed:.1f} sn\n"
+                "════════════════════════════════════════"
+            )
+
+            await asyncio.sleep(
+                settings.SCAN_INTERVAL
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                f"Tarama döngüsü hatası: {e}"
+            )
+
             await asyncio.sleep(30)
 
 
+# ============================================================
+# 6. MAIN
+# ============================================================
+
 async def main():
-    logger.info(f"Bot Başlatıldı | Dry-Run: {settings.DRY_RUN} | Max İşlem: {settings.MAX_CONCURRENT_TRADES} | Kaldıraç: {settings.LEVERAGE}x")
+
+    logger.info(
+        "\n"
+        "╔══════════════════════════════════════════╗\n"
+        "║       BINANCE FUTURES BOT               ║\n"
+        "║       LONG + SHORT TEST ENGINE          ║\n"
+        "╠══════════════════════════════════════════╣\n"
+        f"║ DRY RUN      : {settings.DRY_RUN}\n"
+        f"║ MAX POS      : {settings.MAX_CONCURRENT_TRADES}\n"
+        f"║ MARGIN       : {settings.MARGIN_PER_TRADE:.2f} USDT\n"
+        f"║ LEVERAGE     : {settings.LEVERAGE}x\n"
+        f"║ MARGIN MODE  : {settings.MARGIN_MODE}\n"
+        f"║ MACRO        : {settings.MACRO_TF}\n"
+        f"║ SETUP        : {settings.SETUP_TF}\n"
+        f"║ EXEC         : {settings.EXEC_TF}\n"
+        "╚══════════════════════════════════════════╝"
+    )
+
+    if settings.DRY_RUN:
+
+        logger.success(
+            "\n"
+            "🧪 TEST MODU AKTİF\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "✓ Binance gerçek verileri kullanılacak\n"
+            "✓ LONG + SHORT aktif\n"
+            "✓ Gerçek emir GÖNDERİLMEYECEK\n"
+            "✓ Pozisyonlar sanal takip edilecek\n"
+            "✓ Gerçek piyasa fiyatları kullanılacak\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    else:
+
+        logger.warning(
+            "\n"
+            "⚠️⚠️ GERÇEK EMİR MODU ⚠️⚠️\n"
+            "Binance Futures üzerinde gerçek emir gönderilecek!"
+        )
+
     exchange = BinanceExchange()
+
     active_trades = {}
+
     trade_lock = asyncio.Lock()
 
-    # İki görevi asyncio.gather ile paralel ve bağımsız olarak başlat
     try:
+
+        await exchange.load_markets()
+
         await asyncio.gather(
-            scan_loop(exchange, active_trades, trade_lock),
-            position_monitor_loop(exchange, active_trades, trade_lock)
+
+            scan_loop(
+                exchange,
+                active_trades,
+                trade_lock
+            ),
+
+            position_monitor_loop(
+                exchange,
+                active_trades,
+                trade_lock
+            )
         )
+
     except KeyboardInterrupt:
-        logger.info("Bot kullanıcı tarafından durduruldu.")
+
+        logger.info(
+            "Bot kullanıcı tarafından durduruldu."
+        )
+
     except Exception as e:
-        logger.exception(f"Beklenmeyen ana program hatası: {e}")
+
+        logger.exception(
+            f"Ana program hatası: {e}"
+        )
+
     finally:
+
         await exchange.close()
 
+
+# ============================================================
+# 7. BAŞLAT
+# ============================================================
+
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Bot kapatıldı."
+        )
