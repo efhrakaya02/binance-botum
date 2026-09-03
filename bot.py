@@ -122,7 +122,7 @@ class StrategyEngine:
         nearest_resistance = max(highs[-20:])
         nearest_support = min(lows[-20:])
         
-        # 1. Kazanç Alanı (Runway) Kontrolü: En az %1 ve üzeri olmalı (5x kaldıraç ile en az %5 ROI)
+        # 1. Kazanç Alanı (Runway) Kontrolü: En az %1 ve üzeri olmalı
         distance_to_res_pct = (nearest_resistance - last_close) / last_close * 100
         if distance_to_res_pct < 1.0:
             return {"action": "SKIP_TIGHT_RUNWAY"}
@@ -136,11 +136,10 @@ class StrategyEngine:
         risk_distance = last_close - sl
         reward_distance = tp - last_close
 
-        # Güvenlik Kontrolü: Giriş fiyatı hatalı seviyedeyse pas geç
         if risk_distance <= 0 or reward_distance <= 0:
             return {"action": "SKIP_INVALID_PRICES"}
 
-        # 2. Risk / Ödül Oranı Kuralı: Risk, hedef kazancın (ödülün) %50'sini aşamaz (Reward >= 2 * Risk)
+        # 2. Risk / Ödül Oranı Kuralı: Risk, ödülün %50'sini aşamaz (Reward >= 2 * Risk)
         if (risk_distance / reward_distance) > 0.5:
             return {"action": "SKIP_RISK_REWARD_VIOLATION"}
 
@@ -148,7 +147,7 @@ class StrategyEngine:
             f"İşlem Kararı [LONG]: {self.symbol} paritesinde 4H makro trend uyumlu, "
             f"1H kurulum ve 15M momentum tetiklendi. Giriş Fiyatı: {last_close:.4f}, "
             f"Stop-Loss: {sl:.4f}, Dinamik Hedef (TP): {tp:.4f}. "
-            f"Kazanç Alanı (Runway): %{distance_to_res_pct:.2f} | Risk/Ödül Oranı Kuralı Sağlandı (<= %50)."
+            f"Kazanç Alanı (Runway): %{distance_to_res_pct:.2f} | Risk/Ödül Oranı Sağlandı."
         )
 
         return {
@@ -172,7 +171,7 @@ async def main():
 
     try:
         while True:
-            # 1. Aktif İşlem Takibi, Süpürme Kontrolü ve Kademeli Trailing Stop Yönetimi
+            # 1. Aktif İşlem Takibi, Süpürme Kontrolü ve Gelişmiş Kademeli Trailing Stop Yönetimi
             current_symbols = list(active_trades.keys())
             for symbol in current_symbols:
                 current_price = await exchange.get_current_price(symbol)
@@ -189,10 +188,12 @@ async def main():
                     recent_highs = df_exec_live['high'].values
                     active_resistance = max(recent_highs[-10:])
                     
-                    # Dinamik Hedef Güncellemesi (Fiyat yeni direnç kırdıkça TP'yi yukarı kaydır)
-                    if active_resistance > trade['tp']:
+                    # Dinamik Hedef (TP) Güncellemesi: Runway ve yapısal direnç/likidasyon koşulları uygunsa TP'yi yukarı taşı
+                    # Eğer anlık direnç mevcut TP'den yüksekse ve aradaki kazanç alanı (runway) mantıklıysa TP güncellenir
+                    new_runway_pct = (active_resistance - current_price) / current_price * 100
+                    if active_resistance > trade['tp'] and new_runway_pct >= 0.8:
                         trade['tp'] = active_resistance
-                        logger.info(f"🚀 [DİNAMİK TP GÜNCELLEMESİ] {symbol} yeni direnç kırıldı. Yeni TP: {trade['tp']:.4f}")
+                        logger.info(f"🚀 [DİNAMİK TP & LİKİDİTE GÜNCELLEMESİ] {symbol} yeni direnç ve likidite alanı yakalandı. Yeni TP: {trade['tp']:.4f}")
 
                     # Aktif Süpürme Kontrolü: Fiyat ani bir şekilde ana desteğin altına iğne atıp süpürürse erken koruma
                     if current_price < active_support * 0.992:
@@ -200,19 +201,38 @@ async def main():
                         del active_trades[symbol]
                         continue
 
-                # Kaldıraçlı PnL Hesabı
-                pnl_pct = ((current_price - trade['price']) / trade['price']) * 100 * settings.LEVERAGE
+                # Ham Fiyat Hareket Yüzdesi ve Kaldıraçlı PnL Hesabı
+                raw_price_change_pct = ((current_price - trade['price']) / trade['price']) * 100
+                pnl_pct = raw_price_change_pct * settings.LEVERAGE
 
-                # Kademeli Trailing Stop & Breakeven Mantığı
-                # 1. Aşama: Kaldıraçlı kâr %15'i (Saf %3) geçtiyse Stop-Loss'u Giriş Fiyatına (Breakeven) taşı
-                if pnl_pct >= 15.0 and trade['sl'] < trade['price']:
+                # ==========================================
+                # DİNAMİK & KADEMELİ YARI-KÂR KİLİTLEME MİMARİSİ
+                # ==========================================
+                # 1. Ham hareket %1.2'ye ulaştığında (5x ile ~%6 PnL) Stop'u Giriş Fiyatına (Breakeven) taşı
+                if raw_price_change_pct >= 1.2 and trade['sl'] < trade['price']:
                     trade['sl'] = trade['price']
-                    logger.success(f"🛡️ [BREAKEVEN KİLİDİ] {symbol} kaldıraçlı %15 kâr aşıldı. Stop-Loss giriş seviyesine taşındı: {trade['sl']:.4f}")
+                    logger.success(f"🛡️ [BREAKEVEN KİLİDİ] {symbol} ham %1.2 hareket sağlandı. Stop giriş seviyesine çekildi: {trade['sl']:.4f}")
 
-                # 2. Aşama: Kaldıraçlı kâr %30'u (Saf %6) geçtiyse Stop-Loss'u karlı bölgeye taşı
-                elif pnl_pct >= 30.0 and trade['sl'] < trade['price'] * 1.015:
-                    trade['sl'] = trade['price'] * 1.015
-                    logger.success(f"🔒 [KÂR KİLİTLEME TRAILING] {symbol} kaldıraçlı %30 kâr aşıldı. Stop-Loss karlı bölgeye taşındı: {trade['sl']:.4f}")
+                # 2. Kaldıraçlı kâr %7'den itibaren her %3'lük artışta kazancın YARISINI kilitleyen dinamik stop
+                elif pnl_pct >= 7.0:
+                    # %7 üstündeki her %3'lük basamağı hesapla (7, 10, 13, 16...)
+                    excess_pnl = pnl_pct - 7.0
+                    step_index = int(excess_pnl // 3.0)
+                    target_locked_pnl_pct = 7.0 + (step_index * 3.0)
+                    
+                    # Bu kaldıraçlı kâr yüzdesine karşılık gelen saf fiyat hedefi
+                    target_raw_gain_pct = target_locked_pnl_pct / settings.LEVERAGE
+                    
+                    # İstenen kural: Kazancın YARISINI kilitle (Yani giriş ile anlık fiyat farkının %50'si kadar yukarıda stop tut)
+                    half_gain_price = trade['price'] + ((current_price - trade['price']) * 0.5)
+                    
+                    # Stop seviyesini sadece yukarı yönlü günvelle (Asla geriye sarmaz)
+                    if half_gain_price > trade['sl']:
+                        trade['sl'] = half_gain_price
+                        logger.success(
+                            f"🔒 [KÂRIN YARISI KİLİTLENDİ] {symbol} Kaldıraçlı PnL: %{pnl_pct:.1f} | "
+                            f"Stop-Loss güncellendi: {trade['sl']:.4f} (Kazancın %50'si kasaya alındı)"
+                        )
 
                 # Temel TP / SL Kontrolleri
                 if current_price >= trade['tp']:
