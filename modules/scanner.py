@@ -8,7 +8,7 @@ class MarketScanner:
         # Binance Futures API bağlantısı
         self.exchange = ccxt.binance({
             'apiKey': self.config.BINANCE_API_KEY,
-            'secret': self.config.BINANCE_SECRET,
+            'secret': self.config.BINANCE_API_SECRET,
             'enableRateLimit': True,
             'options': {'defaultType': 'future'}
         })
