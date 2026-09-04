@@ -7,7 +7,7 @@ class MarketScanner:
         self.config = config
         self.exchange = ccxt.binance({
             'apiKey': self.config.BINANCE_API_KEY,
-            'secret': self.config.BINANCE_SECRET,
+            'secret': self.config.BINANCE_API_SECRET,
             'enableRateLimit': True,
             'options': {'defaultType': 'future'}
         })
@@ -44,13 +44,21 @@ class MarketScanner:
         try:
             ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5)
             ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=10)
+            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15) 
             
-            if not ohlcv_4h or not ohlcv_1h:
+            if not ohlcv_4h or not ohlcv_1h or not ohlcv_5m:
                 return None
 
             close_4h_current = ohlcv_4h[-1][4]
             close_4h_prev = ohlcv_4h[-2][4]
             
+            volumes = [candle[5] for candle in ohlcv_5m[-12:-2]]
+            avg_volume = sum(volumes) / len(volumes) if volumes else 0
+            current_volume = ohlcv_5m[-2][5] 
+
+            if current_volume < (avg_volume * self.config.VOLUME_MULTIPLIER):
+                return None 
+
             if close_4h_current > close_4h_prev:
                 return {"symbol": symbol, "trend": "long"}
             elif close_4h_current < close_4h_prev:
