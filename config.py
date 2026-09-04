@@ -2,7 +2,7 @@ import os
 
 # API ve Güvenlik (Railway Variables üzerinden çekilecek)
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 # İşlem Parametreleri
 MAX_OPEN_POSITIONS = 3
