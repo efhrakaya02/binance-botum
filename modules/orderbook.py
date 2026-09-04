@@ -32,11 +32,9 @@ class OrderbookAnalyzer:
                             
                     distance_pct = ((wall_price - current_price) / current_price) * 100
                     if distance_pct < 0.5:
-                        return False # Riskli, sessizce iptal et
+                        return False
                     else:
-                        print(f"✅ ONAY [{self.symbol.upper()}]: PA uyumlu. Yukarı yönlü likidasyon engeli yok (İlk direnç %{distance_pct:.2f} uzakta). İşlem tetikleniyor.")
                         return True
-                        
                 else:
                     max_bid_vol = 0
                     wall_price = 0
@@ -49,11 +47,8 @@ class OrderbookAnalyzer:
                             
                     distance_pct = ((current_price - wall_price) / current_price) * 100
                     if distance_pct < 0.5:
-                        return False # Riskli, sessizce iptal et
+                        return False
                     else:
-                        print(f"✅ ONAY [{self.symbol.upper()}]: PA uyumlu. Aşağı yönlü likidasyon engeli yok (İlk destek %{distance_pct:.2f} uzakta). İşlem tetikleniyor.")
                         return True
-
         except Exception:
-            # WebSocket hatalarında ekranı kirletmeden atla
             return False
