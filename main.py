@@ -8,14 +8,13 @@ from modules.state_manager import StateManager
 from modules.execution import ExecutionEngine
 
 async def main_loop():
-    print("🤖 PA Bot Başlatılıyor... (Sadeleştirilmiş Log Modu Aktif)")
+    print("🤖 PA Bot Başlatılıyor... (Test Modu Aktif)")
     
     state_mgr = StateManager()
     risk_mgr = RiskManager(config)
     scanner = MarketScanner(config)
     executor = ExecutionEngine(config)
     
-    # İşlem takibi loglarının sıklığını yönetmek için zamanlayıcı (Her 60 saniyede 1 rapor)
     last_status_print = {} 
     
     while True:
@@ -23,9 +22,6 @@ async def main_loop():
             now = time.time()
             active_trades = state_mgr.state["active_trades"].copy()
             
-            # ---------------------------------------------------------
-            # 1. AŞAMA: AKTİF İŞLEMLERİ YÖNET
-            # ---------------------------------------------------------
             for symbol, trade_data in active_trades.items():
                 try:
                     ticker = await executor.exchange.fetch_ticker(symbol)
@@ -43,7 +39,6 @@ async def main_loop():
                     dynamic_sl = risk_mgr.calculate_stop_loss(entry_price, trade_data["max_price"], is_long)
                     close_condition = (is_long and current_price <= dynamic_sl) or (not is_long and current_price >= dynamic_sl)
                     
-                    # Anlık Kar/Zarar yüzdesini hesapla
                     if is_long:
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
                     else:
@@ -59,19 +54,14 @@ async def main_loop():
                         state_mgr.state["active_trades"][symbol] = trade_data
                         state_mgr.save_state()
                         
-                        # Ekrana 60 saniyede bir işlem durumu bas (Spam engelleme)
                         if now - last_status_print.get(symbol, 0) > 60:
                             print(f"📊 TAKİP [{symbol}] | Yön: {trade_data['type'].upper()} | Giriş: {entry_price:.5f} | Anlık: {current_price:.5f} | Dinamik Stop: {dynamic_sl:.5f} | PnL: %{pnl_pct:.2f}")
                             last_status_print[symbol] = now
                             
                 except Exception:
-                    pass # Anlık API kopmalarını sessizce geç
+                    pass 
             
-            # ---------------------------------------------------------
-            # 2. AŞAMA: YENİ FIRSAT TARAMASI
-            # ---------------------------------------------------------
             if state_mgr.get_used_slots() < config.MAX_OPEN_POSITIONS:
-                # Ekranda sürekli "Taranıyor" yazısını göstermemek için sessizce tarar
                 radar_list = await scanner.scan_market()
                 
                 for opportunity in radar_list:
@@ -89,7 +79,6 @@ async def main_loop():
                         ticker = await executor.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        # Burada sadece is_safe True ise log basılacak (orderbook içinden)
                         is_safe = await ob_analyzer.check_for_walls_and_sweeps(current_price, is_long=(trend=="long"))
                         
                         if is_safe:
@@ -103,8 +92,8 @@ async def main_loop():
                                     "amount": trade_result["amount"]
                                 }
                                 state_mgr.save_state()
-                                last_status_print[symbol] = now # Hemen ardından takip logu atmasın diye zamanı başlat
-                                print(f"🚀 BAŞARILI: {symbol} işlemi açıldı. (Miktar: {trade_result['amount']})\n")
+                                last_status_print[symbol] = now 
+                                print(f"🚀 BAŞARILI: {symbol} sanal işlem açıldı.\n")
                     except Exception:
                         continue 
             
