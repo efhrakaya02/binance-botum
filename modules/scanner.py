@@ -8,7 +8,7 @@ class MarketScanner:
         # Binance Futures API bağlantısı
         self.exchange = ccxt.binance({
             'apiKey': self.config.BINANCE_API_KEY,
-            'secret': self.config.BINANCE_API_SECRET, # Güncellenmiş secret ismi
+            'secret': self.config.BINANCE_API_SECRET,
             'enableRateLimit': True,
             'options': {'defaultType': 'future'}
         })
@@ -25,16 +25,20 @@ class MarketScanner:
                 print("⚠️ USDT paritesi bulunamadı. Filtreleme hatası olabilir.")
                 return []
             
-            df = pd.DataFrame(usdt_pairs.values())
+            # PANDAS ÇÖKME KORUMASI: Verileri tabloya vermeden önce elimizle listeliyoruz
+            data_list = []
+            for ticker_info in usdt_pairs.values():
+                data_list.append({
+                    'symbol': ticker_info.get('symbol', ''),
+                    'percentage': ticker_info.get('percentage', 0.0),
+                    'quoteVolume': ticker_info.get('quoteVolume', 0.0)
+                })
+                
+            df = pd.DataFrame(data_list)
             
-            # Çökmeyi önlemek için sadece var olan gerekli sütunları seçelim
-            required_cols = ['symbol', 'percentage', 'quoteVolume']
-            for col in required_cols:
-                if col not in df.columns:
-                    print(f"⚠️ Sütun bulunamadı: {col}")
-                    return []
-                    
-            df = df[required_cols].dropna()
+            # Boş gelen verileri (None) 0 ile doldurarak sıralamada hata vermesini engelliyoruz
+            df['percentage'] = df['percentage'].fillna(0)
+            df['quoteVolume'] = df['quoteVolume'].fillna(0)
 
             # İlk 50 Gainer, Loser ve Volume
             gainers = df.sort_values(by='percentage', ascending=False).head(50)['symbol'].tolist()
@@ -44,6 +48,7 @@ class MarketScanner:
             # Aynı coinler birden fazla listede olabileceği için benzersiz bir havuz oluşturuyoruz
             combined_list = list(set(gainers + losers + volume_leaders))
             return combined_list
+            
         except Exception as e:
             print(f"Veri çekme hatası: {e}")
             return []
@@ -82,7 +87,6 @@ class MarketScanner:
         if not top_coins:
             return radar_list
 
-        # Rate-limit (API Ban) yememek için 5'li paketler halinde asenkron sorgu atıyoruz
         batch_size = 5
         for i in range(0, len(top_coins), batch_size):
             batch = top_coins[i:i+batch_size]
@@ -93,11 +97,10 @@ class MarketScanner:
                 if res:
                     radar_list.append(res)
             
-            await asyncio.sleep(0.5) # Binance'i yormamak için mikro bekleme
+            await asyncio.sleep(0.5) 
 
         print(f"✅ Tarama bitti. Harekete hazırlanan coin sayısı: {len(radar_list)}")
         return radar_list
 
     async def close(self):
-        # İşlem bitince bağlantıyı güvenli kapat
         await self.exchange.close()
