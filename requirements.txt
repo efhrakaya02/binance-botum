@@ -1,7 +1,4 @@
-ccxt==4.3.42
-pandas==2.2.1
-numpy==1.26.4
-pydantic-settings==2.2.1
-loguru==0.7.2
-python-dotenv==1.0.1
-Flask
+ccxt==4.2.14
+pandas==2.2.0
+websockets==12.0
+asyncio
