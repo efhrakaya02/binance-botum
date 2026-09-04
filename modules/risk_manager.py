@@ -11,7 +11,12 @@ class RiskManager:
             elif self.config.BREAKEVEN_PCT <= profit_pct < self.config.TRAILING_ACTIVATION_PCT:
                 return entry_price
             else:
-                locked_profit_pct = profit_pct / 2.0
+                # 🚀 YENİ: %3.5 Üzeri Sabit %75 Kilitleme
+                if profit_pct >= 3.5:
+                    locked_profit_pct = profit_pct * 0.75
+                else:
+                    locked_profit_pct = profit_pct * 0.50
+                    
                 return entry_price * (1 + (locked_profit_pct / 100))
         else:
             profit_pct = ((entry_price - max_reached_price) / entry_price) * 100
@@ -21,5 +26,10 @@ class RiskManager:
             elif self.config.BREAKEVEN_PCT <= profit_pct < self.config.TRAILING_ACTIVATION_PCT:
                 return entry_price
             else:
-                locked_profit_pct = profit_pct / 2.0
+                # 🚀 YENİ: %3.5 Üzeri Sabit %75 Kilitleme
+                if profit_pct >= 3.5:
+                    locked_profit_pct = profit_pct * 0.75
+                else:
+                    locked_profit_pct = profit_pct * 0.50
+                    
                 return entry_price * (1 - (locked_profit_pct / 100))
