@@ -8,7 +8,7 @@ class MarketScanner:
         # Binance Futures API bağlantısı
         self.exchange = ccxt.binance({
             'apiKey': self.config.BINANCE_API_KEY,
-            'secret': self.config.BINANCE_API_SECRET,
+            'secret': self.config.BINANCE_API_SECRET, # Güncellenmiş secret ismi
             'enableRateLimit': True,
             'options': {'defaultType': 'future'}
         })
@@ -18,18 +18,30 @@ class MarketScanner:
         try:
             tickers = await self.exchange.fetch_tickers()
             
-            # Sadece vadeli işlemlerdeki USDT paritelerini al
-            usdt_pairs = {k: v for k, v in tickers.items() if k.endswith('/USDT')}
+            # Vadeli işlemlerde semboller "BTC/USDT:USDT" formatındadır!
+            usdt_pairs = {k: v for k, v in tickers.items() if ':USDT' in k}
+            
+            if not usdt_pairs:
+                print("⚠️ USDT paritesi bulunamadı. Filtreleme hatası olabilir.")
+                return []
             
             df = pd.DataFrame(usdt_pairs.values())
-            df = df[['symbol', 'percentage', 'quoteVolume']].dropna()
+            
+            # Çökmeyi önlemek için sadece var olan gerekli sütunları seçelim
+            required_cols = ['symbol', 'percentage', 'quoteVolume']
+            for col in required_cols:
+                if col not in df.columns:
+                    print(f"⚠️ Sütun bulunamadı: {col}")
+                    return []
+                    
+            df = df[required_cols].dropna()
 
             # İlk 50 Gainer, Loser ve Volume
             gainers = df.sort_values(by='percentage', ascending=False).head(50)['symbol'].tolist()
             losers = df.sort_values(by='percentage', ascending=True).head(50)['symbol'].tolist()
             volume_leaders = df.sort_values(by='quoteVolume', ascending=False).head(50)['symbol'].tolist()
 
-            # Aynı coinler birden fazla listede olabileceği için benzersiz (unique) bir havuz oluşturuyoruz
+            # Aynı coinler birden fazla listede olabileceği için benzersiz bir havuz oluşturuyoruz
             combined_list = list(set(gainers + losers + volume_leaders))
             return combined_list
         except Exception as e:
@@ -51,8 +63,7 @@ class MarketScanner:
             close_4h_current = ohlcv_4h[-1][4]
             close_4h_prev = ohlcv_4h[-2][4]
             
-            # Burada makro yön belirlenir (İleride PA ve hacim filtreleri buraya eklenecek)
-            # Şimdilik hareketin yeni başladığını tespit etmek için basit bir ivme kontrolü
+            # Burada makro yön belirlenir
             if close_4h_current > close_4h_prev:
                 return {"symbol": symbol, "trend": "long"}
             elif close_4h_current < close_4h_prev:
@@ -68,6 +79,9 @@ class MarketScanner:
         top_coins = await self.get_top_coins()
         
         radar_list = []
+        if not top_coins:
+            return radar_list
+
         # Rate-limit (API Ban) yememek için 5'li paketler halinde asenkron sorgu atıyoruz
         batch_size = 5
         for i in range(0, len(top_coins), batch_size):
