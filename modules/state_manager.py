@@ -5,7 +5,6 @@ STATE_FILE = "data/state.json"
 
 class StateManager:
     def __init__(self):
-        # Data klasörü yoksa oluştur
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         if not os.path.exists(STATE_FILE):
             self._create_empty_state()
@@ -13,8 +12,8 @@ class StateManager:
 
     def _create_empty_state(self):
         initial_state = {
-            "active_trades": {}, # Sembol: {entry, max_price, sl_price, type}
-            "reserved_slots": [] # Sweep yiyip takibe alınan coinler
+            "active_trades": {}, 
+            "reserved_slots": [] 
         }
         with open(STATE_FILE, "w") as f:
             json.dump(initial_state, f, indent=4)
