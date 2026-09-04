@@ -28,7 +28,7 @@ from flask import Flask, jsonify
 # İŞLEM KURALLARI
 #
 # Maksimum:
-#   2 açık pozisyon
+#   3 açık pozisyon
 #   10 USDT margin / pozisyon
 #   maksimum 5x
 #
@@ -139,6 +139,22 @@ COOLDOWN_MINUTES = 60
 MIN_QUOTE_VOLUME = 2_000_000
 
 MAX_SPREAD_PERCENT = 0.15
+
+
+# ------------------------------------------------------------
+# SCORE / REGRESSION LIMITS
+# ------------------------------------------------------------
+# These constants are used by the detailed PA scoring engine.
+# Structure/setup/trigger are intentionally capped at 40/30/30.
+STRUCTURE_SCORE_MAX = 40
+SETUP_SCORE_MAX = 30
+TRIGGER_SCORE_MAX = 30
+
+# Regression channel confirmation limits.
+REGRESSION_CHANNEL_LOOKBACK = 100
+REGRESSION_CHANNEL_STD_MULT = 2.0
+REGRESSION_MIN_SLOPE_PERCENT = 0.01
+REGRESSION_MAX_DISTANCE_ATR = 3.0
 
 
 # ------------------------------------------------------------
