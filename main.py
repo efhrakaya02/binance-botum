@@ -106,9 +106,11 @@ async def main_loop():
             
             await asyncio.sleep(5)
             
-        except Exception:
+        except Exception as e:
+            import traceback
+            print(f"❌ Ana Döngü Hatası (10 sn sonra tekrar denenecek): {e}")
+            traceback.print_exc()
             await asyncio.sleep(10)
-
 if __name__ == "__main__":
     try:
         asyncio.run(main_loop())
