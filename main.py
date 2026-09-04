@@ -8,7 +8,7 @@ from modules.state_manager import StateManager
 from modules.execution import ExecutionEngine
 
 async def main_loop():
-    print("🤖 PA Bot Başlatılıyor... (Test Modu Aktif)")
+    print("🤖 PA Bot Başlatılıyor... (Test Modu + Cooldown & Hacim Filtresi Aktif)")
     
     state_mgr = StateManager()
     risk_mgr = RiskManager(config)
@@ -49,6 +49,9 @@ async def main_loop():
                         success = await executor.close_position(symbol, 'buy' if is_long else 'sell', trade_data["amount"])
                         if success:
                             del state_mgr.state["active_trades"][symbol]
+                            # 🛡️ YENİ: Kapanan coini Cooldown (Soğuma) listesine al
+                            state_mgr.set_cooldown(symbol, config.COOLDOWN_MINUTES)
+                            print(f"❄️ {symbol} için {config.COOLDOWN_MINUTES} dakikalık soğuma süresi başlatıldı.")
                             state_mgr.save_state()
                     else:
                         state_mgr.state["active_trades"][symbol] = trade_data
@@ -72,6 +75,10 @@ async def main_loop():
                     trend = opportunity["trend"]
                     
                     if symbol in state_mgr.state["active_trades"]:
+                        continue
+                        
+                    # 🛡️ YENİ: Cooldown (Soğuma) listesinde olan coini atla
+                    if state_mgr.is_in_cooldown(symbol):
                         continue
                         
                     ob_analyzer = OrderbookAnalyzer(symbol)
