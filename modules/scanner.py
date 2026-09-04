@@ -52,16 +52,28 @@ class MarketScanner:
             close_4h_current = ohlcv_4h[-1][4]
             close_4h_prev = ohlcv_4h[-2][4]
             
+            # 5 Dakikalık Mum Verileri
+            open_5m = ohlcv_5m[-2][1]
+            close_5m = ohlcv_5m[-2][4]
+            current_volume = ohlcv_5m[-2][5] 
+            
+            # Önceki 10 mumun hacim ortalaması
             volumes = [candle[5] for candle in ohlcv_5m[-12:-2]]
             avg_volume = sum(volumes) / len(volumes) if volumes else 0
-            current_volume = ohlcv_5m[-2][5] 
 
-            if current_volume < (avg_volume * self.config.VOLUME_MULTIPLIER):
+            # 🚀 FİLTRE 1: Hacim en az 2 katına (2.0x) çıkmış olmalı
+            if current_volume < (avg_volume * 2.0):
                 return None 
 
-            if close_4h_current > close_4h_prev:
+            # 🚀 FİLTRE 2: Yön ve Mum Rengi Uyumu
+            if close_4h_current > close_4h_prev: # LONG TREND
+                if close_5m <= open_5m: # Kırmızı mumsa pas geç
+                    return None
                 return {"symbol": symbol, "trend": "long"}
-            elif close_4h_current < close_4h_prev:
+                
+            elif close_4h_current < close_4h_prev: # SHORT TREND
+                if close_5m >= open_5m: # Yeşil mumsa pas geç
+                    return None
                 return {"symbol": symbol, "trend": "short"}
             
             return None
