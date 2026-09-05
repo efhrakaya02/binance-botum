@@ -8,7 +8,7 @@ from modules.state_manager import StateManager
 from modules.execution import ExecutionEngine
 
 async def main_loop():
-    print("🤖 PA Bot Başlatılıyor... (Zirve PnL Takibi, Filtreler ve 30Dk Raporlama Aktif)")
+    print("🤖 PA Bot Başlatılıyor... (Kapanış Sebepleri ve Gelişmiş Raporlama Aktif)")
     
     state_mgr = StateManager()
     risk_mgr = RiskManager(config)
@@ -43,7 +43,6 @@ async def main_loop():
                         
                     dynamic_sl = risk_mgr.calculate_stop_loss(entry_price, trade_data["max_price"], is_long)
                     
-                    # 🚀 YENİ: Anlık PnL ve Zirve (Peak) PnL Hesaplaması
                     if is_long:
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
                         peak_pnl = ((max_price - entry_price) / entry_price) * 100
@@ -57,15 +56,28 @@ async def main_loop():
                     close_condition = (is_long and current_price <= dynamic_sl) or (not is_long and current_price >= dynamic_sl)
                     
                     if close_condition or timeout_close:
+                        # 🚀 YENİ: Kapanış Sebebini Belirleme
+                        close_reason = ""
                         if timeout_close:
-                            print(f"\n⏳ İŞLEM ZAMAN AŞIMI (60dk): {symbol} yataya bağladı. Kapanış: {current_price} | Net PnL: %{pnl_pct:.2f} | Gördüğü Zirve: %{peak_pnl:.2f}")
+                            close_reason = "Zaman Aşımı"
+                        elif pnl_pct <= -0.1:
+                            close_reason = "Stop-Loss"
+                        elif pnl_pct >= 0.5:
+                            close_reason = "Kar Kilitlendi"
                         else:
-                            print(f"\n🔔 İŞLEM KAPATILDI (STOP/TP): {symbol} | Kapanış: {current_price} | Net PnL: %{pnl_pct:.2f} | Gördüğü Zirve: %{peak_pnl:.2f}")
+                            close_reason = "Başa Baş (Breakeven)"
+
+                        print(f"\n🔔 İŞLEM KAPATILDI [{close_reason}]: {symbol} | Kapanış: {current_price:.5f} | Net PnL: %{pnl_pct:.2f} | Zirve: %{peak_pnl:.2f}")
                             
                         success = await executor.close_position(symbol, 'buy' if is_long else 'sell', trade_data["amount"])
                         if success:
-                            # Rapor geçmişine Zirve PnL de ekleniyor
-                            closed_trades_history.append({"symbol": symbol, "pnl": pnl_pct, "peak": peak_pnl})
+                            # 🚀 YENİ: Sebebi rapora ekliyoruz
+                            closed_trades_history.append({
+                                "symbol": symbol, 
+                                "pnl": pnl_pct, 
+                                "peak": peak_pnl, 
+                                "reason": close_reason
+                            })
                             
                             del state_mgr.state["active_trades"][symbol]
                             state_mgr.set_cooldown(symbol, config.COOLDOWN_MINUTES)
@@ -76,17 +88,16 @@ async def main_loop():
                         state_mgr.save_state()
                         
                         if now - last_status_print.get(symbol, 0) > 60:
-                            # 🚀 YENİ: Log ekranına Zirve PnL eklendi
-                            print(f"📊 TAKİP [{symbol}] | Yön: {trade_data['type'].upper()} | Giriş: {entry_price:.5f} | Anlık: {current_price:.5f} | Stop: {dynamic_sl:.5f} | PnL: %{pnl_pct:.2f} | Zirve PnL: %{peak_pnl:.2f} | Süre: {int((now - entry_time)/60)} dk")
+                            print(f"📊 TAKİP [{symbol}] | Yön: {trade_data['type'].upper()} | Giriş: {entry_price:.5f} | Anlık: {current_price:.5f} | Stop: {dynamic_sl:.5f} | PnL: %{pnl_pct:.2f} | Zirve: %{peak_pnl:.2f} | Süre: {int((now - entry_time)/60)} dk")
                             last_status_print[symbol] = now
                             
                 except Exception:
                     pass 
             
             if now - last_report_time >= 1800:
-                print("\n" + "="*50)
+                print("\n" + "="*70)
                 print("🕒 30 DAKİKALIK PERFORMANS ÖZETİ")
-                print("="*50)
+                print("="*70)
                 if not closed_trades_history:
                     print("ℹ️ Son 30 dakikada kapanan işlem bulunmuyor.")
                 else:
@@ -99,12 +110,15 @@ async def main_loop():
                             wins += 1
                         else:
                             losses += 1
-                        print(f"🔸 {t['symbol']:<15} | Net PnL: %{t['pnl']:.2f} | Gördüğü Zirve: %{t['peak']:.2f}")
+                        
+                        # Rapor Formatı
+                        icon = "✅" if t["pnl"] > 0 else ("❌" if t["pnl"] < -0.1 else "🛡️")
+                        print(f"{icon} {t['symbol']:<12} | Net PnL: %{t['pnl']:>5.2f} | Zirve: %{t['peak']:>5.2f} | Sebep: {t['reason']}")
                     
-                    print("-" * 50)
-                    print(f"✅ Başarılı İşlem: {wins} | ❌ Stop/Zarar: {losses}")
+                    print("-" * 70)
+                    print(f"📈 Başarılı İşlem: {wins} | 📉 Stop/Zarar: {losses}")
                     print(f"💰 Toplam PnL Değişimi: %{total_pnl:.2f}")
-                print("="*50 + "\n")
+                print("="*70 + "\n")
                 
                 closed_trades_history.clear()
                 last_report_time = now
@@ -138,7 +152,7 @@ async def main_loop():
                             if trade_result["status"] == "success":
                                 state_mgr.state["active_trades"][symbol] = {
                                     "entry": trade_result["entry_price"],
-                                    "max_price": trade_result["entry_price"], # Burada Zirve başlangıcı belirleniyor
+                                    "max_price": trade_result["entry_price"],
                                     "type": trend,
                                     "amount": trade_result["amount"],
                                     "entry_time": time.time()
