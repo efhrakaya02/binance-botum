@@ -12,6 +12,19 @@ class MarketScanner:
             'options': {'defaultType': 'future'}
         })
 
+    def _calculate_rsi(self, prices, period=14):
+        # RSI hesaplama fonksiyonu (Pandas ile üstel hareketli ortalama kullanarak)
+        if len(prices) < period:
+            return 50 # Yeterli veri yoksa nötr dön
+        delta = pd.Series(prices).diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(com=period-1, min_periods=period).mean()
+        avg_loss = loss.ewm(com=period-1, min_periods=period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1]
+
     async def get_top_coins(self):
         try:
             tickers = await self.exchange.fetch_tickers()
@@ -42,38 +55,74 @@ class MarketScanner:
 
     async def analyze_trend(self, symbol):
         try:
-            ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5)
-            ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=10)
-            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15) 
+            # 🚀 HIZ OPTİMİZASYONU: 4 farklı veriyi aynı anda (paralel) çekiyoruz
+            tasks = [
+                self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5),
+                self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=10),
+                self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20),
+                self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            if not ohlcv_4h or not ohlcv_1h or not ohlcv_5m:
-                return None
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    return None
+                    
+            ohlcv_4h, ohlcv_1h, ohlcv_15m, ohlcv_5m = results
 
             close_4h_current = ohlcv_4h[-1][4]
             close_4h_prev = ohlcv_4h[-2][4]
             
-            # 5 Dakikalık Mum Verileri
+            # 5 Dakikalık Mum Verileri (-2 son kapanan mumdur)
             open_5m = ohlcv_5m[-2][1]
+            high_5m = ohlcv_5m[-2][2]
+            low_5m = ohlcv_5m[-2][3]
             close_5m = ohlcv_5m[-2][4]
             current_volume = ohlcv_5m[-2][5] 
             
-            # Önceki 10 mumun hacim ortalaması
+            # ESKİ KURAL 1: Hacim Teyidi
             volumes = [candle[5] for candle in ohlcv_5m[-12:-2]]
             avg_volume = sum(volumes) / len(volumes) if volumes else 0
 
-            # 🚀 FİLTRE 1: Hacim en az 2 katına (2.0x) çıkmış olmalı
             if current_volume < (avg_volume * 2.0):
                 return None 
 
-            # 🚀 FİLTRE 2: Yön ve Mum Rengi Uyumu
-            if close_4h_current > close_4h_prev: # LONG TREND
-                if close_5m <= open_5m: # Kırmızı mumsa pas geç
+            # YENİ KURAL HAZIRLIKLARI: Fitil ve RSI
+            body_size = abs(close_5m - open_5m)
+            upper_wick = high_5m - max(open_5m, close_5m)
+            lower_wick = min(open_5m, close_5m) - low_5m
+            
+            closes_15m = [candle[4] for candle in ohlcv_15m[:-1]] # Son kapanan muma kadar
+            rsi_15m = self._calculate_rsi(closes_15m, 14)
+
+            if close_4h_current > close_4h_prev: # MACRO LONG TREND
+                # ESKİ KURAL 2: Mum kırmızıysa girme
+                if close_5m <= open_5m: 
                     return None
+                    
+                # 🚀 YENİ KURAL: RSI Çok Şişmişse (Aşırı Alım) girme
+                if rsi_15m > 70:
+                    return None
+                    
+                # 🚀 YENİ KURAL: Üst fitil, gövdenin 1.5 katından büyükse (Satış baskısı yemişse) girme
+                if upper_wick > (body_size * 1.5):
+                    return None
+                    
                 return {"symbol": symbol, "trend": "long"}
                 
-            elif close_4h_current < close_4h_prev: # SHORT TREND
-                if close_5m >= open_5m: # Yeşil mumsa pas geç
+            elif close_4h_current < close_4h_prev: # MACRO SHORT TREND
+                # ESKİ KURAL 2: Mum yeşilse girme
+                if close_5m >= open_5m: 
                     return None
+                    
+                # 🚀 YENİ KURAL: RSI Çok Düşmüşse (Aşırı Satım) girme
+                if rsi_15m < 30:
+                    return None
+                    
+                # 🚀 YENİ KURAL: Alt fitil, gövdenin 1.5 katından büyükse (Alıcı baskısı yemişse) girme
+                if lower_wick > (body_size * 1.5):
+                    return None
+                    
                 return {"symbol": symbol, "trend": "short"}
             
             return None
