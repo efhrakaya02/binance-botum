@@ -12,86 +12,54 @@ class MarketScanner:
             'options': {'defaultType': 'future'}
         })
 
-    def _calculate_rsi(self, prices, period=14):
-        if len(prices) < period:
-            return 50 
-        delta = pd.Series(prices).diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.ewm(com=period-1, min_periods=period).mean()
-        avg_loss = loss.ewm(com=period-1, min_periods=period).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.iloc[-1]
-
-    def _calculate_adx(self, ohlcv, period=14):
-        if len(ohlcv) < period * 2:
+    # 🚀 PA KONTROLÜ 1: Oynaklık (Coin ölü mü, hareketli mi?)
+    def _calculate_average_range(self, ohlcv, period=14):
+        if len(ohlcv) < period:
             return 0
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['h-l'] = df['high'] - df['low']
-        df['h-pc'] = (df['high'] - df['close'].shift(1)).abs()
-        df['l-pc'] = (df['low'] - df['close'].shift(1)).abs()
-        df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
-        
-        df['up_move'] = df['high'] - df['high'].shift(1)
-        df['down_move'] = df['low'].shift(1) - df['low']
-        
-        df['+dm'] = 0.0
-        df.loc[(df['up_move'] > df['down_move']) & (df['up_move'] > 0), '+dm'] = df['up_move']
-        df['-dm'] = 0.0
-        df.loc[(df['down_move'] > df['up_move']) & (df['down_move'] > 0), '-dm'] = df['down_move']
-        
-        tr_sma = df['tr'].rolling(window=period).mean().replace(0, pd.NA)
-        pdm_sma = df['+dm'].rolling(window=period).mean()
-        mdm_sma = df['-dm'].rolling(window=period).mean()
-        
-        pdi = 100 * (pdm_sma / tr_sma)
-        mdi = 100 * (mdm_sma / tr_sma)
-        dx = 100 * (abs(pdi - mdi) / (pdi + mdi))
-        adx = dx.rolling(window=period).mean()
-        
-        val = adx.iloc[-1]
-        return val if not pd.isna(val) else 0
+        # Mum boylarının (High-Low) fiyata % olarak oranı
+        df['range_pct'] = ((df['high'] - df['low']) / df['low']) * 100
+        return df['range_pct'].tail(period).mean()
 
-    def _calculate_atr_pct(self, ohlcv, period=14):
-        if len(ohlcv) < period + 1:
-            return 0
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['h-l'] = df['high'] - df['low']
-        df['h-pc'] = (df['high'] - df['close'].shift(1)).abs()
-        df['l-pc'] = (df['low'] - df['close'].shift(1)).abs()
-        df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
-        
-        atr = df['tr'].rolling(window=period).mean().iloc[-1]
-        current_close = df['close'].iloc[-1]
-        
-        atr_pct = (atr / current_close) * 100
-        return atr_pct if not pd.isna(atr_pct) else 0
+    # 🚀 PA KONTROLÜ 2: Alıcı/Satıcı Baskısı (Mum Gövdelerinin Savaşı)
+    def _get_buying_selling_pressure(self, ohlcv, period=10):
+        if len(ohlcv) < period:
+            return 0, 0
+        df = pd.DataFrame(ohlcv[-period:], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Yeşil mumların gövde toplamı
+        bullish_bodies = (df[df['close'] > df['open']]['close'] - df[df['close'] > df['open']]['open']).sum()
+        # Kırmızı mumların gövde toplamı
+        bearish_bodies = (df[df['open'] > df['close']]['open'] - df[df['open'] > df['close']]['close']).sum()
+        return bullish_bodies, bearish_bodies
 
-    # 🚀 YENİ Zeka: İşlemdeyken Momentum ve Yön Dönüşü Teyidi
+    # 🚀 PA KONTROLÜ 3: Market Structure (Piyasa Yapısı - Swing Tepe/Dip)
+    def _get_market_structure(self, ohlcv, lookback=15):
+        if len(ohlcv) < lookback + 1:
+            return 0, 0
+        # Son 'lookback' kadar mumu alıp en yüksek ve en düşük noktaları bulur (Swing High / Swing Low)
+        df = pd.DataFrame(ohlcv[-(lookback+1):-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        recent_high = df['high'].max()
+        recent_low = df['low'].min()
+        return recent_high, recent_low
+
+    # 🚀 YENİ ZEKA: Saf Price Action ile Momentum Dönüşü (Erken Kaçış)
     async def check_momentum_reversal(self, symbol, trade_type):
         try:
-            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
-            if not ohlcv_15m or len(ohlcv_15m) < 20:
+            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=5)
+            if not ohlcv_5m or len(ohlcv_5m) < 3:
                 return False
 
-            df = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            # 15 Dakikalık EMA 9 (Kısa vadeli trend yönü)
-            df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-            
-            curr_close = df['close'].iloc[-1]
-            curr_ema9 = df['ema9'].iloc[-1]
-            
-            adx_15m = self._calculate_adx(ohlcv_15m, 14)
-            momentum_dying = adx_15m < 25 # İvme bitti mi?
+            # c1: Son kapanan mum, c2: Ondan önceki mum
+            c1_open, c1_high, c1_low, c1_close = ohlcv_5m[-2][1], ohlcv_5m[-2][2], ohlcv_5m[-2][3], ohlcv_5m[-2][4]
+            c2_open, c2_high, c2_low, c2_close = ohlcv_5m[-3][1], ohlcv_5m[-3][2], ohlcv_5m[-3][3], ohlcv_5m[-3][4]
 
             if trade_type == 'long':
-                # Long işlemdeysek: Fiyat EMA9'un altına kırdıysa VE İvme bittiyse (veya 2 sert kırmızı mum varsa)
-                if (curr_close < curr_ema9 and momentum_dying) or (df['close'].iloc[-1] < df['open'].iloc[-1] and df['close'].iloc[-2] < df['open'].iloc[-2]):
+                # PA Kuralı: Son mum kırmızı kapatırsa VE bir önceki mumun en düşük seviyesini aşağı kırarsa (Lower Low) -> Mikro Trend Döndü!
+                if (c1_close < c1_open) and (c1_close < c2_low):
                     return True
             elif trade_type == 'short':
-                # Short işlemdeysek: Fiyat EMA9'un üstüne kırdıysa VE İvme bittiyse (veya 2 sert yeşil mum varsa)
-                if (curr_close > curr_ema9 and momentum_dying) or (df['close'].iloc[-1] > df['open'].iloc[-1] and df['close'].iloc[-2] > df['open'].iloc[-2]):
+                # PA Kuralı: Son mum yeşil kapatırsa VE bir önceki mumun en yüksek seviyesini yukarı kırarsa (Higher High) -> Mikro Trend Döndü!
+                if (c1_close > c1_open) and (c1_close > c2_high):
                     return True
                     
             return False
@@ -127,20 +95,29 @@ class MarketScanner:
     async def analyze_trend(self, symbol):
         try:
             tasks = [
-                self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=5),
-                self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=40),
+                self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30),
                 self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15)
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
-                if isinstance(res, Exception) or not res:
+                if isinstance(res, Exception) or not res or len(res) < 20:
                     return None
                     
-            ohlcv_1h, ohlcv_15m, ohlcv_5m = results
-
-            close_1h_current = ohlcv_1h[-1][4]
-            close_1h_prev = ohlcv_1h[-2][4]
+            ohlcv_15m, ohlcv_5m = results
             
+            # --- 1. AŞAMA: OYNAKLIK KONTROLÜ ---
+            avg_range = self._calculate_average_range(ohlcv_15m[:-1], 15)
+            if avg_range < 0.6: # Hantal ve yatay coinleri direkt ele
+                return None
+                
+            # --- 2. AŞAMA: MARKET STRUCTURE (PİYASA YAPISI) ---
+            recent_high, recent_low = self._get_market_structure(ohlcv_15m, 15)
+            curr_price_15m = ohlcv_15m[-2][4] # 15 dakikalık son kapanış
+
+            # --- 3. AŞAMA: ALICI/SATICI BASKISI ---
+            bull_pressure, bear_pressure = self._get_buying_selling_pressure(ohlcv_15m[:-1], 10)
+
+            # --- 4. AŞAMA: TETİKLEYİCİ (GİRİŞ) MUMU (5 DAKİKALIK) ---
             open_5m = ohlcv_5m[-2][1]
             high_5m = ohlcv_5m[-2][2]
             low_5m = ohlcv_5m[-2][3]
@@ -149,40 +126,32 @@ class MarketScanner:
             
             volumes = [candle[5] for candle in ohlcv_5m[-12:-2]]
             avg_volume = sum(volumes) / len(volumes) if volumes else 0
-            if current_volume < (avg_volume * 2.0):
-                return None 
-
-            body_size = abs(close_5m - open_5m)
-            upper_wick = high_5m - max(open_5m, close_5m)
-            lower_wick = min(open_5m, close_5m) - low_5m
             
-            closes_15m = [candle[4] for candle in ohlcv_15m[:-1]] 
-            rsi_15m = self._calculate_rsi(closes_15m, 14)
-            adx_15m = self._calculate_adx(ohlcv_15m[:-1], 14)
-            atr_pct_15m = self._calculate_atr_pct(ohlcv_15m[:-1], 14)
+            # Mum Boyu ve Gövde Oranı Hesaplama
+            candle_size = high_5m - low_5m
+            if candle_size == 0: return None
+            body_size = abs(close_5m - open_5m)
+            body_ratio = body_size / candle_size # Gövde, tüm mumun yüzde kaçı? (İğne reddini ölçer)
 
-            if adx_15m < 25:
-                return None
-            if atr_pct_15m < 0.8:
-                return None
-
-            if close_1h_current > close_1h_prev: 
-                if close_5m <= open_5m: 
-                    return None
-                if rsi_15m > 70:
-                    return None
-                if upper_wick > (body_size * 1.5):
-                    return None
-                return {"symbol": symbol, "trend": "long"}
-                
-            elif close_1h_current < close_1h_prev: 
-                if close_5m >= open_5m: 
-                    return None
-                if rsi_15m < 30:
-                    return None
-                if lower_wick > (body_size * 1.5):
-                    return None
-                return {"symbol": symbol, "trend": "short"}
+            # 🚀 KESİN GİRİŞ KARARLARI (PURE PRICE ACTION)
+            
+            # LONG SENARYOSU
+            # 1. Fiyat son 15 mumun tepesini (Swing High) kırmış veya milimetrik yakınında (BOS)
+            if curr_price_15m >= (recent_high * 0.998): 
+                # 2. Alıcıların gövde hacmi, satıcıların en az 1.5 katı (Kontrol Boğalarda)
+                if bull_pressure > (bear_pressure * 1.5):
+                    # 3. Tetikleyici Mum: Yeşil olmalı, gövdesi dolgun olmalı (%65 üstü), hacim ortalamanın 1.5 katı olmalı
+                    if close_5m > open_5m and body_ratio > 0.65 and current_volume > (avg_volume * 1.5):
+                        return {"symbol": symbol, "trend": "long"}
+                        
+            # SHORT SENARYOSU
+            # 1. Fiyat son 15 mumun dibini (Swing Low) kırmış veya milimetrik yakınında (BOS)
+            elif curr_price_15m <= (recent_low * 1.002):
+                # 2. Satıcıların gövde hacmi, alıcıların en az 1.5 katı (Kontrol Ayılarda)
+                if bear_pressure > (bull_pressure * 1.5):
+                    # 3. Tetikleyici Mum: Kırmızı olmalı, gövdesi dolgun olmalı (%65 üstü), hacim patlamış olmalı
+                    if close_5m < open_5m and body_ratio > 0.65 and current_volume > (avg_volume * 1.5):
+                        return {"symbol": symbol, "trend": "short"}
             
             return None
         except Exception:
