@@ -53,7 +53,6 @@ class MarketScanner:
         val = adx.iloc[-1]
         return val if not pd.isna(val) else 0
 
-    # 🚀 YENİ: ATR Yüzdesi Hesaplayıcı (Coin ne kadar agresif hareket ediyor?)
     def _calculate_atr_pct(self, ohlcv, period=14):
         if len(ohlcv) < period + 1:
             return 0
@@ -66,9 +65,38 @@ class MarketScanner:
         atr = df['tr'].rolling(window=period).mean().iloc[-1]
         current_close = df['close'].iloc[-1]
         
-        # ATR'yi fiyata oranlayıp yüzdeye çeviriyoruz
         atr_pct = (atr / current_close) * 100
         return atr_pct if not pd.isna(atr_pct) else 0
+
+    # 🚀 YENİ Zeka: İşlemdeyken Momentum ve Yön Dönüşü Teyidi
+    async def check_momentum_reversal(self, symbol, trade_type):
+        try:
+            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
+            if not ohlcv_15m or len(ohlcv_15m) < 20:
+                return False
+
+            df = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            # 15 Dakikalık EMA 9 (Kısa vadeli trend yönü)
+            df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+            
+            curr_close = df['close'].iloc[-1]
+            curr_ema9 = df['ema9'].iloc[-1]
+            
+            adx_15m = self._calculate_adx(ohlcv_15m, 14)
+            momentum_dying = adx_15m < 25 # İvme bitti mi?
+
+            if trade_type == 'long':
+                # Long işlemdeysek: Fiyat EMA9'un altına kırdıysa VE İvme bittiyse (veya 2 sert kırmızı mum varsa)
+                if (curr_close < curr_ema9 and momentum_dying) or (df['close'].iloc[-1] < df['open'].iloc[-1] and df['close'].iloc[-2] < df['open'].iloc[-2]):
+                    return True
+            elif trade_type == 'short':
+                # Short işlemdeysek: Fiyat EMA9'un üstüne kırdıysa VE İvme bittiyse (veya 2 sert yeşil mum varsa)
+                if (curr_close > curr_ema9 and momentum_dying) or (df['close'].iloc[-1] > df['open'].iloc[-1] and df['close'].iloc[-2] > df['open'].iloc[-2]):
+                    return True
+                    
+            return False
+        except Exception:
+            return False
 
     async def get_top_coins(self):
         try:
@@ -133,16 +161,12 @@ class MarketScanner:
             adx_15m = self._calculate_adx(ohlcv_15m[:-1], 14)
             atr_pct_15m = self._calculate_atr_pct(ohlcv_15m[:-1], 14)
 
-            # 🚀 FİLTRE: Trend Gücü (ADX) 25'in altındaysa pas geç
             if adx_15m < 25:
                 return None
-                
-            # 🚀 FİLTRE: Oynaklık (ATR) %0.8'in altındaysa (Coin hantal/yavaşsa) pas geç!
-            # (Bu sayede %1 kâr potansiyeli olmayan uyuşuk coinlere bulaşmayacağız)
             if atr_pct_15m < 0.8:
                 return None
 
-            if close_1h_current > close_1h_prev: # MACRO LONG TREND
+            if close_1h_current > close_1h_prev: 
                 if close_5m <= open_5m: 
                     return None
                 if rsi_15m > 70:
@@ -151,7 +175,7 @@ class MarketScanner:
                     return None
                 return {"symbol": symbol, "trend": "long"}
                 
-            elif close_1h_current < close_1h_prev: # MACRO SHORT TREND
+            elif close_1h_current < close_1h_prev: 
                 if close_5m >= open_5m: 
                     return None
                 if rsi_15m < 30:
