@@ -8,7 +8,7 @@ from modules.state_manager import StateManager
 from modules.execution import ExecutionEngine
 
 async def main_loop():
-    print("🤖 PA Bot Başlatılıyor... (Kapanış Sebepleri ve Gelişmiş Raporlama Aktif)")
+    print("🤖 PA Bot Başlatılıyor... (2 Saat Hard-Limit ve Dinamik Çıkış Zekası Aktif)")
     
     state_mgr = StateManager()
     risk_mgr = RiskManager(config)
@@ -16,6 +16,7 @@ async def main_loop():
     executor = ExecutionEngine(config)
     
     last_status_print = {} 
+    last_momentum_check = {} # API limitlerini korumak için 60 saniye bekletici
     last_report_time = time.time()
     closed_trades_history = [] 
     
@@ -50,16 +51,31 @@ async def main_loop():
                         pnl_pct = ((entry_price - current_price) / entry_price) * 100
                         peak_pnl = ((entry_price - max_price) / entry_price) * 100
                     
-                    is_timeout = (now - entry_time) >= 3600
-                    timeout_close = is_timeout and pnl_pct < config.TRAILING_ACTIVATION_PCT
+                    # 🚀 ZAMAN AŞIMI KONTROLLERİ
+                    time_open = now - entry_time
+                    hard_timeout = time_open >= 7200 # 2 Saat (7200 Saniye) - Ne olursa olsun kapat
+                    stagnant_timeout = (time_open >= 3600) and (pnl_pct < config.TRAILING_ACTIVATION_PCT) # 60dk Yataya bağlama
+                    
+                    # 🚀 DİNAMİK MOMENTUM ÇIKIŞI (Sadece kârdayken, her 60 saniyede bir kontrol et)
+                    is_reversing = False
+                    if symbol not in last_momentum_check:
+                        last_momentum_check[symbol] = 0
+                        
+                    if pnl_pct > 0.2 and (now - last_momentum_check[symbol]) > 60:
+                        is_reversing = await scanner.check_momentum_reversal(symbol, trade_data["type"])
+                        last_momentum_check[symbol] = now
                     
                     close_condition = (is_long and current_price <= dynamic_sl) or (not is_long and current_price >= dynamic_sl)
                     
-                    if close_condition or timeout_close:
-                        # 🚀 YENİ: Kapanış Sebebini Belirleme
+                    if close_condition or hard_timeout or stagnant_timeout or is_reversing:
+                        # Kapanış Sebebini Belirleme
                         close_reason = ""
-                        if timeout_close:
-                            close_reason = "Zaman Aşımı"
+                        if hard_timeout:
+                            close_reason = "2 Saat Süre Sınırı"
+                        elif is_reversing:
+                            close_reason = "Momentum Kaybı / Erken Çıkış"
+                        elif stagnant_timeout:
+                            close_reason = "60dk Hacimsiz (Zaman Aşımı)"
                         elif pnl_pct <= -0.1:
                             close_reason = "Stop-Loss"
                         elif pnl_pct >= 0.5:
@@ -71,7 +87,6 @@ async def main_loop():
                             
                         success = await executor.close_position(symbol, 'buy' if is_long else 'sell', trade_data["amount"])
                         if success:
-                            # 🚀 YENİ: Sebebi rapora ekliyoruz
                             closed_trades_history.append({
                                 "symbol": symbol, 
                                 "pnl": pnl_pct, 
@@ -81,6 +96,8 @@ async def main_loop():
                             
                             del state_mgr.state["active_trades"][symbol]
                             state_mgr.set_cooldown(symbol, config.COOLDOWN_MINUTES)
+                            if symbol in last_momentum_check:
+                                del last_momentum_check[symbol]
                             print(f"❄️ {symbol} için {config.COOLDOWN_MINUTES} dakikalık soğuma süresi başlatıldı.")
                             state_mgr.save_state()
                     else:
@@ -88,16 +105,16 @@ async def main_loop():
                         state_mgr.save_state()
                         
                         if now - last_status_print.get(symbol, 0) > 60:
-                            print(f"📊 TAKİP [{symbol}] | Yön: {trade_data['type'].upper()} | Giriş: {entry_price:.5f} | Anlık: {current_price:.5f} | Stop: {dynamic_sl:.5f} | PnL: %{pnl_pct:.2f} | Zirve: %{peak_pnl:.2f} | Süre: {int((now - entry_time)/60)} dk")
+                            print(f"📊 TAKİP [{symbol}] | Yön: {trade_data['type'].upper()} | Giriş: {entry_price:.5f} | Anlık: {current_price:.5f} | Stop: {dynamic_sl:.5f} | PnL: %{pnl_pct:.2f} | Zirve: %{peak_pnl:.2f} | Süre: {int(time_open/60)} dk")
                             last_status_print[symbol] = now
                             
                 except Exception:
                     pass 
             
             if now - last_report_time >= 1800:
-                print("\n" + "="*70)
+                print("\n" + "="*75)
                 print("🕒 30 DAKİKALIK PERFORMANS ÖZETİ")
-                print("="*70)
+                print("="*75)
                 if not closed_trades_history:
                     print("ℹ️ Son 30 dakikada kapanan işlem bulunmuyor.")
                 else:
@@ -111,14 +128,13 @@ async def main_loop():
                         else:
                             losses += 1
                         
-                        # Rapor Formatı
                         icon = "✅" if t["pnl"] > 0 else ("❌" if t["pnl"] < -0.1 else "🛡️")
                         print(f"{icon} {t['symbol']:<12} | Net PnL: %{t['pnl']:>5.2f} | Zirve: %{t['peak']:>5.2f} | Sebep: {t['reason']}")
                     
-                    print("-" * 70)
+                    print("-" * 75)
                     print(f"📈 Başarılı İşlem: {wins} | 📉 Stop/Zarar: {losses}")
                     print(f"💰 Toplam PnL Değişimi: %{total_pnl:.2f}")
-                print("="*70 + "\n")
+                print("="*75 + "\n")
                 
                 closed_trades_history.clear()
                 last_report_time = now
