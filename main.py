@@ -16,7 +16,7 @@ class TradingBot:
         self.max_active_trades = getattr(Config, 'MAX_OPEN_POSITIONS', 3)
 
     async def manage_active_trades(self):
-        """Aktif işlemleri yönetir: SL/TP, Dinamik Kâr Kilidi, Zaman Aşımı ve Geri Dönüşleri kontrol eder."""
+        """Aktif işlemleri yönetir: SL/TP, Dinamik Kâr Kilidi, Zaman Aşımı, Geri Dönüşler ve Dakikalık Durum Raporu verir."""
         current_time = time.time()
         
         for symbol, trade in list(self.active_trades.items()):
@@ -33,10 +33,17 @@ class TradingBot:
                 elif not is_long and current_price < trade['max_reached_price']:
                     trade['max_reached_price'] = current_price
 
+                # Anlık PnL ve süre hesaplama
+                profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - current_price) / trade['entry_price']) * 100
+                trade_duration_mins = (current_time - trade['start_time']) / 60
+
+                # 📊 DAKİKALIK DURUM RAPORU (Her 60 saniyede bir kez yazar)
+                if current_time - trade.get('last_log_time', 0) >= 60:
+                    print(f"📊 [TAKİP RAPORU] {symbol} | Yön: {trade['trend'].upper()} | Süre: {trade_duration_mins:.1f} dk | Giriş: {trade['entry_price']} | Güncel: {current_price} | PnL: %{profit_pct:.2f}")
+                    trade['last_log_time'] = current_time
+
                 # 1. 60 DAKİKA ZAMAN AŞIMI (Time Stop) Kontrolü
-                trade_duration = (current_time - trade['start_time']) / 60
-                if trade_duration >= 60:
-                    profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - current_price) / trade['entry_price']) * 100
+                if trade_duration_mins >= 60:
                     if profit_pct < 1.0: # 60 dakika geçmiş ve %1 kâr bile yapamamışsa kes!
                         print(f"[{symbol}] Zaman Aşımı (60dk). İşlem hacimsiz, kapatılıyor. PnL: %{profit_pct:.2f}")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
@@ -62,20 +69,20 @@ class TradingBot:
                 # TP (Take Profit - Hard %3) veya SL/Kilit Tetiklenmesi
                 if is_long:
                     if current_price >= trade['entry_price'] * 1.03: # %3 Hedef
-                        print(f"[{symbol}] HEDEF VURULDU (+%3.00). Kâr alındı!")
+                        print(f"[{symbol}] HEDEF VURULDU (+%3.00). Kâr alındı! PnL: %{profit_pct:.2f}")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
                         del self.active_trades[symbol]
                     elif current_price <= current_sl:
-                        print(f"[{symbol}] Stop-Loss / Kâr Kilidi tetiklendi. Çıkış yapıldı.")
+                        print(f"[{symbol}] Stop-Loss / Kâr Kilidi tetiklendi. Çıkış yapıldı. PnL: %{profit_pct:.2f}")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
                         del self.active_trades[symbol]
                 else: # Short
                     if current_price <= trade['entry_price'] * 0.97: # %3 Hedef
-                        print(f"[{symbol}] HEDEF VURULDU (+%3.00). Kâr alındı!")
+                        print(f"[{symbol}] HEDEF VURULDU (+%3.00). Kâr alındı! PnL: %{profit_pct:.2f}")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
                         del self.active_trades[symbol]
                     elif current_price >= current_sl:
-                        print(f"[{symbol}] Stop-Loss / Kâr Kilidi tetiklendi. Çıkış yapıldı.")
+                        print(f"[{symbol}] Stop-Loss / Kâr Kilidi tetiklendi. Çıkış yapıldı. PnL: %{profit_pct:.2f}")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
                         del self.active_trades[symbol]
 
@@ -129,7 +136,8 @@ class TradingBot:
                                     'entry_price': execution_result['entry_price'],
                                     'max_reached_price': execution_result['entry_price'],
                                     'initial_sl': initial_sl,
-                                    'start_time': time.time()
+                                    'start_time': time.time(),
+                                    'last_log_time': 0
                                 }
                                 
                                 if len(self.active_trades) >= self.max_active_trades:
