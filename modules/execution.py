@@ -10,6 +10,15 @@ class ExecutionEngine:
             'options': {'defaultType': 'future'}
         })
 
+    async def get_current_price(self, symbol):
+        """İlgili coin için güncel fiyatı çeker."""
+        try:
+            ticker = await self.exchange.fetch_ticker(symbol)
+            return ticker['last']
+        except Exception as e:
+            print(f"[{symbol}] Fiyat alınırken hata oluştu: {e}")
+            return None
+
     async def setup_margin_and_leverage(self, symbol):
         if hasattr(self.config, 'PAPER_TRADING') and self.config.PAPER_TRADING:
             return
