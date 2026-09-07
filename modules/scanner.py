@@ -12,60 +12,52 @@ class MarketScanner:
             'options': {'defaultType': 'future'}
         })
 
-    def _calculate_average_range(self, ohlcv, period=14):
-        if len(ohlcv) < period:
-            return 0
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['range_pct'] = ((df['high'] - df['low']) / df['low']) * 100
-        return df['range_pct'].tail(period).mean()
+    def _analyze_candle_anatomy(self, open_p, high_p, low_p, close_p):
+        """Mumun anatomik yapısını (Price Action formasyonunu) belirler."""
+        body = abs(close_p - open_p)
+        candle_range = high_p - low_p
+        
+        if candle_range == 0:
+            return 'doji'
+            
+        upper_wick = high_p - max(open_p, close_p)
+        lower_wick = min(open_p, close_p) - low_p
+        
+        body_ratio = body / candle_range
 
-    def _get_buying_selling_pressure(self, ohlcv, period=10):
-        if len(ohlcv) < period:
-            return 0, 0
-        df = pd.DataFrame(ohlcv[-period:], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        bullish_bodies = (df[df['close'] > df['open']]['close'] - df[df['close'] > df['open']]['open']).sum()
-        bearish_bodies = (df[df['open'] > df['close']]['open'] - df[df['open'] > df['close']]['close']).sum()
-        return bullish_bodies, bearish_bodies
+        if body_ratio < 0.1:
+            if lower_wick > 2 * upper_wick: return 'hammer' # Çekiç / Pinbar (Boğa)
+            if upper_wick > 2 * lower_wick: return 'gravestone' # Mezar Taşı (Ayı)
+            return 'doji' # Kararsızlık
+            
+        if body_ratio > 0.65:
+            return 'strong_bullish' if close_p > open_p else 'strong_bearish' # Marubozu / Yutan
+            
+        if lower_wick > 2 * body and upper_wick < body:
+            return 'hammer'
+        if upper_wick > 2 * body and lower_wick < body:
+            return 'shooting_star' # Kayan Yıldız
+            
+        return 'neutral'
 
-    def _get_market_structure(self, ohlcv, lookback=10):
-        if len(ohlcv) < lookback + 1:
-            return 0, 0
-        df = pd.DataFrame(ohlcv[-(lookback+1):-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        recent_high = df['high'].max()
-        recent_low = df['low'].min()
-        return recent_high, recent_low
-
-    # 🚀 YENİ İLAVE 1: Bitcoin (BTC) Yön Teyidi
-    async def _get_btc_trend(self):
+    async def _get_btc_context(self):
+        """0. Aşama: Piyasaya yön veren BTC'nin 4H trendini okur."""
         try:
-            ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=5)
+            ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='4h', limit=10)
+            if not ohlcv or len(ohlcv) < 3: return 'neutral'
+            
             c_close = ohlcv[-2][4]
             c_open = ohlcv[-2][1]
             return 'bullish' if c_close > c_open else 'bearish'
         except:
             return 'neutral'
 
-    async def check_momentum_reversal(self, symbol, trade_type):
-        try:
-            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=5)
-            if not ohlcv_5m or len(ohlcv_5m) < 3:
-                return False
-            c1_open, c1_high, c1_low, c1_close = ohlcv_5m[-2][1], ohlcv_5m[-2][2], ohlcv_5m[-2][3], ohlcv_5m[-2][4]
-            c2_open, c2_high, c2_low, c2_close = ohlcv_5m[-3][1], ohlcv_5m[-3][2], ohlcv_5m[-3][3], ohlcv_5m[-3][4]
-
-            if trade_type == 'long':
-                if (c1_close < c1_open) and (c1_close < c2_low): return True
-            elif trade_type == 'short':
-                if (c1_close > c1_open) and (c1_close > c2_high): return True
-            return False
-        except:
-            return False
-
     async def get_top_coins(self):
+        """Hacimli ve hareketli adayları havuzda toplar."""
         try:
             tickers = await self.exchange.fetch_tickers()
             usdt_pairs = {k: v for k, v in tickers.items() if ':USDT' in k}
-            if not usdt_pairs: return []
+            
             data_list = []
             for ticker_info in usdt_pairs.values():
                 data_list.append({
@@ -73,95 +65,111 @@ class MarketScanner:
                     'percentage': ticker_info.get('percentage', 0.0),
                     'quoteVolume': ticker_info.get('quoteVolume', 0.0)
                 })
+                
             df = pd.DataFrame(data_list)
             df['percentage'] = df['percentage'].fillna(0)
             df['quoteVolume'] = df['quoteVolume'].fillna(0)
-            gainers = df.sort_values(by='percentage', ascending=False).head(50)['symbol'].tolist()
-            losers = df.sort_values(by='percentage', ascending=True).head(50)['symbol'].tolist()
-            volume_leaders = df.sort_values(by='quoteVolume', ascending=False).head(50)['symbol'].tolist()
+
+            gainers = df.sort_values(by='percentage', ascending=False).head(40)['symbol'].tolist()
+            losers = df.sort_values(by='percentage', ascending=True).head(40)['symbol'].tolist()
+            volume_leaders = df.sort_values(by='quoteVolume', ascending=False).head(40)['symbol'].tolist()
             return list(set(gainers + losers + volume_leaders))
         except:
             return []
 
-    async def analyze_trend(self, symbol, btc_trend):
+    async def check_volume_breakout(self, symbol):
+        """Filtreyi geçen elit coinler için 50 mumluk Hacim Patlaması analizi."""
         try:
-            tasks = [
-                self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5),
-                self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20),
-                self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15),
-                self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=5)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in results:
-                if isinstance(res, Exception) or not res or len(res) < 5: return None
+            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
+            if not ohlcv_15m or len(ohlcv_15m) < 50: return False
+            
+            volumes = [c[5] for c in ohlcv_15m[:-2]]
+            avg_volume_50 = sum(volumes) / len(volumes)
+            current_volume = ohlcv_15m[-2][5]
+            
+            # Son mumun hacmi, son 50 mumun ortalamasının en az 2 katı olmalı (Gerçek Kırılım)
+            return current_volume > (avg_volume_50 * 2.0)
+        except:
+            return False
+
+    async def analyze_trend(self, symbol, btc_trend):
+        """Çok Katmanlı (4H -> 1H -> 15M -> 5M -> 1M) Anatomi ve PA Analizi"""
+        try:
+            # --- 1. KATMAN (Makro Trend & API Koruyucu) ---
+            ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=10)
+            ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
+            
+            if not ohlcv_4h or not ohlcv_1h: return None
+            
+            prev_4h_anatomy = self._analyze_candle_anatomy(ohlcv_4h[-2][1], ohlcv_4h[-2][2], ohlcv_4h[-2][3], ohlcv_4h[-2][4])
+            curr_4h_is_green = ohlcv_4h[-1][4] > ohlcv_4h[-1][1]
+            prev_4h_is_green = ohlcv_4h[-2][4] > ohlcv_4h[-2][1]
+            
+            prev_1h_anatomy = self._analyze_candle_anatomy(ohlcv_1h[-2][1], ohlcv_1h[-2][2], ohlcv_1h[-2][3], ohlcv_1h[-2][4])
+            curr_1h_is_green = ohlcv_1h[-1][4] > ohlcv_1h[-1][1]
+
+            # Makro Uyum Kontrolü (Long Adayı mı, Short Adayı mı?)
+            potential_trend = None
+            if prev_4h_is_green and curr_4h_is_green and prev_4h_anatomy not in ['gravestone', 'shooting_star']:
+                if curr_1h_is_green and prev_1h_anatomy not in ['gravestone', 'shooting_star']:
+                    potential_trend = 'long'
                     
-            ohlcv_4h, ohlcv_15m, ohlcv_5m, ohlcv_1m = results
+            elif not prev_4h_is_green and not curr_4h_is_green and prev_4h_anatomy not in ['hammer']:
+                if not curr_1h_is_green and prev_1h_anatomy not in ['hammer']:
+                    potential_trend = 'short'
             
-            close_4h_prev = ohlcv_4h[-2][4]
-            open_4h_prev = ohlcv_4h[-2][1]
-            is_4h_bullish = close_4h_prev > open_4h_prev 
-            is_4h_bearish = close_4h_prev < open_4h_prev 
-            
-            avg_range = self._calculate_average_range(ohlcv_15m[:-1], 10)
-            if avg_range < 0.35: return None
-                
-            recent_high, recent_low = self._get_market_structure(ohlcv_15m, 10)
-            momentum_ivme_pct = ((recent_high - recent_low) / recent_low) * 100
-            
-            if momentum_ivme_pct < 1.2: return None
-                
-            curr_price_15m = ohlcv_15m[-2][4] 
-            bull_pressure, bear_pressure = self._get_buying_selling_pressure(ohlcv_15m[:-1], 7)
+            if not potential_trend: return None # Makro trend yoksa hemen çık, API yorma.
 
-            open_5m = ohlcv_5m[-2][1]
-            high_5m = ohlcv_5m[-2][2]
-            low_5m = ohlcv_5m[-2][3]
-            close_5m = ohlcv_5m[-2][4]
-            current_volume = ohlcv_5m[-2][5] 
-            
-            volumes = [candle[5] for candle in ohlcv_5m[-12:-2]]
-            avg_volume = sum(volumes) / len(volumes) if volumes else 0
-            
-            candle_size = high_5m - low_5m
-            if candle_size == 0: return None
-            body_size = abs(close_5m - open_5m)
-            body_ratio = body_size / candle_size 
-            
-            open_1m = ohlcv_1m[-2][1]
-            close_1m = ohlcv_1m[-2][4]
+            # Korelasyon Kontrolü (BTC düşerken Long aranıyorsa ekstra temkin)
+            is_contrarian = (potential_trend == 'long' and btc_trend == 'bearish') or (potential_trend == 'short' and btc_trend == 'bullish')
 
-            # 🚀 LONG SENARYOSU (BTC Teyidi Eklendi)
-            if btc_trend in ['bullish', 'neutral']:
-                if is_4h_bullish: 
-                    if curr_price_15m >= (recent_high * 0.990) and bull_pressure > (bear_pressure * 1.2): 
-                        if close_5m > open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2): 
-                            if close_1m > open_1m: 
-                                # 🚀 YENİ İLAVE 2: Dinamik Stop Hesaplaması (Dibin %0.5 altı)
-                                sl_price = recent_low * 0.995 
-                                return {"symbol": symbol, "trend": "long", "sl_price": sl_price}
-                            
-            # 🚀 SHORT SENARYOSU (BTC Teyidi Eklendi)
-            if btc_trend in ['bearish', 'neutral']:
-                if is_4h_bearish: 
-                    if curr_price_15m <= (recent_low * 1.010) and bear_pressure > (bull_pressure * 1.2): 
-                        if close_5m < open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2): 
-                            if close_1m < open_1m: 
-                                # 🚀 YENİ İLAVE 2: Dinamik Stop Hesaplaması (Zirvenin %0.5 üstü)
-                                sl_price = recent_high * 1.005 
-                                return {"symbol": symbol, "trend": "short", "sl_price": sl_price}
+            # --- 2. KATMAN (Momentum: 15M ve 5M) ---
+            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=16)
+            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20)
             
+            prev_15m_anatomy = self._analyze_candle_anatomy(ohlcv_15m[-2][1], ohlcv_15m[-2][2], ohlcv_15m[-2][3], ohlcv_15m[-2][4])
+            prev_5m_anatomy = self._analyze_candle_anatomy(ohlcv_5m[-2][1], ohlcv_5m[-2][2], ohlcv_5m[-2][3], ohlcv_5m[-2][4])
+            
+            # Momentum Evresi: 5M'de son 3 mum peş peşe doji ise trend yorulmuştur (Exhaustion)
+            last_3_5m_anatomies = [self._analyze_candle_anatomy(c[1], c[2], c[3], c[4]) for c in ohlcv_5m[-4:-1]]
+            if last_3_5m_anatomies.count('doji') >= 2: return None 
+
+            # --- 3. KATMAN (Hacim Patlaması & 1M Kesin Giriş) ---
+            if is_contrarian:
+                # BTC'ye ters gidiyorsa hacim kırılımı ZORUNLUDUR!
+                has_breakout = await self.check_volume_breakout(symbol)
+                if not has_breakout: return None
+
+            ohlcv_1m = await self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=15)
+            curr_1m_is_green = ohlcv_1m[-1][4] > ohlcv_1m[-1][1]
+            
+            # Swing SL (Dinamik Stop) için 15M yapıları
+            df_15 = pd.DataFrame(ohlcv_15m[:-1], columns=['t', 'o', 'h', 'l', 'c', 'v'])
+            recent_low = df_15['l'].min()
+            recent_high = df_15['h'].max()
+
+            # NİHAİ KARAR MEKANİZMASI
+            if potential_trend == 'long':
+                if prev_15m_anatomy in ['strong_bullish', 'hammer'] and prev_5m_anatomy not in ['shooting_star', 'gravestone']:
+                    if curr_1m_is_green: # Bıçak düşmüyor, yön yukarı döndü
+                        return {"symbol": symbol, "trend": "long", "sl_price": recent_low * 0.995}
+                        
+            elif potential_trend == 'short':
+                if prev_15m_anatomy in ['strong_bearish', 'shooting_star'] and prev_5m_anatomy not in ['hammer']:
+                    if not curr_1m_is_green: # Fiyat anlık olarak yukarı fırlamıyor
+                        return {"symbol": symbol, "trend": "short", "sl_price": recent_high * 1.005}
+
             return None
-        except Exception:
+        except Exception as e:
             return None
 
     async def scan_market(self):
-        # İşlem taramadan önce BTC'nin anlık yönünü alır
-        btc_trend = await self._get_btc_trend()
-        
+        btc_trend = await self._get_btc_context()
         top_coins = await self.get_top_coins()
+        
         radar_list = []
-        if not top_coins:
-            return radar_list
+        if not top_coins: return radar_list
+        
         batch_size = 5
         for i in range(0, len(top_coins), batch_size):
             batch = top_coins[i:i+batch_size]
@@ -170,8 +178,22 @@ class MarketScanner:
             for res in results:
                 if res:
                     radar_list.append(res)
-            await asyncio.sleep(0.5) 
+            await asyncio.sleep(0.3) # API Rate Limit koruması
+            
         return radar_list
+
+    async def check_momentum_reversal(self, symbol, trade_type):
+        """Açık işlemler için 15M'de ani geri dönüş (Çekiç/Kayan Yıldız) kontrolü."""
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=3)
+            anatomy = self._analyze_candle_anatomy(ohlcv[-2][1], ohlcv[-2][2], ohlcv[-2][3], ohlcv[-2][4])
+            
+            if trade_type == 'long' and anatomy in ['shooting_star', 'gravestone', 'strong_bearish']: return True
+            if trade_type == 'short' and anatomy in ['hammer', 'strong_bullish']: return True
+            
+            return False
+        except:
+            return False
 
     async def close(self):
         await self.exchange.close()
