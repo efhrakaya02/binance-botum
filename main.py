@@ -11,7 +11,7 @@ class TradingBot:
         self.config = Config()
         self.scanner = MarketScanner(self.config)
         self.risk_manager = RiskManager(self.config)
-        self.execution = Execution(self.config)
+        self.execution = ExecutionEngine(self.config)
         self.active_trades = {}  # Aktif işlemleri takip edeceğimiz sözlük
         self.max_active_trades = 3  # Aynı anda maksimum 3 işlem
 
