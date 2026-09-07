@@ -8,7 +8,7 @@ from modules.state_manager import StateManager
 from modules.execution import ExecutionEngine
 
 async def main_loop():
-    print("🤖 PA Bot Başlatılıyor... (2 Saat Hard-Limit ve Dinamik Çıkış Zekası Aktif)")
+    print("🤖 PA Bot Başlatılıyor... (%3 Hard TP ve %1.2 İvme Filtresi Aktif)")
     
     state_mgr = StateManager()
     risk_mgr = RiskManager(config)
@@ -16,7 +16,7 @@ async def main_loop():
     executor = ExecutionEngine(config)
     
     last_status_print = {} 
-    last_momentum_check = {} # API limitlerini korumak için 60 saniye bekletici
+    last_momentum_check = {} 
     last_report_time = time.time()
     closed_trades_history = [] 
     
@@ -53,10 +53,12 @@ async def main_loop():
                     
                     # 🚀 ZAMAN AŞIMI KONTROLLERİ
                     time_open = now - entry_time
-                    hard_timeout = time_open >= 7200 # 2 Saat (7200 Saniye) - Ne olursa olsun kapat
-                    stagnant_timeout = (time_open >= 3600) and (pnl_pct < config.TRAILING_ACTIVATION_PCT) # 60dk Yataya bağlama
+                    hard_timeout = time_open >= 7200 
+                    stagnant_timeout = (time_open >= 3600) and (pnl_pct < config.TRAILING_ACTIVATION_PCT) 
                     
-                    # 🚀 DİNAMİK MOMENTUM ÇIKIŞI (Sadece kârdayken, her 60 saniyede bir kontrol et)
+                    # 🚀 %3 KESİN HEDEF KONTROLÜ (HARD TP)
+                    target_reached = pnl_pct >= 3.0
+                    
                     is_reversing = False
                     if symbol not in last_momentum_check:
                         last_momentum_check[symbol] = 0
@@ -67,10 +69,12 @@ async def main_loop():
                     
                     close_condition = (is_long and current_price <= dynamic_sl) or (not is_long and current_price >= dynamic_sl)
                     
-                    if close_condition or hard_timeout or stagnant_timeout or is_reversing:
-                        # Kapanış Sebebini Belirleme
+                    # Kapanış Şartlarından Herhangi Biri Gerçekleştiyse:
+                    if target_reached or close_condition or hard_timeout or stagnant_timeout or is_reversing:
                         close_reason = ""
-                        if hard_timeout:
+                        if target_reached:
+                            close_reason = "Hedef Vuruldu (%3 Hard TP)"
+                        elif hard_timeout:
                             close_reason = "2 Saat Süre Sınırı"
                         elif is_reversing:
                             close_reason = "Momentum Kaybı / Erken Çıkış"
