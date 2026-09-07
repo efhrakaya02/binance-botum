@@ -6,27 +6,19 @@ class RiskManager:
         if is_long:
             profit_pct = ((max_reached_price - entry_price) / entry_price) * 100
             
-            # 🚀 GÜNCELLEME: Sabit -%1 yerine, PA temelli Swing Low (Dinamik) Stop noktası kullanılır
             if profit_pct < 1.5:
+                # Kâr %1.5'e ulaşana kadar, Dinamik Stop (Swing Low) veya sabit -%1 koruması devrededir
                 return initial_sl if initial_sl else entry_price * 0.99
-            elif 1.5 <= profit_pct < 3.0:
-                return entry_price * 1.01 
-            elif 3.0 <= profit_pct < 3.5:
-                locked_profit_pct = profit_pct * 0.70  
-                return entry_price * (1 + (locked_profit_pct / 100))
             else:
-                locked_profit_pct = profit_pct * 0.75 
+                # 🚀 YENİ: Kâr %1.5'i geçtiği andan itibaren, görülen ZİRVENİN %75'ini kilitler!
+                # (Örn: Zirve %2.0 -> Kilit %1.5'te | Zirve %2.75 -> Kilit %2.06'da)
+                locked_profit_pct = profit_pct * 0.75
                 return entry_price * (1 + (locked_profit_pct / 100))
         else:
             profit_pct = ((entry_price - max_reached_price) / entry_price) * 100
             
             if profit_pct < 1.5:
                 return initial_sl if initial_sl else entry_price * 1.01
-            elif 1.5 <= profit_pct < 3.0:
-                return entry_price * 0.99  
-            elif 3.0 <= profit_pct < 3.5:
-                locked_profit_pct = profit_pct * 0.70
-                return entry_price * (1 - (locked_profit_pct / 100))
             else:
                 locked_profit_pct = profit_pct * 0.75
                 return entry_price * (1 - (locked_profit_pct / 100))
