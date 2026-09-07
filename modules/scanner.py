@@ -12,56 +12,44 @@ class MarketScanner:
             'options': {'defaultType': 'future'}
         })
 
-    # 🚀 PA KONTROLÜ 1: Oynaklık (Coin ölü mü, hareketli mi?)
     def _calculate_average_range(self, ohlcv, period=14):
         if len(ohlcv) < period:
             return 0
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # Mum boylarının (High-Low) fiyata % olarak oranı
         df['range_pct'] = ((df['high'] - df['low']) / df['low']) * 100
         return df['range_pct'].tail(period).mean()
 
-    # 🚀 PA KONTROLÜ 2: Alıcı/Satıcı Baskısı (Mum Gövdelerinin Savaşı)
     def _get_buying_selling_pressure(self, ohlcv, period=10):
         if len(ohlcv) < period:
             return 0, 0
         df = pd.DataFrame(ohlcv[-period:], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # Yeşil mumların gövde toplamı
         bullish_bodies = (df[df['close'] > df['open']]['close'] - df[df['close'] > df['open']]['open']).sum()
-        # Kırmızı mumların gövde toplamı
         bearish_bodies = (df[df['open'] > df['close']]['open'] - df[df['open'] > df['close']]['close']).sum()
         return bullish_bodies, bearish_bodies
 
-    # 🚀 PA KONTROLÜ 3: Market Structure (Piyasa Yapısı - Swing Tepe/Dip)
-    def _get_market_structure(self, ohlcv, lookback=15):
+    def _get_market_structure(self, ohlcv, lookback=10): # 🚀 DEĞİŞİKLİK: 15'ten 10'a düştü (Daha hızlı tepki)
         if len(ohlcv) < lookback + 1:
             return 0, 0
-        # Son 'lookback' kadar mumu alıp en yüksek ve en düşük noktaları bulur (Swing High / Swing Low)
         df = pd.DataFrame(ohlcv[-(lookback+1):-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         recent_high = df['high'].max()
         recent_low = df['low'].min()
         return recent_high, recent_low
 
-    # 🚀 YENİ ZEKA: Saf Price Action ile Momentum Dönüşü (Erken Kaçış)
     async def check_momentum_reversal(self, symbol, trade_type):
         try:
             ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=5)
             if not ohlcv_5m or len(ohlcv_5m) < 3:
                 return False
 
-            # c1: Son kapanan mum, c2: Ondan önceki mum
             c1_open, c1_high, c1_low, c1_close = ohlcv_5m[-2][1], ohlcv_5m[-2][2], ohlcv_5m[-2][3], ohlcv_5m[-2][4]
             c2_open, c2_high, c2_low, c2_close = ohlcv_5m[-3][1], ohlcv_5m[-3][2], ohlcv_5m[-3][3], ohlcv_5m[-3][4]
 
             if trade_type == 'long':
-                # PA Kuralı: Son mum kırmızı kapatırsa VE bir önceki mumun en düşük seviyesini aşağı kırarsa (Lower Low) -> Mikro Trend Döndü!
                 if (c1_close < c1_open) and (c1_close < c2_low):
                     return True
             elif trade_type == 'short':
-                # PA Kuralı: Son mum yeşil kapatırsa VE bir önceki mumun en yüksek seviyesini yukarı kırarsa (Higher High) -> Mikro Trend Döndü!
                 if (c1_close > c1_open) and (c1_close > c2_high):
                     return True
-                    
             return False
         except Exception:
             return False
@@ -95,29 +83,28 @@ class MarketScanner:
     async def analyze_trend(self, symbol):
         try:
             tasks = [
-                self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30),
+                self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20),
                 self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15)
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
-                if isinstance(res, Exception) or not res or len(res) < 20:
+                if isinstance(res, Exception) or not res or len(res) < 15:
                     return None
                     
             ohlcv_15m, ohlcv_5m = results
             
-            # --- 1. AŞAMA: OYNAKLIK KONTROLÜ ---
-            avg_range = self._calculate_average_range(ohlcv_15m[:-1], 15)
-            if avg_range < 0.6: # Hantal ve yatay coinleri direkt ele
+            # --- OYNAKLIK EŞİĞİ --- (0.35'e çekildi, aşırı ölü coinler hariç işleme izin verir)
+            avg_range = self._calculate_average_range(ohlcv_15m[:-1], 10)
+            if avg_range < 0.35: 
                 return None
                 
-            # --- 2. AŞAMA: MARKET STRUCTURE (PİYASA YAPISI) ---
-            recent_high, recent_low = self._get_market_structure(ohlcv_15m, 15)
-            curr_price_15m = ohlcv_15m[-2][4] # 15 dakikalık son kapanış
+            # --- MARKET STRUCTURE (Son 10 mumluk taze zirve/dip kontrolü) ---
+            recent_high, recent_low = self._get_market_structure(ohlcv_15m, 10)
+            curr_price_15m = ohlcv_15m[-2][4] 
 
-            # --- 3. AŞAMA: ALICI/SATICI BASKISI ---
-            bull_pressure, bear_pressure = self._get_buying_selling_pressure(ohlcv_15m[:-1], 10)
+            # Baskı ölçümünü son 7 mumda yapıyoruz (Çok geçmişe bakıp yanılmamak için)
+            bull_pressure, bear_pressure = self._get_buying_selling_pressure(ohlcv_15m[:-1], 7)
 
-            # --- 4. AŞAMA: TETİKLEYİCİ (GİRİŞ) MUMU (5 DAKİKALIK) ---
             open_5m = ohlcv_5m[-2][1]
             high_5m = ohlcv_5m[-2][2]
             low_5m = ohlcv_5m[-2][3]
@@ -127,30 +114,29 @@ class MarketScanner:
             volumes = [candle[5] for candle in ohlcv_5m[-12:-2]]
             avg_volume = sum(volumes) / len(volumes) if volumes else 0
             
-            # Mum Boyu ve Gövde Oranı Hesaplama
             candle_size = high_5m - low_5m
             if candle_size == 0: return None
             body_size = abs(close_5m - open_5m)
-            body_ratio = body_size / candle_size # Gövde, tüm mumun yüzde kaçı? (İğne reddini ölçer)
+            body_ratio = body_size / candle_size 
 
-            # 🚀 KESİN GİRİŞ KARARLARI (PURE PRICE ACTION)
+            # 🚀 DENGELİ KESİN GİRİŞ KARARLARI (SNIPER + NEFES PAYI)
             
             # LONG SENARYOSU
-            # 1. Fiyat son 15 mumun tepesini (Swing High) kırmış veya milimetrik yakınında (BOS)
-            if curr_price_15m >= (recent_high * 0.998): 
-                # 2. Alıcıların gövde hacmi, satıcıların en az 1.5 katı (Kontrol Boğalarda)
-                if bull_pressure > (bear_pressure * 1.5):
-                    # 3. Tetikleyici Mum: Yeşil olmalı, gövdesi dolgun olmalı (%65 üstü), hacim ortalamanın 1.5 katı olmalı
-                    if close_5m > open_5m and body_ratio > 0.65 and current_volume > (avg_volume * 1.5):
+            # 1. Zirve Yakınlığı: 0.995'ten 0.990'a çekildi (Tepenin %1 yakını yeterli)
+            if curr_price_15m >= (recent_high * 0.990): 
+                # 2. Baskı Oranı: Alıcılar %20 daha güçlü olmalı
+                if bull_pressure > (bear_pressure * 1.2):
+                    # 3. Mum Dolgunluğu: %50 (Gövde mumun en az yarısı), Hacim Artışı: 1.2x
+                    if close_5m > open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2):
                         return {"symbol": symbol, "trend": "long"}
                         
             # SHORT SENARYOSU
-            # 1. Fiyat son 15 mumun dibini (Swing Low) kırmış veya milimetrik yakınında (BOS)
-            elif curr_price_15m <= (recent_low * 1.002):
-                # 2. Satıcıların gövde hacmi, alıcıların en az 1.5 katı (Kontrol Ayılarda)
-                if bear_pressure > (bull_pressure * 1.5):
-                    # 3. Tetikleyici Mum: Kırmızı olmalı, gövdesi dolgun olmalı (%65 üstü), hacim patlamış olmalı
-                    if close_5m < open_5m and body_ratio > 0.65 and current_volume > (avg_volume * 1.5):
+            # 1. Dip Yakınlığı: 1.005'ten 1.010'a çekildi (Dibin %1 yakını yeterli)
+            elif curr_price_15m <= (recent_low * 1.010):
+                # 2. Baskı Oranı: Satıcılar %20 daha güçlü olmalı
+                if bear_pressure > (bull_pressure * 1.2):
+                    # 3. Mum Dolgunluğu: %50, Hacim Artışı: 1.2x
+                    if close_5m < open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2):
                         return {"symbol": symbol, "trend": "short"}
             
             return None
