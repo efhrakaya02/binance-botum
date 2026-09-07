@@ -3,7 +3,7 @@ import time
 from config import Config
 from modules.scanner import MarketScanner
 from modules.orderbook import OrderbookAnalyzer
-from risk_manager import RiskManager
+from modules.risk_manager import RiskManager
 from modules.execution import Execution  # İşlem açma/kapatma modülün (var olduğunu varsayıyorum)
 
 class TradingBot:
