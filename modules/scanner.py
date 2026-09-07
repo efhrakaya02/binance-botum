@@ -82,34 +82,41 @@ class MarketScanner:
 
     async def analyze_trend(self, symbol):
         try:
+            # 🚀 YENİ: 4H, 15M, 5M ve 1M verileri aynı anda çekiliyor
             tasks = [
+                self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5),
                 self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20),
-                self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15)
+                self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=15),
+                self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=5)
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
-                if isinstance(res, Exception) or not res or len(res) < 15:
+                if isinstance(res, Exception) or not res or len(res) < 5:
                     return None
                     
-            ohlcv_15m, ohlcv_5m = results
+            ohlcv_4h, ohlcv_15m, ohlcv_5m, ohlcv_1m = results
             
+            # --- 1. 4H MAKRO TREND KONTROLÜ (YÖN TEYİDİ) ---
+            close_4h_prev = ohlcv_4h[-2][4]
+            open_4h_prev = ohlcv_4h[-2][1]
+            is_4h_bullish = close_4h_prev > open_4h_prev # Ana trend yeşil mi?
+            is_4h_bearish = close_4h_prev < open_4h_prev # Ana trend kırmızı mı?
+            
+            # --- 2. 15M İVME VE POTANSİYEL KONTROLÜ ---
             avg_range = self._calculate_average_range(ohlcv_15m[:-1], 10)
             if avg_range < 0.35: 
                 return None
                 
             recent_high, recent_low = self._get_market_structure(ohlcv_15m, 10)
-            
-            # 🚀 YENİ ZEKA: HAREKET İVMESİ (POTANSİYEL) KONTROLÜ
-            # Son yapının (dalganın) en dibi ile en tepesi arasındaki % farkı ölçer
             momentum_ivme_pct = ((recent_high - recent_low) / recent_low) * 100
             
-            # Eğer dalganın toplam ivmesi %1.2'den küçükse, bu coinden %3 hedef beklemek mantıksızdır, pas geç!
             if momentum_ivme_pct < 1.2:
                 return None
                 
             curr_price_15m = ohlcv_15m[-2][4] 
             bull_pressure, bear_pressure = self._get_buying_selling_pressure(ohlcv_15m[:-1], 7)
 
+            # --- 3. 5M TETİKLEYİCİ MUM KONTROLÜ ---
             open_5m = ohlcv_5m[-2][1]
             high_5m = ohlcv_5m[-2][2]
             low_5m = ohlcv_5m[-2][3]
@@ -124,15 +131,25 @@ class MarketScanner:
             body_size = abs(close_5m - open_5m)
             body_ratio = body_size / candle_size 
             
-            if curr_price_15m >= (recent_high * 0.990): 
-                if bull_pressure > (bear_pressure * 1.2):
-                    if close_5m > open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2):
-                        return {"symbol": symbol, "trend": "long"}
+            # --- 4. 1M MİKRO ZAMANLAMA KONTROLÜ (SNIPER) ---
+            open_1m = ohlcv_1m[-2][1]
+            close_1m = ohlcv_1m[-2][4]
+
+            # 🚀 KESİN GİRİŞ KARARLARI (4 Katmanlı Zırh)
+            
+            # LONG SENARYOSU
+            if is_4h_bullish: # 1. 4H Onayı
+                if curr_price_15m >= (recent_high * 0.990) and bull_pressure > (bear_pressure * 1.2): # 2. 15M Onayı
+                    if close_5m > open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2): # 3. 5M Onayı
+                        if close_1m > open_1m: # 4. 1M Onayı (Anlık düşüşte değiliz)
+                            return {"symbol": symbol, "trend": "long"}
                         
-            elif curr_price_15m <= (recent_low * 1.010):
-                if bear_pressure > (bull_pressure * 1.2):
-                    if close_5m < open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2):
-                        return {"symbol": symbol, "trend": "short"}
+            # SHORT SENARYOSU
+            if is_4h_bearish: # 1. 4H Onayı
+                if curr_price_15m <= (recent_low * 1.010) and bear_pressure > (bull_pressure * 1.2): # 2. 15M Onayı
+                    if close_5m < open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2): # 3. 5M Onayı
+                        if close_1m < open_1m: # 4. 1M Onayı (Anlık yükselişte değiliz)
+                            return {"symbol": symbol, "trend": "short"}
             
             return None
         except Exception:
