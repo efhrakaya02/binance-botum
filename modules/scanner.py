@@ -27,7 +27,7 @@ class MarketScanner:
         bearish_bodies = (df[df['open'] > df['close']]['open'] - df[df['open'] > df['close']]['close']).sum()
         return bullish_bodies, bearish_bodies
 
-    def _get_market_structure(self, ohlcv, lookback=10): # 🚀 DEĞİŞİKLİK: 15'ten 10'a düştü (Daha hızlı tepki)
+    def _get_market_structure(self, ohlcv, lookback=10):
         if len(ohlcv) < lookback + 1:
             return 0, 0
         df = pd.DataFrame(ohlcv[-(lookback+1):-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -93,16 +93,21 @@ class MarketScanner:
                     
             ohlcv_15m, ohlcv_5m = results
             
-            # --- OYNAKLIK EŞİĞİ --- (0.35'e çekildi, aşırı ölü coinler hariç işleme izin verir)
             avg_range = self._calculate_average_range(ohlcv_15m[:-1], 10)
             if avg_range < 0.35: 
                 return None
                 
-            # --- MARKET STRUCTURE (Son 10 mumluk taze zirve/dip kontrolü) ---
             recent_high, recent_low = self._get_market_structure(ohlcv_15m, 10)
+            
+            # 🚀 YENİ ZEKA: HAREKET İVMESİ (POTANSİYEL) KONTROLÜ
+            # Son yapının (dalganın) en dibi ile en tepesi arasındaki % farkı ölçer
+            momentum_ivme_pct = ((recent_high - recent_low) / recent_low) * 100
+            
+            # Eğer dalganın toplam ivmesi %1.2'den küçükse, bu coinden %3 hedef beklemek mantıksızdır, pas geç!
+            if momentum_ivme_pct < 1.2:
+                return None
+                
             curr_price_15m = ohlcv_15m[-2][4] 
-
-            # Baskı ölçümünü son 7 mumda yapıyoruz (Çok geçmişe bakıp yanılmamak için)
             bull_pressure, bear_pressure = self._get_buying_selling_pressure(ohlcv_15m[:-1], 7)
 
             open_5m = ohlcv_5m[-2][1]
@@ -118,24 +123,14 @@ class MarketScanner:
             if candle_size == 0: return None
             body_size = abs(close_5m - open_5m)
             body_ratio = body_size / candle_size 
-
-            # 🚀 DENGELİ KESİN GİRİŞ KARARLARI (SNIPER + NEFES PAYI)
             
-            # LONG SENARYOSU
-            # 1. Zirve Yakınlığı: 0.995'ten 0.990'a çekildi (Tepenin %1 yakını yeterli)
             if curr_price_15m >= (recent_high * 0.990): 
-                # 2. Baskı Oranı: Alıcılar %20 daha güçlü olmalı
                 if bull_pressure > (bear_pressure * 1.2):
-                    # 3. Mum Dolgunluğu: %50 (Gövde mumun en az yarısı), Hacim Artışı: 1.2x
                     if close_5m > open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2):
                         return {"symbol": symbol, "trend": "long"}
                         
-            # SHORT SENARYOSU
-            # 1. Dip Yakınlığı: 1.005'ten 1.010'a çekildi (Dibin %1 yakını yeterli)
             elif curr_price_15m <= (recent_low * 1.010):
-                # 2. Baskı Oranı: Satıcılar %20 daha güçlü olmalı
                 if bear_pressure > (bull_pressure * 1.2):
-                    # 3. Mum Dolgunluğu: %50, Hacim Artışı: 1.2x
                     if close_5m < open_5m and body_ratio > 0.50 and current_volume > (avg_volume * 1.2):
                         return {"symbol": symbol, "trend": "short"}
             
