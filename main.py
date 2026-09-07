@@ -8,7 +8,7 @@ from modules.state_manager import StateManager
 from modules.execution import ExecutionEngine
 
 async def main_loop():
-    print("🤖 PA Bot Başlatılıyor... (%3 Hard TP ve %1.2 İvme Filtresi Aktif)")
+    print("🤖 PA Bot Başlatılıyor... (BTC Teyidi, Dinamik SL ve Gece Modu Aktif)")
     
     state_mgr = StateManager()
     risk_mgr = RiskManager(config)
@@ -34,6 +34,7 @@ async def main_loop():
                     entry_price = trade_data["entry"]
                     max_price = trade_data["max_price"]
                     entry_time = trade_data.get("entry_time", now) 
+                    initial_sl = trade_data.get("initial_sl") # 🚀 Dinamik Stop Hafızadan Çekildi
                     
                     if is_long and current_price > max_price:
                         trade_data["max_price"] = current_price
@@ -42,7 +43,8 @@ async def main_loop():
                         trade_data["max_price"] = current_price
                         max_price = current_price
                         
-                    dynamic_sl = risk_mgr.calculate_stop_loss(entry_price, trade_data["max_price"], is_long)
+                    # 🚀 initial_sl değeri artık RiskManager'a gönderiliyor
+                    dynamic_sl = risk_mgr.calculate_stop_loss(entry_price, trade_data["max_price"], is_long, initial_sl)
                     
                     if is_long:
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -51,12 +53,10 @@ async def main_loop():
                         pnl_pct = ((entry_price - current_price) / entry_price) * 100
                         peak_pnl = ((entry_price - max_price) / entry_price) * 100
                     
-                    # 🚀 ZAMAN AŞIMI KONTROLLERİ
                     time_open = now - entry_time
                     hard_timeout = time_open >= 7200 
                     stagnant_timeout = (time_open >= 3600) and (pnl_pct < config.TRAILING_ACTIVATION_PCT) 
                     
-                    # 🚀 %3 KESİN HEDEF KONTROLÜ (HARD TP)
                     target_reached = pnl_pct >= 3.0
                     
                     is_reversing = False
@@ -69,7 +69,6 @@ async def main_loop():
                     
                     close_condition = (is_long and current_price <= dynamic_sl) or (not is_long and current_price >= dynamic_sl)
                     
-                    # Kapanış Şartlarından Herhangi Biri Gerçekleştiyse:
                     if target_reached or close_condition or hard_timeout or stagnant_timeout or is_reversing:
                         close_reason = ""
                         if target_reached:
@@ -81,7 +80,7 @@ async def main_loop():
                         elif stagnant_timeout:
                             close_reason = "60dk Hacimsiz (Zaman Aşımı)"
                         elif pnl_pct <= -0.1:
-                            close_reason = "Stop-Loss"
+                            close_reason = "Stop-Loss (Dinamik/Sabit)"
                         elif pnl_pct >= 0.5:
                             close_reason = "Kar Kilitlendi"
                         else:
@@ -143,45 +142,55 @@ async def main_loop():
                 closed_trades_history.clear()
                 last_report_time = now
 
+            # 🚀 YENİ İLAVE 3: Asya Seansı / Uyku Modu (TSİ 02:00 - 05:00)
+            current_hour_tsi = (time.gmtime().tm_hour + 3) % 24
+            is_sleeping_hours = 2 <= current_hour_tsi < 5
+
             if state_mgr.get_used_slots() < config.MAX_OPEN_POSITIONS:
-                radar_list = await scanner.scan_market()
-                
-                for opportunity in radar_list:
-                    if state_mgr.get_used_slots() >= config.MAX_OPEN_POSITIONS:
-                        break 
-                        
-                    symbol = opportunity["symbol"]
-                    trend = opportunity["trend"]
+                if is_sleeping_hours:
+                    if now - last_status_print.get("sleep_msg", 0) > 3600:
+                        print("🌙 Bot Asya seansında (TSİ 02:00-05:00) hacim düştüğü için yeni işlem aramayı durdurdu. Açık işlemler takip ediliyor...")
+                        last_status_print["sleep_msg"] = now
+                else:
+                    radar_list = await scanner.scan_market()
                     
-                    if symbol in state_mgr.state["active_trades"]:
-                        continue
-                        
-                    if state_mgr.is_in_cooldown(symbol):
-                        continue
-                        
-                    ob_analyzer = OrderbookAnalyzer(symbol)
-                    try:
-                        ticker = await executor.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        
-                        is_safe = await ob_analyzer.check_for_walls_and_sweeps(current_price, is_long=(trend=="long"))
-                        
-                        if is_safe:
-                            trade_result = await executor.open_position(symbol, 'buy' if trend == "long" else 'sell', current_price)
+                    for opportunity in radar_list:
+                        if state_mgr.get_used_slots() >= config.MAX_OPEN_POSITIONS:
+                            break 
                             
-                            if trade_result["status"] == "success":
-                                state_mgr.state["active_trades"][symbol] = {
-                                    "entry": trade_result["entry_price"],
-                                    "max_price": trade_result["entry_price"],
-                                    "type": trend,
-                                    "amount": trade_result["amount"],
-                                    "entry_time": time.time()
-                                }
-                                state_mgr.save_state()
-                                last_status_print[symbol] = now 
-                                print(f"🚀 BAŞARILI: {symbol} sanal işlem açıldı.\n")
-                    except Exception:
-                        continue 
+                        symbol = opportunity["symbol"]
+                        trend = opportunity["trend"]
+                        
+                        if symbol in state_mgr.state["active_trades"]:
+                            continue
+                            
+                        if state_mgr.is_in_cooldown(symbol):
+                            continue
+                            
+                        ob_analyzer = OrderbookAnalyzer(symbol)
+                        try:
+                            ticker = await executor.exchange.fetch_ticker(symbol)
+                            current_price = ticker['last']
+                            
+                            is_safe = await ob_analyzer.check_for_walls_and_sweeps(current_price, is_long=(trend=="long"))
+                            
+                            if is_safe:
+                                trade_result = await executor.open_position(symbol, 'buy' if trend == "long" else 'sell', current_price)
+                                
+                                if trade_result["status"] == "success":
+                                    state_mgr.state["active_trades"][symbol] = {
+                                        "entry": trade_result["entry_price"],
+                                        "max_price": trade_result["entry_price"],
+                                        "type": trend,
+                                        "amount": trade_result["amount"],
+                                        "entry_time": time.time(),
+                                        "initial_sl": opportunity.get("sl_price") # 🚀 Dinamik SL kaydedildi
+                                    }
+                                    state_mgr.save_state()
+                                    last_status_print[symbol] = now 
+                                    print(f"🚀 BAŞARILI: {symbol} sanal işlem açıldı.\n")
+                        except Exception:
+                            continue 
             
             await asyncio.sleep(5)
             
