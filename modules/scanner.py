@@ -151,13 +151,15 @@ class MarketScanner:
             # NİHAİ KARAR MEKANİZMASI
             if potential_trend == 'long':
                 if prev_15m_anatomy in ['strong_bullish', 'hammer'] and prev_5m_anatomy not in ['shooting_star', 'gravestone']:
-                    if curr_1m_is_green: # Bıçak düşmüyor, yön yukarı döndü
-                        return {"symbol": symbol, "trend": "long", "sl_price": recent_low * 0.995}
+                    if curr_1m_is_green:
+                        reason = f"BTC trendi uyumlu. 4H ve 1H makro yön yukarı. 15M grafiğinde '{prev_15m_anatomy}' mumu ile dönüş teyidi aldım."
+                        return {"symbol": symbol, "trend": "long", "sl_price": recent_low * 0.995, "reason": reason}
                         
             elif potential_trend == 'short':
                 if prev_15m_anatomy in ['strong_bearish', 'shooting_star'] and prev_5m_anatomy not in ['hammer']:
-                    if not curr_1m_is_green: # Fiyat anlık olarak yukarı fırlamıyor
-                        return {"symbol": symbol, "trend": "short", "sl_price": recent_high * 1.005}
+                    if not curr_1m_is_green:
+                        reason = f"BTC yönüyle uyumlu. 4H ve 1H satıcılı. 15M grafiğinde '{prev_15m_anatomy}' ile tükeniş gördüm."
+                        return {"symbol": symbol, "trend": "short", "sl_price": recent_high * 1.005, "reason": reason}
 
             return None
         except Exception as e:
