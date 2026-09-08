@@ -1,201 +1,200 @@
 import ccxt.async_support as ccxt
 import asyncio
-import pandas as pd
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Optional
 
+# --- KURUMSAL PRICE ACTION (SMC) SINIFLARI VE FONKSİYONLARI ---
+class Trend(Enum):
+    UP = "UP"
+    DOWN = "DOWN"
+    RANGE = "RANGE"
+
+class SwingType(Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
+
+@dataclass
+class SwingPoint:
+    index: int
+    price: float
+    type: SwingType
+
+@dataclass
+class StructureBreak:
+    kind: str
+    direction: Trend
+    broken_level: float
+    break_close: float
+
+def find_swing_points(candles, lookback: int = 2) -> List[SwingPoint]:
+    points = []
+    n = len(candles)
+    for i in range(lookback, n - lookback):
+        window = candles[i - lookback : i + lookback + 1]
+        c = candles[i]
+        highs = [w[2] for w in window] # High index = 2
+        lows = [w[3] for w in window]  # Low index = 3
+        if c[2] == max(highs):
+            points.append(SwingPoint(index=i, price=c[2], type=SwingType.HIGH))
+        elif c[3] == min(lows):
+            points.append(SwingPoint(index=i, price=c[3], type=SwingType.LOW))
+    return points
+
+def determine_trend(swings: List[SwingPoint]) -> Trend:
+    highs = [s for s in swings if s.type == SwingType.HIGH][-3:]
+    lows = [s for s in swings if s.type == SwingType.LOW][-3:]
+    if len(highs) >= 2 and len(lows) >= 2:
+        higher_highs = highs[-1].price > highs[-2].price
+        higher_lows = lows[-1].price > lows[-2].price
+        lower_highs = highs[-1].price < highs[-2].price
+        lower_lows = lows[-1].price < lows[-2].price
+        if higher_highs and higher_lows: return Trend.UP
+        if lower_highs and lower_lows: return Trend.DOWN
+    return Trend.RANGE
+
+def detect_structure_break(candles, swings: List[SwingPoint], prevailing_trend: Trend) -> Optional[StructureBreak]:
+    if not candles or not swings: return None
+    last_close = candles[-1][4] # Close index = 4
+    last_high = next((s for s in reversed(swings) if s.type == SwingType.HIGH), None)
+    last_low = next((s for s in reversed(swings) if s.type == SwingType.LOW), None)
+
+    if prevailing_trend == Trend.UP and last_high and last_close > last_high.price:
+        return StructureBreak("BOS", Trend.UP, last_high.price, last_close)
+    if prevailing_trend == Trend.DOWN and last_low and last_close < last_low.price:
+        return StructureBreak("BOS", Trend.DOWN, last_low.price, last_close)
+    return None
+
+def volume_anomaly_ratio(candles, baseline_window: int = 20) -> float:
+    if len(candles) < baseline_window + 1: return 1.0
+    baseline = candles[-(baseline_window + 1) : -1]
+    avg_vol = sum(c[5] for c in baseline) / len(baseline) # Volume index = 5
+    if avg_vol == 0: return 1.0
+    return candles[-1][5] / avg_vol
+
+def momentum_roc(candles, periods: int = 5) -> float:
+    if len(candles) < periods + 1: return 0.0
+    past = candles[-(periods + 1)][4]
+    now = candles[-1][4]
+    if past == 0: return 0.0
+    return (now - past) / past * 100
+
+# --- ANA TARAYICI SINIFI ---
 class MarketScanner:
     def __init__(self, config):
         self.config = config
-        self.exchange = ccxt.binance({
-            'apiKey': self.config.BINANCE_API_KEY,
-            'secret': self.config.BINANCE_API_SECRET,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
-        })
-
-    def _analyze_candle_anatomy(self, open_p, high_p, low_p, close_p):
-        """Mumun anatomik yapısını (Price Action formasyonunu) belirler."""
-        body = abs(close_p - open_p)
-        candle_range = high_p - low_p
-        
-        if candle_range == 0:
-            return 'doji'
-            
-        upper_wick = high_p - max(open_p, close_p)
-        lower_wick = min(open_p, close_p) - low_p
-        
-        body_ratio = body / candle_range
-
-        if body_ratio < 0.1:
-            if lower_wick > 2 * upper_wick: return 'hammer' # Çekiç / Pinbar (Boğa)
-            if upper_wick > 2 * lower_wick: return 'gravestone' # Mezar Taşı (Ayı)
-            return 'doji' # Kararsızlık
-            
-        if body_ratio > 0.65:
-            return 'strong_bullish' if close_p > open_p else 'strong_bearish' # Marubozu / Yutan
-            
-        if lower_wick > 2 * body and upper_wick < body:
-            return 'hammer'
-        if upper_wick > 2 * body and lower_wick < body:
-            return 'shooting_star' # Kayan Yıldız
-            
-        return 'neutral'
-
-    async def _get_btc_context(self):
-        """0. Aşama: Piyasaya yön veren BTC'nin 4H trendini okur."""
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='4h', limit=10)
-            if not ohlcv or len(ohlcv) < 3: return 'neutral'
-            
-            c_close = ohlcv[-2][4]
-            c_open = ohlcv[-2][1]
-            return 'bullish' if c_close > c_open else 'bearish'
-        except:
-            return 'neutral'
-
-    async def get_top_coins(self):
-        """Hacimli ve hareketli adayları havuzda toplar."""
-        try:
-            tickers = await self.exchange.fetch_tickers()
-            usdt_pairs = {k: v for k, v in tickers.items() if ':USDT' in k}
-            
-            data_list = []
-            for ticker_info in usdt_pairs.values():
-                data_list.append({
-                    'symbol': ticker_info.get('symbol', ''),
-                    'percentage': ticker_info.get('percentage', 0.0),
-                    'quoteVolume': ticker_info.get('quoteVolume', 0.0)
-                })
-                
-            df = pd.DataFrame(data_list)
-            df['percentage'] = df['percentage'].fillna(0)
-            df['quoteVolume'] = df['quoteVolume'].fillna(0)
-
-            gainers = df.sort_values(by='percentage', ascending=False).head(40)['symbol'].tolist()
-            losers = df.sort_values(by='percentage', ascending=True).head(40)['symbol'].tolist()
-            volume_leaders = df.sort_values(by='quoteVolume', ascending=False).head(40)['symbol'].tolist()
-            return list(set(gainers + losers + volume_leaders))
-        except:
-            return []
-
-    async def check_volume_breakout(self, symbol):
-        """Filtreyi geçen elit coinler için 50 mumluk Hacim Patlaması analizi."""
-        try:
-            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
-            if not ohlcv_15m or len(ohlcv_15m) < 50: return False
-            
-            volumes = [c[5] for c in ohlcv_15m[:-2]]
-            avg_volume_50 = sum(volumes) / len(volumes)
-            current_volume = ohlcv_15m[-2][5]
-            
-            # Son mumun hacmi, son 50 mumun ortalamasının en az 2 katı olmalı (Gerçek Kırılım)
-            return current_volume > (avg_volume_50 * 2.0)
-        except:
-            return False
-
-    async def analyze_trend(self, symbol, btc_trend):
-        """Çok Katmanlı (4H -> 1H -> 15M -> 5M -> 1M) Anatomi ve PA Analizi"""
-        try:
-            # --- 1. KATMAN (Makro Trend & API Koruyucu) ---
-            ohlcv_4h = await self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=10)
-            ohlcv_1h = await self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=20)
-            
-            if not ohlcv_4h or not ohlcv_1h: return None
-            
-            prev_4h_anatomy = self._analyze_candle_anatomy(ohlcv_4h[-2][1], ohlcv_4h[-2][2], ohlcv_4h[-2][3], ohlcv_4h[-2][4])
-            curr_4h_is_green = ohlcv_4h[-1][4] > ohlcv_4h[-1][1]
-            prev_4h_is_green = ohlcv_4h[-2][4] > ohlcv_4h[-2][1]
-            
-            prev_1h_anatomy = self._analyze_candle_anatomy(ohlcv_1h[-2][1], ohlcv_1h[-2][2], ohlcv_1h[-2][3], ohlcv_1h[-2][4])
-            curr_1h_is_green = ohlcv_1h[-1][4] > ohlcv_1h[-1][1]
-
-            # Makro Uyum Kontrolü (Long Adayı mı, Short Adayı mı?)
-            potential_trend = None
-            if prev_4h_is_green and curr_4h_is_green and prev_4h_anatomy not in ['gravestone', 'shooting_star']:
-                if curr_1h_is_green and prev_1h_anatomy not in ['gravestone', 'shooting_star']:
-                    potential_trend = 'long'
-                    
-            elif not prev_4h_is_green and not curr_4h_is_green and prev_4h_anatomy not in ['hammer']:
-                if not curr_1h_is_green and prev_1h_anatomy not in ['hammer']:
-                    potential_trend = 'short'
-            
-            if not potential_trend: return None # Makro trend yoksa hemen çık, API yorma.
-
-            # Korelasyon Kontrolü (BTC düşerken Long aranıyorsa ekstra temkin)
-            is_contrarian = (potential_trend == 'long' and btc_trend == 'bearish') or (potential_trend == 'short' and btc_trend == 'bullish')
-
-            # --- 2. KATMAN (Momentum: 15M ve 5M) ---
-            ohlcv_15m = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=16)
-            ohlcv_5m = await self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20)
-            
-            prev_15m_anatomy = self._analyze_candle_anatomy(ohlcv_15m[-2][1], ohlcv_15m[-2][2], ohlcv_15m[-2][3], ohlcv_15m[-2][4])
-            prev_5m_anatomy = self._analyze_candle_anatomy(ohlcv_5m[-2][1], ohlcv_5m[-2][2], ohlcv_5m[-2][3], ohlcv_5m[-2][4])
-            
-            # Momentum Evresi: 5M'de son 3 mum peş peşe doji ise trend yorulmuştur (Exhaustion)
-            last_3_5m_anatomies = [self._analyze_candle_anatomy(c[1], c[2], c[3], c[4]) for c in ohlcv_5m[-4:-1]]
-            if last_3_5m_anatomies.count('doji') >= 2: return None 
-
-            # --- 3. KATMAN (Hacim Patlaması & 1M Kesin Giriş) ---
-            if is_contrarian:
-                # BTC'ye ters gidiyorsa hacim kırılımı ZORUNLUDUR!
-                has_breakout = await self.check_volume_breakout(symbol)
-                if not has_breakout: return None
-
-            ohlcv_1m = await self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=15)
-            curr_1m_is_green = ohlcv_1m[-1][4] > ohlcv_1m[-1][1]
-            
-            # Swing SL (Dinamik Stop) için 15M yapıları
-            df_15 = pd.DataFrame(ohlcv_15m[:-1], columns=['t', 'o', 'h', 'l', 'c', 'v'])
-            recent_low = df_15['l'].min()
-            recent_high = df_15['h'].max()
-
-            # NİHAİ KARAR MEKANİZMASI
-            if potential_trend == 'long':
-                if prev_15m_anatomy in ['strong_bullish', 'hammer'] and prev_5m_anatomy not in ['shooting_star', 'gravestone']:
-                    if curr_1m_is_green:
-                        reason = f"BTC trendi uyumlu. 4H ve 1H makro yön yukarı. 15M grafiğinde '{prev_15m_anatomy}' mumu ile dönüş teyidi aldım."
-                        return {"symbol": symbol, "trend": "long", "sl_price": recent_low * 0.995, "reason": reason}
-                        
-            elif potential_trend == 'short':
-                if prev_15m_anatomy in ['strong_bearish', 'shooting_star'] and prev_5m_anatomy not in ['hammer']:
-                    if not curr_1m_is_green:
-                        reason = f"BTC yönüyle uyumlu. 4H ve 1H satıcılı. 15M grafiğinde '{prev_15m_anatomy}' ile tükeniş gördüm."
-                        return {"symbol": symbol, "trend": "short", "sl_price": recent_high * 1.005, "reason": reason}
-
-            return None
-        except Exception as e:
-            return None
-
-    async def scan_market(self):
-        btc_trend = await self._get_btc_context()
-        top_coins = await self.get_top_coins()
-        
-        radar_list = []
-        if not top_coins: return radar_list
-        
-        batch_size = 5
-        for i in range(0, len(top_coins), batch_size):
-            batch = top_coins[i:i+batch_size]
-            tasks = [self.analyze_trend(coin, btc_trend) for coin in batch]
-            results = await asyncio.gather(*tasks)
-            for res in results:
-                if res:
-                    radar_list.append(res)
-            await asyncio.sleep(0.3) # API Rate Limit koruması
-            
-        return radar_list
-
-    async def check_momentum_reversal(self, symbol, trade_type):
-        """Açık işlemler için 15M'de ani geri dönüş (Çekiç/Kayan Yıldız) kontrolü."""
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=3)
-            anatomy = self._analyze_candle_anatomy(ohlcv[-2][1], ohlcv[-2][2], ohlcv[-2][3], ohlcv[-2][4])
-            
-            if trade_type == 'long' and anatomy in ['shooting_star', 'gravestone', 'strong_bearish']: return True
-            if trade_type == 'short' and anatomy in ['hammer', 'strong_bullish']: return True
-            
-            return False
-        except:
-            return False
+        self.exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+        self.previous_ranks = {}
+        self.NEUTRAL_RANK = 10000
 
     async def close(self):
         await self.exchange.close()
+
+    async def _get_hot_candidates(self) -> List[str]:
+        """Rank Velocity ve Composite Score mantığı ile en sıcak coinleri bulur."""
+        try:
+            tickers = await self.exchange.fetch_tickers()
+            usable = [t for t in tickers.values() if t['symbol'].endswith('USDT')]
+            
+            by_vol = sorted(usable, key=lambda t: t.get('quoteVolume', 0), reverse=True)
+            volume_rank = {t['symbol']: i + 1 for i, t in enumerate(by_vol[:100])}
+            
+            scored_candidates = []
+            current_ranks = {}
+            
+            for symbol, t in tickers.items():
+                if not symbol.endswith('USDT'): continue
+                
+                best_rank = volume_rank.get(symbol, self.NEUTRAL_RANK)
+                current_ranks[symbol] = best_rank
+                prev_rank = self.previous_ranks.get(symbol)
+                velocity = (prev_rank - best_rank) if prev_rank else 0
+                is_new = prev_rank is None and best_rank <= 40
+                
+                # Sadece ivmeli, yeni giren veya zaten çok hacimli olanları seç
+                if velocity >= 5 or is_new or best_rank <= 20:
+                    scored_candidates.append(symbol)
+                    
+            self.previous_ranks = current_ranks
+            return scored_candidates[:15] # En sıcak 15 coini analiz için gönder
+        except Exception:
+            return []
+
+    async def scan_market(self):
+        """Piyasayı tarar, SMC kurallarına göre analiz eder ve işlem sinyali üretir."""
+        opportunities = []
+        hot_symbols = await self._get_hot_candidates()
+        
+        for symbol in hot_symbols:
+            try:
+                # 4H, 1H, 15M, 5M verilerini paralel çek (Hız için)
+                tasks = [
+                    self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50),
+                    self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50),
+                    self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30),
+                    self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=30)
+                ]
+                c_4h, c_1h, c_15m, c_5m = await asyncio.gather(*tasks)
+                
+                # 1. Aşama: 4H Makro Yön
+                swings_4h = find_swing_points(c_4h)
+                macro_trend = determine_trend(swings_4h)
+                if macro_trend == Trend.RANGE: continue # Yatay piyasayı çöpe at
+                
+                # 2. Aşama: 1H Uyum ve BOS (Yapı Kırılımı)
+                swings_1h = find_swing_points(c_1h)
+                trend_1h = determine_trend(swings_1h)
+                if trend_1h != macro_trend: continue # Uyumsuz trend
+                
+                structure_break = detect_structure_break(c_1h, swings_1h, macro_trend)
+                if not structure_break or structure_break.kind != "BOS": continue # Kırılım yoksa girme
+                
+                # 3. Aşama: 15M ve 5M Hacim/Momentum İvmesi
+                vol_ratio = volume_anomaly_ratio(c_5m)
+                roc = momentum_roc(c_5m)
+                
+                trend_str = 'long' if macro_trend == Trend.UP else 'short'
+                momentum_aligned = (roc > 0.1 and trend_str == 'long') or (roc < -0.1 and trend_str == 'short')
+                
+                if vol_ratio >= 1.5 and momentum_aligned:
+                    # SL Hesaplama (Son Swing Low / High)
+                    if trend_str == 'long':
+                        sl_price = min(c[3] for c in c_15m[-5:]) * 0.995 # Son 5 mumun en düşüğü
+                    else:
+                        sl_price = max(c[2] for c in c_15m[-5:]) * 1.005
+                        
+                    reason = f"4H/1H makro yön uyumlu. 1H grafikte BOS (Yapı Kırılımı) onaylandı. 5M'de x{vol_ratio:.1f} hacim anomalisi ve {roc:+.2f}% ivme var!"
+                    
+                    opportunities.append({
+                        "symbol": symbol,
+                        "trend": trend_str,
+                        "sl_price": sl_price,
+                        "reason": reason
+                    })
+                    break # Bulduğumuz ilk kaliteli sinyalde döngüyü kes, işleme git.
+                    
+            except Exception as e:
+                continue
+                
+        return opportunities
+
+    async def check_momentum_reversal(self, symbol: str, trend: str) -> bool:
+        """İçerideyken trendin terse dönüp dönmediğini (CHoCH) kontrol eder."""
+        try:
+            candles = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
+            swings = find_swing_points(candles)
+            prevailing = Trend.UP if trend == 'long' else Trend.DOWN
+            
+            # Trendin tersi yönde bir kırılım (CHoCH) var mı?
+            last_close = candles[-1][4]
+            last_high = next((s for s in reversed(swings) if s.type == SwingType.HIGH), None)
+            last_low = next((s for s in reversed(swings) if s.type == SwingType.LOW), None)
+
+            if prevailing == Trend.UP and last_low and last_close < last_low.price:
+                return True # Long'daydık, aşağı kırdı!
+            if prevailing == Trend.DOWN and last_high and last_close > last_high.price:
+                return True # Short'taydık, yukarı kırdı!
+                
+            return False
+        except:
+            return False
