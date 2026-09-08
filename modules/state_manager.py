@@ -1,51 +1,31 @@
-import json
-import os
-import time
-
-STATE_FILE = "data/state.json"
-
 class StateManager:
     def __init__(self):
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        if not os.path.exists(STATE_FILE):
-            self._create_empty_state()
-        self.state = self.load_state()
+        self.hourly_trades = []
 
-    def _create_empty_state(self):
-        initial_state = {
-            "active_trades": {}, 
-            "reserved_slots": [],
-            "cooldowns": {} # 🛡️ YENİ: Bekleme süreleri listesi
-        }
-        with open(STATE_FILE, "w") as f:
-            json.dump(initial_state, f, indent=4)
+    def record_closed_trade(self, symbol, pnl, reason):
+        """Kapanan işlemi hafızaya alır."""
+        self.hourly_trades.append({
+            'symbol': symbol,
+            'pnl': pnl,
+            'reason': reason
+        })
 
-    def load_state(self):
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-            # Eski state dosyasında cooldowns yoksa çökmemesi için ekleme
-            if "cooldowns" not in data:
-                data["cooldowns"] = {}
-            return data
+    def generate_hourly_report(self):
+        """Saatlik performans özetini hesaplar ve sıfırlar."""
+        if not self.hourly_trades:
+            return "Geçtiğimiz saat içinde kapanan işlem olmadı."
 
-    def save_state(self):
-        with open(STATE_FILE, "w") as f:
-            json.dump(self.state, f, indent=4)
-            
-    def get_used_slots(self):
-        return len(self.state["active_trades"]) + len(self.state["reserved_slots"])
+        total_trades = len(self.hourly_trades)
+        wins = sum(1 for t in self.hourly_trades if t['pnl'] > 0)
+        losses = sum(1 for t in self.hourly_trades if t['pnl'] <= 0)
+        net_pnl = sum(t['pnl'] for t in self.hourly_trades)
 
-    # 🛡️ COOLDOWN (SOĞUMA) KONTROLLERİ
-    def set_cooldown(self, symbol, minutes):
-        self.state["cooldowns"][symbol] = time.time() + (minutes * 60)
-        self.save_state()
-
-    def is_in_cooldown(self, symbol):
-        if symbol in self.state["cooldowns"]:
-            if time.time() < self.state["cooldowns"][symbol]:
-                return True
-            else:
-                del self.state["cooldowns"][symbol] # Süresi dolduysa listeden sil
-                self.save_state()
-                return False
-        return False
+        report = (
+            f"🕒 SAATLİK KAPANIŞ RAPORU 🕒\n"
+            f"Toplam Kapanan İşlem: {total_trades}\n"
+            f"Başarılı (Kâr): {wins} | Başarısız (Zarar): {losses}\n"
+            f"Net PnL Durumu: %{net_pnl:.2f}\n"
+            f"-----------------------------------"
+        )
+        self.hourly_trades = [] # Rapor sonrası sıfırla
+        return report
