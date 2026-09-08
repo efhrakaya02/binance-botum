@@ -26,6 +26,7 @@ class StructureBreak:
     direction: Trend   # Kırılım sonrası işaret ettiği yeni yön
     broken_level: float
     break_close: float
+    is_strong: bool    # Mum gövdesi güçlü mü?
 
 def find_swing_points(candles, lookback: int = 2) -> List[SwingPoint]:
     points = []
@@ -55,38 +56,43 @@ def determine_trend(swings: List[SwingPoint]) -> Trend:
 
 def detect_structure_break(candles, swings: List[SwingPoint], prevailing_trend: Trend) -> Optional[StructureBreak]:
     if not candles or not swings: return None
-    last_close = candles[-1][4] 
+    last_candle = candles[-1]
+    open_p, high_p, low_p, close_p = last_candle[1], last_candle[2], last_candle[3], last_candle[4]
+    
     last_high = next((s for s in reversed(swings) if s.type == SwingType.HIGH), None)
     last_low = next((s for s in reversed(swings) if s.type == SwingType.LOW), None)
 
-    # BOS (Yapı Kırılımı - Trend Devamı)
-    if prevailing_trend == Trend.UP and last_high and last_close > last_high.price:
-        return StructureBreak("BOS", Trend.UP, last_high.price, last_close)
-    if prevailing_trend == Trend.DOWN and last_low and last_close < last_low.price:
-        return StructureBreak("BOS", Trend.DOWN, last_low.price, last_close)
+    # Mum gövdesi güçlü mü analizi (Kapanış mumun zirvesine/dibine yakın mı?)
+    body = abs(close_p - open_p)
+    total_range = high_p - low_p
+    total_range = max(total_range, close_p * 0.0001)
+    is_strong_body = (body / total_range) > 0.60 # Mumun %60'ı gövde ise güçlüdür
+
+    # BOS (Trend Devamı)
+    if prevailing_trend == Trend.UP and last_high and close_p > last_high.price:
+        return StructureBreak("BOS", Trend.UP, last_high.price, close_p, is_strong_body)
+    if prevailing_trend == Trend.DOWN and last_low and close_p < last_low.price:
+        return StructureBreak("BOS", Trend.DOWN, last_low.price, close_p, is_strong_body)
         
-    # CHoCH (Karakter Değişimi - Trend Dönüşü / Tükeniş)
-    if prevailing_trend == Trend.UP and last_low and last_close < last_low.price:
-        return StructureBreak("CHoCH", Trend.DOWN, last_low.price, last_close)
-    if prevailing_trend == Trend.DOWN and last_high and last_close > last_high.price:
-        return StructureBreak("CHoCH", Trend.UP, last_high.price, last_close)
+    # CHoCH (Trend Dönüşü - Erken Sinyal)
+    if prevailing_trend == Trend.UP and last_low and close_p < last_low.price:
+        return StructureBreak("CHoCH", Trend.DOWN, last_low.price, close_p, is_strong_body)
+    if prevailing_trend == Trend.DOWN and last_high and close_p > last_high.price:
+        return StructureBreak("CHoCH", Trend.UP, last_high.price, close_p, is_strong_body)
         
     return None
 
 def check_exhaustion(candles) -> Optional[str]:
-    """Fitil reddi (Wick Rejection) analizi yapar. Fiyatın tepeden/dipten dönüp dönmediğini ölçer."""
-    for c in candles[-3:]: # Son 3 mumu incele
+    for c in candles[-3:]:
         open_p, high_p, low_p, close_p = c[1], c[2], c[3], c[4]
         body = abs(close_p - open_p)
-        body = max(body, close_p * 0.0001) # Sıfıra bölünme hatasını engelle
+        body = max(body, close_p * 0.0001) 
         
         upper_wick = high_p - max(open_p, close_p)
         lower_wick = min(open_p, close_p) - low_p
         
-        # Üst fitil, gövdenin 2.5 katından büyükse (Tepeden balyoz yemiş - Kayan Yıldız)
         if upper_wick > body * 2.5 and upper_wick > lower_wick * 2:
             return 'TOP_REJECTION'
-        # Alt fitil, gövdenin 2.5 katından büyükse (Dipten destek bulmuş - Çekiç)
         if lower_wick > body * 2.5 and lower_wick > upper_wick * 2:
             return 'BOTTOM_REJECTION'
     return None
@@ -143,7 +149,6 @@ class MarketScanner:
             return []
 
     async def scan_market(self):
-        """Makro yönü bulur, Mikro ölçekte Tüketilmişlik (Exhaustion) ve Dönüş (Reversal) arar."""
         opportunities = []
         hot_symbols = await self._get_hot_candidates()
         
@@ -151,59 +156,70 @@ class MarketScanner:
             try:
                 tasks = [
                     self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50),
-                    self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50),
-                    self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=30)
+                    self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50),
+                    self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
                 ]
-                c_4h, c_15m, c_5m = await asyncio.gather(*tasks)
+                c_4h, c_1h, c_15m = await asyncio.gather(*tasks)
                 
-                # --- 1. MAKRO FAZ (Büyük Resim) ---
+                # Sadece referans için makro duruma bak (Ama kararı esir almasına izin verme)
                 swings_4h = find_swing_points(c_4h)
                 macro_trend = determine_trend(swings_4h)
-                if macro_trend == Trend.RANGE: continue 
                 
-                # --- 2. MİKRO FAZ (Hacim ve Momentum) ---
-                vol_ratio = volume_anomaly_ratio(c_5m)
-                roc = momentum_roc(c_5m)
-                if vol_ratio < 1.30: continue # Yeterli hacim patlaması yoksa pas geç
+                # Kararın kalbi: 1H ve 15M'deki Hacim ve Yapı Kırılımları
+                vol_ratio = volume_anomaly_ratio(c_15m)
+                roc = momentum_roc(c_15m)
+                if vol_ratio < 1.30: continue 
                 
-                # --- 3. MİKRO FAZ (Zamanlama ve Karar Mekanizması) ---
                 swings_15m = find_swing_points(c_15m)
-                struct_break = detect_structure_break(c_15m, swings_15m, macro_trend)
+                
+                # 15M içindeki yapıyı genel (1H) trend üzerinden okuyalım
+                swings_1h = find_swing_points(c_1h)
+                trend_1h = determine_trend(swings_1h)
+                
+                # Kırılımı 15M'de arıyoruz (Mikro ölçek)
+                struct_break = detect_structure_break(c_15m, swings_15m, trend_1h)
                 exhaustion = check_exhaustion(c_15m)
                 
                 target_trend = None
                 reason = ""
                 sl_price = 0.0
 
-                if macro_trend == Trend.UP:
-                    # TERSİNE İŞLEM SENARYOSU (Senin yakaladığın GUSDT olayı)
-                    if exhaustion == 'TOP_REJECTION' or (struct_break and struct_break.kind == "CHoCH" and struct_break.direction == Trend.DOWN):
-                        if roc < -0.1: # Momentum da aşağı dönmüşse
-                            target_trend = 'short'
-                            sl_price = max(c[2] for c in c_15m[-3:]) * 1.005 # Yakın stop (Tepenin hemen üstü)
-                            reason = f"Makro trend UP ama 15M grafikte {'Tepeden Sert Red (Fitil)' if exhaustion else 'CHoCH (Aşağı Kırılım)'} var. Tükeniş tespit edildi. Balinalar mal boşaltıyor, SHORT giriyoruz!"
+                # 1. SENARYO: ERKEN DÖNÜŞ YAKALAMA (Mikro Makroyu Büküyor)
+                if struct_break and struct_break.kind == "CHoCH" and struct_break.is_strong:
+                    if struct_break.direction == Trend.UP and roc > 0.1:
+                        target_trend = 'long'
+                        sl_price = min(c[3] for c in c_15m[-3:]) * 0.995
+                        reason = f"Makro yapı ({macro_trend.name}) bağımsız olarak, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Yukarı Dönüş (CHoCH) yakalandı. Trend dönüyor, erken LONG!"
                     
-                    # NORMAL TREND DEVAMI (Sağlıklı kalkış)
-                    elif struct_break and struct_break.kind == "BOS" and roc > 0.1:
+                    elif struct_break.direction == Trend.DOWN and roc < -0.1:
+                        target_trend = 'short'
+                        sl_price = max(c[2] for c in c_15m[-3:]) * 1.005
+                        reason = f"Makro yapı ({macro_trend.name}) bağımsız olarak, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Aşağı Dönüş (CHoCH) yakalandı. Trend dönüyor, erken SHORT!"
+
+                # 2. SENARYO: TÜKENİŞ / TEPEDEN-DİPTEN RED YAKALAMA
+                elif exhaustion:
+                    if exhaustion == 'TOP_REJECTION' and roc < -0.1:
+                        target_trend = 'short'
+                        sl_price = max(c[2] for c in c_15m[-3:]) * 1.005
+                        reason = f"15M grafikte devasa üst fitil (Tepeden Red) oluştu. Alıcılar tükendi, balinalar boşaltıyor. SHORT giriyoruz!"
+                    
+                    elif exhaustion == 'BOTTOM_REJECTION' and roc > 0.1:
+                        target_trend = 'long'
+                        sl_price = min(c[3] for c in c_15m[-3:]) * 0.995
+                        reason = f"15M grafikte devasa alt fitil (Dipten Red) oluştu. Satıcılar tükendi, balinalar topluyor. LONG giriyoruz!"
+
+                # 3. SENARYO: TREND DEVAMI (BOS)
+                elif struct_break and struct_break.kind == "BOS" and struct_break.is_strong:
+                    if struct_break.direction == Trend.UP and roc > 0.1:
                         target_trend = 'long'
                         sl_price = min(c[3] for c in c_15m[-5:]) * 0.995
-                        reason = f"Makro trend UP. 15M grafikte sağlıklı BOS (Yapı Kırılımı) onaylandı. x{vol_ratio:.2f} Hacim ile LONG giriyoruz."
-
-                elif macro_trend == Trend.DOWN:
-                    # TERSİNE İŞLEM SENARYOSU
-                    if exhaustion == 'BOTTOM_REJECTION' or (struct_break and struct_break.kind == "CHoCH" and struct_break.direction == Trend.UP):
-                        if roc > 0.1:
-                            target_trend = 'long'
-                            sl_price = min(c[3] for c in c_15m[-3:]) * 0.995
-                            reason = f"Makro trend DOWN ama 15M grafikte {'Dipten Güçlü Alım (Fitil)' if exhaustion else 'CHoCH (Yukarı Kırılım)'} var. Satıcılar tükendi, LONG giriyoruz!"
-                            
-                    # NORMAL TREND DEVAMI
-                    elif struct_break and struct_break.kind == "BOS" and roc < -0.1:
+                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS) ile trend devam ediyor. Hacim: x{vol_ratio:.2f}. LONG giriyoruz."
+                    
+                    elif struct_break.direction == Trend.DOWN and roc < -0.1:
                         target_trend = 'short'
                         sl_price = max(c[2] for c in c_15m[-5:]) * 1.005
-                        reason = f"Makro trend DOWN. 15M grafikte sağlıklı BOS (Yapı Kırılımı) onaylandı. x{vol_ratio:.2f} Hacim ile SHORT giriyoruz."
+                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS) ile trend devam ediyor. Hacim: x{vol_ratio:.2f}. SHORT giriyoruz."
 
-                # Eğer bir karar verildiyse sinyali gönder
                 if target_trend:
                     opportunities.append({
                         "symbol": symbol,
@@ -219,7 +235,6 @@ class MarketScanner:
         return opportunities
 
     async def check_momentum_reversal(self, symbol: str, trend: str) -> bool:
-        """İçerideyken trendin terse dönüp dönmediğini (CHoCH) kontrol eder."""
         try:
             candles = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
             swings = find_swing_points(candles)
