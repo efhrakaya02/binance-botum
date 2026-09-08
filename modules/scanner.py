@@ -123,29 +123,45 @@ class MarketScanner:
         await self.exchange.close()
 
     async def _get_hot_candidates(self) -> List[str]:
+        """Hacim, Gainers ve Losers listelerinden Rank Velocity mantığı ile en sıcak coinleri bulur."""
         try:
             tickers = await self.exchange.fetch_tickers()
             usable = [t for t in tickers.values() if t['symbol'].endswith('USDT')]
-            by_vol = sorted(usable, key=lambda t: t.get('quoteVolume', 0), reverse=True)
-            volume_rank = {t['symbol']: i + 1 for i, t in enumerate(by_vol[:100])}
+            
+            # 1. Hacim, 2. Kazandıranlar (Gainers), 3. Kaybettirenler (Losers)
+            by_vol = sorted(usable, key=lambda t: t.get('quoteVolume', 0) or 0, reverse=True)
+            by_gain = sorted(usable, key=lambda t: t.get('percentage', 0) or 0, reverse=True)
+            by_loss = sorted(usable, key=lambda t: t.get('percentage', 0) or 0)
+            
+            volume_rank = {t['symbol']: i + 1 for i, t in enumerate(by_vol[:50])}
+            gainer_rank = {t['symbol']: i + 1 for i, t in enumerate(by_gain[:50])}
+            loser_rank = {t['symbol']: i + 1 for i, t in enumerate(by_loss[:50])}
+            
+            candidate_symbols = set(volume_rank.keys()) | set(gainer_rank.keys()) | set(loser_rank.keys())
             
             scored_candidates = []
             current_ranks = {}
-            for symbol, t in tickers.items():
-                if not symbol.endswith('USDT'): continue
+            
+            for symbol in candidate_symbols:
+                rv = volume_rank.get(symbol, self.NEUTRAL_RANK)
+                rg = gainer_rank.get(symbol, self.NEUTRAL_RANK)
+                rl = loser_rank.get(symbol, self.NEUTRAL_RANK)
+                best_rank = min(rv, rg, rl)
                 
-                best_rank = volume_rank.get(symbol, self.NEUTRAL_RANK)
                 current_ranks[symbol] = best_rank
                 prev_rank = self.previous_ranks.get(symbol)
                 velocity = (prev_rank - best_rank) if prev_rank else 0
                 is_new = prev_rank is None and best_rank <= 40
                 
                 if velocity >= 5 or is_new or best_rank <= 20:
-                    scored_candidates.append(symbol)
+                    score = (self.NEUTRAL_RANK - best_rank) + (velocity * 2) + (10 if is_new else 0)
+                    scored_candidates.append((symbol, score))
                     
             self.previous_ranks = current_ranks
-            return scored_candidates[:25] 
-        except Exception:
+            scored_candidates.sort(key=lambda x: x[1], reverse=True)
+            return [x[0] for x in scored_candidates[:25]]
+            
+        except Exception as e:
             return []
 
     async def scan_market(self):
@@ -161,22 +177,17 @@ class MarketScanner:
                 ]
                 c_4h, c_1h, c_15m = await asyncio.gather(*tasks)
                 
-                # Sadece referans için makro duruma bak (Ama kararı esir almasına izin verme)
                 swings_4h = find_swing_points(c_4h)
                 macro_trend = determine_trend(swings_4h)
                 
-                # Kararın kalbi: 1H ve 15M'deki Hacim ve Yapı Kırılımları
                 vol_ratio = volume_anomaly_ratio(c_15m)
                 roc = momentum_roc(c_15m)
                 if vol_ratio < 1.30: continue 
                 
                 swings_15m = find_swing_points(c_15m)
-                
-                # 15M içindeki yapıyı genel (1H) trend üzerinden okuyalım
                 swings_1h = find_swing_points(c_1h)
                 trend_1h = determine_trend(swings_1h)
                 
-                # Kırılımı 15M'de arıyoruz (Mikro ölçek)
                 struct_break = detect_structure_break(c_15m, swings_15m, trend_1h)
                 exhaustion = check_exhaustion(c_15m)
                 
@@ -189,12 +200,12 @@ class MarketScanner:
                     if struct_break.direction == Trend.UP and roc > 0.1:
                         target_trend = 'long'
                         sl_price = min(c[3] for c in c_15m[-3:]) * 0.995
-                        reason = f"Makro yapı ({macro_trend.name}) bağımsız olarak, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Yukarı Dönüş (CHoCH) yakalandı. Trend dönüyor, erken LONG!"
+                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Yukarı Dönüş (CHoCH) yakalandı. Erken LONG!"
                     
                     elif struct_break.direction == Trend.DOWN and roc < -0.1:
                         target_trend = 'short'
                         sl_price = max(c[2] for c in c_15m[-3:]) * 1.005
-                        reason = f"Makro yapı ({macro_trend.name}) bağımsız olarak, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Aşağı Dönüş (CHoCH) yakalandı. Trend dönüyor, erken SHORT!"
+                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Aşağı Dönüş (CHoCH) yakalandı. Erken SHORT!"
 
                 # 2. SENARYO: TÜKENİŞ / TEPEDEN-DİPTEN RED YAKALAMA
                 elif exhaustion:
