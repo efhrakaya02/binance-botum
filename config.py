@@ -7,12 +7,12 @@ class Config:
     MAX_OPEN_POSITIONS = 3
     MARGIN_PER_TRADE_USDT = 10
     LEVERAGE = 5
-
     PAPER_TRADING = True
 
-    BREAKEVEN_PCT = 1.0  
-    TRAILING_ACTIVATION_PCT = 1.5  
+    # Kâr/Zarar Sınırları
+    HARD_TP_PCT = 3.0      # %3 Hedef
+    HARD_SL_PCT = 1.5      # %1.5 Kırmızı Çizgi
 
-    # 🛡️ YENİ EKLENEN FİLTRELER
-    COOLDOWN_MINUTES = 15 
-    VOLUME_MULTIPLIER = 1.5
+    # Zamanlayıcılar (Saniye)
+    SCAN_INTERVAL = 300    # 5 Dakikada bir tarama
+    MONITOR_INTERVAL = 1   # Saniyede bir fiyat ve stop kontrolü
