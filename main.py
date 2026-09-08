@@ -5,6 +5,7 @@ from modules.scanner import MarketScanner
 from modules.orderbook import OrderbookAnalyzer
 from modules.risk_manager import RiskManager
 from modules.execution import ExecutionEngine
+from modules.state_manager import StateManager
 
 class TradingBot:
     def __init__(self):
@@ -12,144 +13,168 @@ class TradingBot:
         self.scanner = MarketScanner(self.config)
         self.risk_manager = RiskManager(self.config)
         self.execution = ExecutionEngine(self.config)
-        self.active_trades = {}  # Aktif işlemleri takip edeceğimiz sözlük
+        self.state_manager = StateManager()
+        self.active_trades = {}
         self.max_active_trades = getattr(Config, 'MAX_OPEN_POSITIONS', 3)
 
-    async def manage_active_trades(self):
-        """Aktif işlemleri yönetir: SL/TP, Dinamik Kâr Kilidi, Zaman Aşımı, Geri Dönüşler ve Dakikalık Durum Raporu verir."""
-        current_time = time.time()
-        
-        for symbol, trade in list(self.active_trades.items()):
-            try:
-                current_price = await self.execution.get_current_price(symbol)
-                if not current_price:
-                    continue
+    async def fast_price_monitor(self):
+        """1 SANİYELİK DÖNGÜ: Anlık fiyat takibi ve Stop-Loss/Take-Profit tetikleyicisi."""
+        while True:
+            for symbol, trade in list(self.active_trades.items()):
+                try:
+                    current_price = await self.execution.get_current_price(symbol)
+                    if not current_price: continue
+                        
+                    is_long = trade['trend'] == 'long'
                     
-                is_long = trade['trend'] == 'long'
-                
-                # Zirve/Dip fiyatı güncelle
-                if is_long and current_price > trade['max_reached_price']:
-                    trade['max_reached_price'] = current_price
-                elif not is_long and current_price < trade['max_reached_price']:
-                    trade['max_reached_price'] = current_price
+                    if is_long and current_price > trade['max_reached_price']:
+                        trade['max_reached_price'] = current_price
+                    elif not is_long and current_price < trade['max_reached_price']:
+                        trade['max_reached_price'] = current_price
 
-                # Anlık PnL ve süre hesaplama
-                profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - current_price) / trade['entry_price']) * 100
-                trade_duration_mins = (current_time - trade['start_time']) / 60
+                    current_sl = self.risk_manager.calculate_stop_loss(
+                        entry_price=trade['entry_price'], max_reached_price=trade['max_reached_price'],
+                        is_long=is_long, initial_sl=trade['initial_sl']
+                    )
 
-                # 📊 DAKİKALIK DURUM RAPORU (Her 60 saniyede bir kez yazar)
-                if current_time - trade.get('last_log_time', 0) >= 60:
-                    print(f"📊 [TAKİP RAPORU] {symbol} | Yön: {trade['trend'].upper()} | Süre: {trade_duration_mins:.1f} dk | Giriş: {trade['entry_price']} | Güncel: {current_price} | PnL: %{profit_pct:.2f}")
-                    trade['last_log_time'] = current_time
+                    profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - current_price) / trade['entry_price']) * 100
+                    trade['current_sl'] = current_sl # Rapor için kaydet
 
-                # 1. 60 DAKİKA ZAMAN AŞIMI (Time Stop) Kontrolü
-                if trade_duration_mins >= 60:
-                    if profit_pct < 1.0: # 60 dakika geçmiş ve %1 kâr bile yapamamışsa kes!
-                        print(f"[{symbol}] Zaman Aşımı (60dk). İşlem hacimsiz, kapatılıyor. PnL: %{profit_pct:.2f}")
+                    closed = False
+                    if is_long:
+                        if profit_pct >= self.config.HARD_TP_PCT:
+                            print(f"\n✅ [KÂR ALINDI] Patron, {symbol} hedefimize ulaştı! %{profit_pct:.2f} kârı kasaya koydum, masadan kalkıyoruz.")
+                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                            self.state_manager.record_closed_trade(symbol, profit_pct, "Take Profit")
+                            closed = True
+                        elif current_price <= current_sl:
+                            print(f"\n🚨 [STOP-LOSS] Bana kızma patron ama {symbol} işleminde piyasa aniden tersine döndü. Kırmızı çizgimizi delmesine izin vermeden zararı %{profit_pct:.2f} seviyesinde acımasızca kestim. Sermayeyi koruduk.")
+                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                            self.state_manager.record_closed_trade(symbol, profit_pct, "Stop Loss")
+                            closed = True
+                    else: # Short için
+                        if profit_pct >= self.config.HARD_TP_PCT:
+                            print(f"\n✅ [KÂR ALINDI] Patron, {symbol} hedefimize ulaştı! %{profit_pct:.2f} kârı kasaya koydum.")
+                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                            self.state_manager.record_closed_trade(symbol, profit_pct, "Take Profit")
+                            closed = True
+                        elif current_price >= current_sl:
+                            print(f"\n🚨 [STOP-LOSS] Patron, {symbol} beklediğimiz gibi gitmedi. Anaparayı korumak için zararı %{profit_pct:.2f} seviyesinde kestim.")
+                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                            self.state_manager.record_closed_trade(symbol, profit_pct, "Stop Loss")
+                            closed = True
+
+                    if closed:
+                        del self.active_trades[symbol]
+
+                except Exception as e:
+                    pass
+            await asyncio.sleep(self.config.MONITOR_INTERVAL) 
+
+    async def slow_trade_manager(self):
+        """1 DAKİKALIK DÖNGÜ: Detaylı takip raporu ve API gerektiren 15M/Zaman çıkışları."""
+        while True:
+            current_time = time.time()
+            for symbol, trade in list(self.active_trades.items()):
+                if symbol not in self.active_trades: continue
+                try:
+                    current_price = await self.execution.get_current_price(symbol)
+                    if not current_price: continue
+                    
+                    is_long = trade['trend'] == 'long'
+                    profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - current_price) / trade['entry_price']) * 100
+                    max_profit_pct = ((trade['max_reached_price'] - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - trade['max_reached_price']) / trade['entry_price']) * 100
+                    trade_duration_mins = (current_time - trade['start_time']) / 60
+                    target_tp = trade['entry_price'] * 1.03 if is_long else trade['entry_price'] * 0.97
+                    current_sl = trade.get('current_sl', trade['initial_sl'])
+
+                    # DAKİKALIK TAKİP RAPORU
+                    if current_time - trade.get('last_log_time', 0) >= 60:
+                        print(f"📊 [TAKİP] {symbol} ({trade['trend'].upper()}) | Süre: {trade_duration_mins:.1f}dk | Giriş: {trade['entry_price']:.4f} | Anlık: {current_price:.4f} | Hedef: {target_tp:.4f} | SL: {current_sl:.4f}")
+                        print(f"   => Anlık PnL: %{profit_pct:.2f} (Görülen Zirve PnL: %{max_profit_pct:.2f})")
+                        trade['last_log_time'] = current_time
+
+                    # 60 Dk Zaman Aşımı
+                    if trade_duration_mins >= 60 and profit_pct < 1.0:
+                        print(f"\n⏳ [ZAMAN AŞIMI] Patron, {symbol} tam 60 dakikadır yataya bağladı. Paramızı içeride esir edemem, %{profit_pct:.2f} ile masadan kalktım.")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                        self.state_manager.record_closed_trade(symbol, profit_pct, "Zaman Aşımı")
                         del self.active_trades[symbol]
                         continue
 
-                # 2. 15M ANİ GERİ DÖNÜŞ (Reversal) Kontrolü
-                is_reversing = await self.scanner.check_momentum_reversal(symbol, trade['trend'])
-                if is_reversing:
-                    print(f"[{symbol}] 15M Grafikte Sert Ters Mum (Çekiç/Mezar Taşı) tespit edildi. Güvenlik çıkışı yapılıyor!")
-                    await self.execution.close_position(symbol, trade['side'], trade['amount'])
-                    del self.active_trades[symbol]
-                    continue
-
-                # 3. DİNAMİK STOP LOSS ve KÂR KİLİDİ KONTROLÜ
-                current_sl = self.risk_manager.calculate_stop_loss(
-                    entry_price=trade['entry_price'],
-                    max_reached_price=trade['max_reached_price'],
-                    is_long=is_long,
-                    initial_sl=trade['initial_sl']
-                )
-
-                # TP (Take Profit - Hard %3) veya SL/Kilit Tetiklenmesi
-                if is_long:
-                    if current_price >= trade['entry_price'] * 1.03: # %3 Hedef
-                        print(f"[{symbol}] HEDEF VURULDU (+%3.00). Kâr alındı! PnL: %{profit_pct:.2f}")
+                    # 15M Ters Mum
+                    is_reversing = await self.scanner.check_momentum_reversal(symbol, trade['trend'])
+                    if is_reversing:
+                        print(f"\n⚠️ [TEHLİKE SEZİLDİ] {symbol} 15M grafiğinde ters yönlü sert bir mum sezdim. Güvenlik protokolünü devreye sokup işlemi %{profit_pct:.2f} PnL ile kapattım.")
                         await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                        self.state_manager.record_closed_trade(symbol, profit_pct, "15M Ters Mum")
                         del self.active_trades[symbol]
-                    elif current_price <= current_sl:
-                        print(f"[{symbol}] Stop-Loss / Kâr Kilidi tetiklendi. Çıkış yapıldı. PnL: %{profit_pct:.2f}")
-                        await self.execution.close_position(symbol, trade['side'], trade['amount'])
-                        del self.active_trades[symbol]
-                else: # Short
-                    if current_price <= trade['entry_price'] * 0.97: # %3 Hedef
-                        print(f"[{symbol}] HEDEF VURULDU (+%3.00). Kâr alındı! PnL: %{profit_pct:.2f}")
-                        await self.execution.close_position(symbol, trade['side'], trade['amount'])
-                        del self.active_trades[symbol]
-                    elif current_price >= current_sl:
-                        print(f"[{symbol}] Stop-Loss / Kâr Kilidi tetiklendi. Çıkış yapıldı. PnL: %{profit_pct:.2f}")
-                        await self.execution.close_position(symbol, trade['side'], trade['amount'])
-                        del self.active_trades[symbol]
+                        
+                except Exception as e:
+                    pass
+            await asyncio.sleep(60) 
 
-            except Exception as e:
-                print(f"Aktif işlem yönetilirken hata ({symbol}): {e}")
-
-    async def run(self):
-        print("🚀 Kurumsal Price Action Botu Başlatıldı...")
-        
+    async def market_scanner(self):
+        """5 DAKİKALIK DÖNGÜ: Piyasayı tarar ve fırsat kollar."""
         while True:
             try:
-                # 1. Aşama: Mevcut işlemleri kontrol et
-                await self.manage_active_trades()
-
-                # 2. Aşama: Kapasite varsa yeni fırsat tara
                 if len(self.active_trades) < self.max_active_trades:
-                    print(f"🔍 Yeni fırsatlar taranıyor... (Aktif: {len(self.active_trades)}/{self.max_active_trades})")
-                    
-                    # Scanner (4H -> 1H -> 15M -> 5M -> Hacim Kırılımı)
+                    print(f"🔍 Yeni fırsatlar taranıyor... (Kapasite: {len(self.active_trades)}/{self.max_active_trades})")
                     opportunities = await self.scanner.scan_market()
                     
                     for opp in opportunities:
                         symbol = opp['symbol']
                         trend = opp['trend']
                         initial_sl = opp['sl_price']
+                        pa_reason = opp.get('reason', 'Güçlü Price Action formasyonu.')
                         is_long = trend == 'long'
                         
-                        if symbol in self.active_trades:
-                            continue # Zaten içerideyiz
+                        if symbol in self.active_trades: continue
                             
-                        # 3. Aşama: Emir Defteri ve Taker Hacim (Spoofing) Kontrolü
                         current_price = await self.execution.get_current_price(symbol)
-                        if not current_price:
-                            continue
+                        if not current_price: continue
                             
                         ob_analyzer = OrderbookAnalyzer(symbol)
-                        is_path_clear = await ob_analyzer.check_for_walls_and_sweeps(current_price, is_long)
+                        is_path_clear, ob_reason = await ob_analyzer.check_for_walls_and_sweeps(current_price, is_long)
                         
                         if is_path_clear:
-                            print(f"✅ [{symbol}] Tüm PA filtreleri ve Tahta analizi geçildi. {trend.upper()} giriliyor!")
+                            print(f"\n🚀 [İŞLEM AÇILIYOR] Patron, {symbol} radarıma takıldı!")
+                            print(f"   => Seçim Nedenim: {pa_reason}")
+                            print(f"   => Tahta Analizim: {ob_reason}")
+                            print(f"   => {trend.upper()} işlemine giriyorum!")
                             
                             side = 'buy' if is_long else 'sell'
                             execution_result = await self.execution.open_position(symbol, side, current_price)
                             
                             if execution_result and execution_result.get("status") == "success":
-                                # İşlemi takibe al
                                 self.active_trades[symbol] = {
-                                    'trend': trend,
-                                    'side': side,
+                                    'trend': trend, 'side': side,
                                     'amount': execution_result['amount'],
                                     'entry_price': execution_result['entry_price'],
                                     'max_reached_price': execution_result['entry_price'],
-                                    'initial_sl': initial_sl,
-                                    'start_time': time.time(),
-                                    'last_log_time': 0
+                                    'initial_sl': initial_sl, 'current_sl': initial_sl,
+                                    'start_time': time.time(), 'last_log_time': time.time()
                                 }
-                                
-                                if len(self.active_trades) >= self.max_active_trades:
-                                    break # Kapasite doldu, taramayı durdur
-                        else:
-                            print(f"⚠️ [{symbol}] Kurumsal onaylardan geçti fakat Tahtada manipülasyon (Spoofing) veya Balina Duvarı tespit edildi. Pas geçiliyor.")
-
-                await asyncio.sleep(10) # Döngüyü çok hızlı çalıştırıp sistemi yormamak için
-                
+                                if len(self.active_trades) >= self.max_active_trades: break
             except Exception as e:
-                print(f"Ana döngüde hata: {e}")
-                await asyncio.sleep(10)
+                pass
+            await asyncio.sleep(self.config.SCAN_INTERVAL) # 5 DAKİKA BEKLE
+
+    async def hourly_reporter(self):
+        """60 DAKİKALIK DÖNGÜ: Saatlik kapanan işlemleri raporlar."""
+        while True:
+            await asyncio.sleep(3600) # 1 saat bekle
+            report = self.state_manager.generate_hourly_report()
+            print(f"\n{report}")
+
+    async def run(self):
+        print("🤖 Kurumsal Price Action Asistanın Uyandı ve Taramaya Başlıyor...")
+        await asyncio.gather(
+            self.fast_price_monitor(),
+            self.slow_trade_manager(),
+            self.market_scanner(),
+            self.hourly_reporter()
+        )
 
     async def shutdown(self):
         await self.scanner.close()
