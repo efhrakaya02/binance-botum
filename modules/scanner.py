@@ -116,7 +116,7 @@ class MarketScanner:
                     scored_candidates.append(symbol)
                     
             self.previous_ranks = current_ranks
-            return scored_candidates[:15] # En sıcak 15 coini analiz için gönder
+            return scored_candidates[:25] # GÜNCELLEME: En sıcak 25 coini analiz için gönder
         except Exception:
             return []
 
@@ -156,14 +156,15 @@ class MarketScanner:
                 trend_str = 'long' if macro_trend == Trend.UP else 'short'
                 momentum_aligned = (roc > 0.1 and trend_str == 'long') or (roc < -0.1 and trend_str == 'short')
                 
-                if vol_ratio >= 1.5 and momentum_aligned:
+                # GÜNCELLEME: Hacim anomalisini 1.30'a çektik
+                if vol_ratio >= 1.30 and momentum_aligned:
                     # SL Hesaplama (Son Swing Low / High)
                     if trend_str == 'long':
                         sl_price = min(c[3] for c in c_15m[-5:]) * 0.995 # Son 5 mumun en düşüğü
                     else:
                         sl_price = max(c[2] for c in c_15m[-5:]) * 1.005
                         
-                    reason = f"4H/1H makro yön uyumlu. 1H grafikte BOS (Yapı Kırılımı) onaylandı. 5M'de x{vol_ratio:.1f} hacim anomalisi ve {roc:+.2f}% ivme var!"
+                    reason = f"4H/1H makro yön uyumlu. 1H grafikte BOS (Yapı Kırılımı) onaylandı. 5M'de x{vol_ratio:.2f} hacim anomalisi ve {roc:+.2f}% ivme var!"
                     
                     opportunities.append({
                         "symbol": symbol,
