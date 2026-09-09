@@ -39,11 +39,25 @@ class TradingBot:
                 continue
 
             # 2. STANDART FİYAT VE HEDEF (SL/TP) KONTROLÜ
+            now = datetime.datetime.now(datetime.UTC)
             for symbol in list(self.active_positions.keys()):
                 pos = self.active_positions[symbol]
                 current_price = await self.execution.get_current_price(symbol)
                 
                 if current_price:
+                    # --- EKRANA ANLIK TAKİP MESAJI BASMA BÖLÜMÜ (3 Dakikada Bir) ---
+                    last_print = pos.get('last_print_time', now)
+                    if (now - last_print).total_seconds() >= 180 or pos.get('first_print', True):
+                        pnl_pct = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
+                        if pos['side'] == 'sell':
+                            pnl_pct = -pnl_pct # Short işlemse PnL'i tersine çevir
+                            
+                        print(f"👀 [TAKİP] {symbol} | Yön: {pos['side'].upper()} | Anlık: {current_price:.5f} | PnL: %{pnl_pct:.2f} | SL: {pos['sl_price']:.5f} | TP: {pos['tp_price']:.5f}")
+                        
+                        pos['last_print_time'] = now
+                        pos['first_print'] = False
+                    # ----------------------------------------------
+
                     exit_check = self.risk_manager.check_exit_conditions(
                         current_price=current_price,
                         entry_price=pos['entry_price'],
@@ -85,9 +99,11 @@ class TradingBot:
                                 'entry_price': order['entry_price'],
                                 'amount': order['amount'],
                                 'sl_price': opp['sl_price'],
-                                'tp_price': opp.get('tp_price', 0) # Scanner'dan gelen TP noktası
+                                'tp_price': opp.get('tp_price', 0),
+                                'last_print_time': datetime.datetime.now(datetime.UTC),
+                                'first_print': True # İşleme girince ilk mesajı hemen basması için
                             }
-                            print(f"✅ {sym} İşleme Alındı. SL: {opp['sl_price']:.4f} | TP: {opp.get('tp_price', 0):.4f}\n")
+                            print(f"✅ {sym} İşleme Alındı. Giriş: {order['entry_price']:.5f} | SL: {opp['sl_price']:.5f} | TP: {opp.get('tp_price', 0):.5f}\n")
                             
             await asyncio.sleep(self.config.SCAN_INTERVAL)
 
