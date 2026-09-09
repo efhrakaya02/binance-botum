@@ -119,6 +119,29 @@ def calculate_atr(candles, period: int = 14) -> float:
         tr_list.append(tr)
     return sum(tr_list[-period:]) / period
 
+# 🚀 YENİ: Aşırı Uzama (Overextension) / Düzeltme Radarı
+def check_overextension(candles, lookback: int, threshold_pct: float) -> str:
+    """Belirli bir mum aralığındaki fiyat uzamasını (şişkinliğini) ölçer."""
+    if len(candles) < lookback: 
+        return 'NORMAL'
+        
+    window = candles[-lookback:]
+    min_price = min(c[3] for c in window)
+    max_price = max(c[2] for c in window)
+    
+    first_open = window[0][1]
+    last_close = window[-1][4]
+    
+    move_pct = ((max_price - min_price) / min_price) * 100
+    
+    if move_pct >= threshold_pct:
+        if last_close > first_open:
+            return 'OVERBOUGHT' # Aşırı Alım - Fiyat Şişti (Düzeltme Beklenir)
+        else:
+            return 'OVERSOLD'   # Aşırı Satım - Fiyat Çöktü (Tepki Beklenir)
+            
+    return 'NORMAL'
+
 # --- ANA TARAYICI SINIFI ---
 class MarketScanner:
     def __init__(self, config):
@@ -194,7 +217,7 @@ class MarketScanner:
                 vol_ratio = volume_anomaly_ratio(c_15m_closed)
                 roc_15m = momentum_roc(c_15m_closed)
                 
-                # 🚀 CLIMAX (TAVAN) KORUMASI: Hacim x3'ten büyükse bu bir balina tuzağıdır, kaç!
+                # CLIMAX (TAVAN) KORUMASI
                 if vol_ratio < 1.30 or vol_ratio > 3.0: 
                     continue 
                 
@@ -208,7 +231,7 @@ class MarketScanner:
                 target_trend = None
                 reason = ""
 
-                # 15M Karar Mekanizması
+                # 1. AŞAMA: 15M Karar Mekanizması
                 if struct_break and struct_break.kind == "CHoCH" and struct_break.is_strong:
                     if struct_break.direction == Trend.UP and roc_15m > 0.1:
                         target_trend = 'long'
@@ -233,7 +256,23 @@ class MarketScanner:
                         target_trend = 'short'
                         reason = f"Kapanmış 15M mumda Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}."
 
-                # 2. AŞAMA: MİKRO TEYİT (Geçmiş Yapı ve İlk 1 Dakika Açılış Kontrolü)
+                # 2. AŞAMA: DÜZELTME AVI (Overextension Veto ve Ters Yön Çevirme)
+                if target_trend:
+                    overext_15m = check_overextension(c_15m_closed, lookback=5, threshold_pct=5.0)
+                    overext_1h = check_overextension(c_1h_closed, lookback=4, threshold_pct=8.0)
+                    
+                    is_overbought = overext_15m == 'OVERBOUGHT' or overext_1h == 'OVERBOUGHT'
+                    is_oversold = overext_15m == 'OVERSOLD' or overext_1h == 'OVERSOLD'
+                    
+                    if target_trend == 'long' and is_overbought:
+                        target_trend = 'short'
+                        reason = f"⚠️ [DÜZELTME AVI] İlk plan LONG idi ama fiyat %5-8 üzeri şişti (OVERBOUGHT). Yön SHORT olarak tersine çevrildi!"
+                    
+                    elif target_trend == 'short' and is_oversold:
+                        target_trend = 'long'
+                        reason = f"⚠️ [DÜZELTME AVI] İlk plan SHORT idi ama fiyat %5-8 üzeri çöktü (OVERSOLD). Yön LONG olarak tersine çevrildi!"
+
+                # 3. AŞAMA: MİKRO TEYİT (Geçmiş Yapı ve İlk 1 Dakika Açılış Kontrolü)
                 if target_trend:
                     tasks_micro = [
                         self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20),
@@ -241,11 +280,9 @@ class MarketScanner:
                     ]
                     c_5m, c_1m = await asyncio.gather(*tasks_micro)
                     
-                    # Sadece Kapanmış Mikro Mumlar
-                    c_5m_closed = c_5m[-4:-1]   # 15M içindeki son 3 kapanmış 5M mumu
-                    c_1m_closed = c_1m[-16:-1]  # 15M içindeki son 15 kapanmış 1M mumu
+                    c_5m_closed = c_5m[-4:-1]   
+                    c_1m_closed = c_1m[-16:-1]  
                     
-                    # Yeni 15M Periyodunun "İlk 1 Dakikalık" Mumu (Aktif Mum)
                     active_1m = c_1m[-1]
                     active_1m_change = ((active_1m[4] - active_1m[1]) / active_1m[1]) * 100
                     
@@ -253,28 +290,28 @@ class MarketScanner:
                     
                     exh_5m = check_exhaustion(c_5m_closed) if len(c_5m_closed) >= 3 else None
                     exh_1m = check_exhaustion(c_1m_closed) if len(c_1m_closed) >= 3 else None
-                    roc_1m = momentum_roc(c_1m_closed, periods=14) # Kapanan son 15 dakikanın ivmesi
+                    roc_1m = momentum_roc(c_1m_closed, periods=14) 
                     
                     if target_trend == 'long':
                         if exh_5m == 'TOP_REJECTION' or exh_1m == 'TOP_REJECTION':
                             veto = True
                         elif roc_1m < -0.15:
                             veto = True
-                        elif active_1m_change < -0.05: # İlk 1 dakikada sert kırmızı açılış
+                        elif active_1m_change < -0.05: 
                             veto = True
-                    else: # short
+                    else: # short (Düzeltme işlemleri de bu filtreden geçmek zorunda)
                         if exh_5m == 'BOTTOM_REJECTION' or exh_1m == 'BOTTOM_REJECTION':
                             veto = True
                         elif roc_1m > 0.15:
                             veto = True
-                        elif active_1m_change > 0.05: # İlk 1 dakikada sert yeşil açılış
+                        elif active_1m_change > 0.05: 
                             veto = True
 
                     if veto:
                         continue
 
-                    # 3. AŞAMA: MİKRO TEYİT ALINDI! STOP'U HESAPLA
-                    current_price = c_15m[-1][4] # Anlık aktif fiyat
+                    # 4. AŞAMA: MİKRO TEYİT ALINDI! STOP'U HESAPLA
+                    current_price = c_15m[-1][4] 
                     atr = calculate_atr(c_15m)
                     
                     if target_trend == 'long':
@@ -290,7 +327,7 @@ class MarketScanner:
                         "symbol": symbol,
                         "trend": target_trend,
                         "sl_price": final_sl,
-                        "reason": reason + " (✅ İlk dakika açılışı ve Mikro Teyit Onaylandı!)"
+                        "reason": reason + " (✅ Mikro Teyit Onaylandı!)"
                     })
                     break 
 
@@ -302,7 +339,7 @@ class MarketScanner:
     async def check_momentum_reversal(self, symbol: str, trend: str) -> bool:
         try:
             candles = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
-            swings = find_swing_points(candles[:-1]) # Repaint engeli
+            swings = find_swing_points(candles[:-1]) 
             prevailing = Trend.UP if trend == 'long' else Trend.DOWN
             
             last_close = candles[-1][4]
