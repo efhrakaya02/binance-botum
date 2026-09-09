@@ -22,11 +22,11 @@ class SwingPoint:
 
 @dataclass
 class StructureBreak:
-    kind: str          # "BOS" (Devam) veya "CHoCH" (Tersine Dönüş)
-    direction: Trend   # Kırılım sonrası işaret ettiği yeni yön
+    kind: str          
+    direction: Trend   
     broken_level: float
     break_close: float
-    is_strong: bool    # Mum gövdesi güçlü mü?
+    is_strong: bool    
 
 def find_swing_points(candles, lookback: int = 2) -> List[SwingPoint]:
     points = []
@@ -176,7 +176,6 @@ class MarketScanner:
         
         for symbol in hot_symbols:
             try:
-                # 1. AŞAMA: Sadece Makro ve 15M Verilerini Çek
                 tasks = [
                     self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50),
                     self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50),
@@ -184,19 +183,27 @@ class MarketScanner:
                 ]
                 c_4h, c_1h, c_15m = await asyncio.gather(*tasks)
                 
-                swings_4h = find_swing_points(c_4h)
+                # 🚀 REPAINT KORUMASI: Makro kararlar sadece "KAPANMIŞ" mumlar üzerinden verilir.
+                c_4h_closed = c_4h[:-1]
+                c_1h_closed = c_1h[:-1]
+                c_15m_closed = c_15m[:-1]
+                
+                swings_4h = find_swing_points(c_4h_closed)
                 macro_trend = determine_trend(swings_4h)
                 
-                vol_ratio = volume_anomaly_ratio(c_15m)
-                roc_15m = momentum_roc(c_15m)
-                if vol_ratio < 1.30: continue 
+                vol_ratio = volume_anomaly_ratio(c_15m_closed)
+                roc_15m = momentum_roc(c_15m_closed)
                 
-                swings_15m = find_swing_points(c_15m)
-                swings_1h = find_swing_points(c_1h)
+                # 🚀 CLIMAX (TAVAN) KORUMASI: Hacim x3'ten büyükse bu bir balina tuzağıdır, kaç!
+                if vol_ratio < 1.30 or vol_ratio > 3.0: 
+                    continue 
+                
+                swings_15m = find_swing_points(c_15m_closed)
+                swings_1h = find_swing_points(c_1h_closed)
                 trend_1h = determine_trend(swings_1h)
                 
-                struct_break = detect_structure_break(c_15m, swings_15m, trend_1h)
-                exhaustion = check_exhaustion(c_15m)
+                struct_break = detect_structure_break(c_15m_closed, swings_15m, trend_1h)
+                exhaustion = check_exhaustion(c_15m_closed)
                 
                 target_trend = None
                 reason = ""
@@ -205,28 +212,28 @@ class MarketScanner:
                 if struct_break and struct_break.kind == "CHoCH" and struct_break.is_strong:
                     if struct_break.direction == Trend.UP and roc_15m > 0.1:
                         target_trend = 'long'
-                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) Erken LONG Dönüşü (CHoCH) yakalandı."
+                        reason = f"Makro bağımsız, kapanmış 15M mumda Yukarı Dönüş (CHoCH). Hacim: x{vol_ratio:.2f}."
                     elif struct_break.direction == Trend.DOWN and roc_15m < -0.1:
                         target_trend = 'short'
-                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) Erken SHORT Dönüşü (CHoCH) yakalandı."
+                        reason = f"Makro bağımsız, kapanmış 15M mumda Aşağı Dönüş (CHoCH). Hacim: x{vol_ratio:.2f}."
 
                 elif exhaustion:
                     if exhaustion == 'TOP_REJECTION' and roc_15m < -0.1:
                         target_trend = 'short'
-                        reason = f"15M grafikte devasa üst fitil (Tükeniş). Alıcılar tükendi, SHORT giriyoruz!"
+                        reason = f"Kapanmış 15M mumda üst fitil (Tükeniş). SHORT giriyoruz!"
                     elif exhaustion == 'BOTTOM_REJECTION' and roc_15m > 0.1:
                         target_trend = 'long'
-                        reason = f"15M grafikte devasa alt fitil (Tükeniş). Satıcılar tükendi, LONG giriyoruz!"
+                        reason = f"Kapanmış 15M mumda alt fitil (Tükeniş). LONG giriyoruz!"
 
                 elif struct_break and struct_break.kind == "BOS" and struct_break.is_strong:
                     if struct_break.direction == Trend.UP and roc_15m > 0.1:
                         target_trend = 'long'
-                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}. LONG giriyoruz."
+                        reason = f"Kapanmış 15M mumda Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}."
                     elif struct_break.direction == Trend.DOWN and roc_15m < -0.1:
                         target_trend = 'short'
-                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}. SHORT giriyoruz."
+                        reason = f"Kapanmış 15M mumda Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}."
 
-                # 2. AŞAMA: MİKRO TEYİT (Sadece 15M sinyal ürettiyse 5M ve 1M çekilir)
+                # 2. AŞAMA: MİKRO TEYİT (Geçmiş Yapı ve İlk 1 Dakika Açılış Kontrolü)
                 if target_trend:
                     tasks_micro = [
                         self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20),
@@ -234,36 +241,40 @@ class MarketScanner:
                     ]
                     c_5m, c_1m = await asyncio.gather(*tasks_micro)
                     
-                    veto = False
-                    veto_reason = ""
+                    # Sadece Kapanmış Mikro Mumlar
+                    c_5m_closed = c_5m[-4:-1]   # 15M içindeki son 3 kapanmış 5M mumu
+                    c_1m_closed = c_1m[-16:-1]  # 15M içindeki son 15 kapanmış 1M mumu
                     
-                    exh_5m = check_exhaustion(c_5m)
-                    exh_1m = check_exhaustion(c_1m)
-                    roc_1m = momentum_roc(c_1m, periods=3) # 1M'de son 3 mumun ivmesi (Çok kısa vade)
+                    # Yeni 15M Periyodunun "İlk 1 Dakikalık" Mumu (Aktif Mum)
+                    active_1m = c_1m[-1]
+                    active_1m_change = ((active_1m[4] - active_1m[1]) / active_1m[1]) * 100
+                    
+                    veto = False
+                    
+                    exh_5m = check_exhaustion(c_5m_closed) if len(c_5m_closed) >= 3 else None
+                    exh_1m = check_exhaustion(c_1m_closed) if len(c_1m_closed) >= 3 else None
+                    roc_1m = momentum_roc(c_1m_closed, periods=14) # Kapanan son 15 dakikanın ivmesi
                     
                     if target_trend == 'long':
                         if exh_5m == 'TOP_REJECTION' or exh_1m == 'TOP_REJECTION':
                             veto = True
-                            veto_reason = "5M/1M grafikte Tepeden Red (Fitil) var."
                         elif roc_1m < -0.15:
                             veto = True
-                            veto_reason = "1M momentumu sert şekilde aşağı dönmüş."
+                        elif active_1m_change < -0.05: # İlk 1 dakikada sert kırmızı açılış
+                            veto = True
                     else: # short
                         if exh_5m == 'BOTTOM_REJECTION' or exh_1m == 'BOTTOM_REJECTION':
                             veto = True
-                            veto_reason = "5M/1M grafikte Dipten Alım (Fitil) var."
                         elif roc_1m > 0.15:
                             veto = True
-                            veto_reason = "1M momentumu sert şekilde yukarı dönmüş."
+                        elif active_1m_change > 0.05: # İlk 1 dakikada sert yeşil açılış
+                            veto = True
 
-                    # Eğer mikro teyit olumsuzsa (Veto edildiyse), bu coini atla!
                     if veto:
-                        # Geliştirici olarak logda görmek istersen diye bu printi bıraktım.
-                        # print(f"🛑 [VETO] {symbol} {target_trend.upper()} iptal edildi. Sebep: {veto_reason}")
                         continue
 
-                    # 3. AŞAMA: MİKRO TEYİT ALINDI! STOP'U HESAPLA VE İŞLEMİ GÖNDER
-                    current_price = c_15m[-1][4]
+                    # 3. AŞAMA: MİKRO TEYİT ALINDI! STOP'U HESAPLA
+                    current_price = c_15m[-1][4] # Anlık aktif fiyat
                     atr = calculate_atr(c_15m)
                     
                     if target_trend == 'long':
@@ -279,9 +290,9 @@ class MarketScanner:
                         "symbol": symbol,
                         "trend": target_trend,
                         "sl_price": final_sl,
-                        "reason": reason + f" (✅ 5M ve 1M Mikro Teyidi Alındı!)"
+                        "reason": reason + " (✅ İlk dakika açılışı ve Mikro Teyit Onaylandı!)"
                     })
-                    break # Bir tane kaliteli sinyal bulduk, taramayı durdur ve işleme geç.
+                    break 
 
             except Exception as e:
                 continue
@@ -291,7 +302,7 @@ class MarketScanner:
     async def check_momentum_reversal(self, symbol: str, trend: str) -> bool:
         try:
             candles = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
-            swings = find_swing_points(candles)
+            swings = find_swing_points(candles[:-1]) # Repaint engeli
             prevailing = Trend.UP if trend == 'long' else Trend.DOWN
             
             last_close = candles[-1][4]
