@@ -111,6 +111,18 @@ def momentum_roc(candles, periods: int = 5) -> float:
     if past == 0: return 0.0
     return (now - past) / past * 100
 
+# 🚀 YENİ EKLENEN: ATR Hesaplayıcı (Dinamik Stop İçin)
+def calculate_atr(candles, period: int = 14) -> float:
+    if len(candles) < period + 1: return 0.0
+    tr_list = []
+    for i in range(1, len(candles)):
+        high_p = candles[i][2]
+        low_p = candles[i][3]
+        prev_close = candles[i-1][4]
+        tr = max(high_p - low_p, abs(high_p - prev_close), abs(low_p - prev_close))
+        tr_list.append(tr)
+    return sum(tr_list[-period:]) / period
+
 # --- ANA TARAYICI SINIFI ---
 class MarketScanner:
     def __init__(self, config):
@@ -123,12 +135,10 @@ class MarketScanner:
         await self.exchange.close()
 
     async def _get_hot_candidates(self) -> List[str]:
-        """Hacim, Gainers ve Losers listelerinden Rank Velocity mantığı ile en sıcak coinleri bulur."""
         try:
             tickers = await self.exchange.fetch_tickers()
             usable = [t for t in tickers.values() if t['symbol'].endswith('USDT')]
             
-            # 1. Hacim, 2. Kazandıranlar (Gainers), 3. Kaybettirenler (Losers)
             by_vol = sorted(usable, key=lambda t: t.get('quoteVolume', 0) or 0, reverse=True)
             by_gain = sorted(usable, key=lambda t: t.get('percentage', 0) or 0, reverse=True)
             by_loss = sorted(usable, key=lambda t: t.get('percentage', 0) or 0)
@@ -191,6 +201,20 @@ class MarketScanner:
                 struct_break = detect_structure_break(c_15m, swings_15m, trend_1h)
                 exhaustion = check_exhaustion(c_15m)
                 
+                # 🚀 YENİ: Dinamik ATR Stop ve %1.5 Kesin Sınır Hesaplaması
+                current_price = c_15m[-1][4]
+                atr = calculate_atr(c_15m)
+                
+                # LONG için: 2x ATR uzağa koy, ama %1.5'ten daha aşağı inmesine İZİN VERME!
+                long_atr_sl = current_price - (atr * 2)
+                long_max_sl = current_price * 0.985
+                final_long_sl = max(long_atr_sl, long_max_sl) # Hangisi daha güvenliyse onu al (Yüksek olanı)
+
+                # SHORT için: 2x ATR uzağa koy, ama %1.5'ten daha yukarı çıkmasına İZİN VERME!
+                short_atr_sl = current_price + (atr * 2)
+                short_max_sl = current_price * 1.015
+                final_short_sl = min(short_atr_sl, short_max_sl) # Hangisi daha güvenliyse onu al (Düşük olanı)
+
                 target_trend = None
                 reason = ""
                 sl_price = 0.0
@@ -199,36 +223,36 @@ class MarketScanner:
                 if struct_break and struct_break.kind == "CHoCH" and struct_break.is_strong:
                     if struct_break.direction == Trend.UP and roc > 0.1:
                         target_trend = 'long'
-                        sl_price = min(c[3] for c in c_15m[-3:]) * 0.995
+                        sl_price = final_long_sl
                         reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Yukarı Dönüş (CHoCH) yakalandı. Erken LONG!"
                     
                     elif struct_break.direction == Trend.DOWN and roc < -0.1:
                         target_trend = 'short'
-                        sl_price = max(c[2] for c in c_15m[-3:]) * 1.005
+                        sl_price = final_short_sl
                         reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Aşağı Dönüş (CHoCH) yakalandı. Erken SHORT!"
 
                 # 2. SENARYO: TÜKENİŞ / TEPEDEN-DİPTEN RED YAKALAMA
                 elif exhaustion:
                     if exhaustion == 'TOP_REJECTION' and roc < -0.1:
                         target_trend = 'short'
-                        sl_price = max(c[2] for c in c_15m[-3:]) * 1.005
+                        sl_price = final_short_sl
                         reason = f"15M grafikte devasa üst fitil (Tepeden Red) oluştu. Alıcılar tükendi, balinalar boşaltıyor. SHORT giriyoruz!"
                     
                     elif exhaustion == 'BOTTOM_REJECTION' and roc > 0.1:
                         target_trend = 'long'
-                        sl_price = min(c[3] for c in c_15m[-3:]) * 0.995
+                        sl_price = final_long_sl
                         reason = f"15M grafikte devasa alt fitil (Dipten Red) oluştu. Satıcılar tükendi, balinalar topluyor. LONG giriyoruz!"
 
                 # 3. SENARYO: TREND DEVAMI (BOS)
                 elif struct_break and struct_break.kind == "BOS" and struct_break.is_strong:
                     if struct_break.direction == Trend.UP and roc > 0.1:
                         target_trend = 'long'
-                        sl_price = min(c[3] for c in c_15m[-5:]) * 0.995
+                        sl_price = final_long_sl
                         reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS) ile trend devam ediyor. Hacim: x{vol_ratio:.2f}. LONG giriyoruz."
                     
                     elif struct_break.direction == Trend.DOWN and roc < -0.1:
                         target_trend = 'short'
-                        sl_price = max(c[2] for c in c_15m[-5:]) * 1.005
+                        sl_price = final_short_sl
                         reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS) ile trend devam ediyor. Hacim: x{vol_ratio:.2f}. SHORT giriyoruz."
 
                 if target_trend:
