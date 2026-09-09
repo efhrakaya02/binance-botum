@@ -119,7 +119,7 @@ def calculate_atr(candles, period: int = 14) -> float:
         tr_list.append(tr)
     return sum(tr_list[-period:]) / period
 
-# 🚀 YENİ: Aşırı Uzama (Overextension) / Düzeltme Radarı
+# 🚀 DÜZELTME RADARI (Eşik Değeri %2.5)
 def check_overextension(candles, lookback: int, threshold_pct: float) -> str:
     """Belirli bir mum aralığındaki fiyat uzamasını (şişkinliğini) ölçer."""
     if len(candles) < lookback: 
@@ -256,21 +256,21 @@ class MarketScanner:
                         target_trend = 'short'
                         reason = f"Kapanmış 15M mumda Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}."
 
-                # 2. AŞAMA: DÜZELTME AVI (Overextension Veto ve Ters Yön Çevirme)
+                # 2. AŞAMA: DÜZELTME AVI (Overextension Veto ve Ters Yön Çevirme) - Yeni Limit: %2.5
                 if target_trend:
-                    overext_15m = check_overextension(c_15m_closed, lookback=5, threshold_pct=5.0)
-                    overext_1h = check_overextension(c_1h_closed, lookback=4, threshold_pct=8.0)
+                    overext_15m = check_overextension(c_15m_closed, lookback=5, threshold_pct=2.5)
+                    overext_1h = check_overextension(c_1h_closed, lookback=4, threshold_pct=2.5)
                     
                     is_overbought = overext_15m == 'OVERBOUGHT' or overext_1h == 'OVERBOUGHT'
                     is_oversold = overext_15m == 'OVERSOLD' or overext_1h == 'OVERSOLD'
                     
                     if target_trend == 'long' and is_overbought:
                         target_trend = 'short'
-                        reason = f"⚠️ [DÜZELTME AVI] İlk plan LONG idi ama fiyat %5-8 üzeri şişti (OVERBOUGHT). Yön SHORT olarak tersine çevrildi!"
+                        reason = f"⚠️ [DÜZELTME AVI] İlk plan LONG idi ama fiyat %2.5 üzeri şişti (OVERBOUGHT). Yön SHORT olarak tersine çevrildi!"
                     
                     elif target_trend == 'short' and is_oversold:
                         target_trend = 'long'
-                        reason = f"⚠️ [DÜZELTME AVI] İlk plan SHORT idi ama fiyat %5-8 üzeri çöktü (OVERSOLD). Yön LONG olarak tersine çevrildi!"
+                        reason = f"⚠️ [DÜZELTME AVI] İlk plan SHORT idi ama fiyat %2.5 üzeri çöktü (OVERSOLD). Yön LONG olarak tersine çevrildi!"
 
                 # 3. AŞAMA: MİKRO TEYİT (Geçmiş Yapı ve İlk 1 Dakika Açılış Kontrolü)
                 if target_trend:
