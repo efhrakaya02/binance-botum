@@ -4,7 +4,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import List, Optional
 
-# --- KURUMSAL PRICE ACTION (SMC) SINIFLARI VE FONKSİYONLARI ---
+# --- KURUMSAL PRICE ACTION & TIMSAH (CROCODILE) SINIFLARI ---
 class Trend(Enum):
     UP = "UP"
     DOWN = "DOWN"
@@ -19,14 +19,6 @@ class SwingPoint:
     index: int
     price: float
     type: SwingType
-
-@dataclass
-class StructureBreak:
-    kind: str          
-    direction: Trend   
-    broken_level: float
-    break_close: float
-    is_strong: bool    
 
 def find_swing_points(candles, lookback: int = 2) -> List[SwingPoint]:
     points = []
@@ -46,44 +38,17 @@ def determine_trend(swings: List[SwingPoint]) -> Trend:
     highs = [s for s in swings if s.type == SwingType.HIGH][-3:]
     lows = [s for s in swings if s.type == SwingType.LOW][-3:]
     if len(highs) >= 2 and len(lows) >= 2:
-        higher_highs = highs[-1].price > highs[-2].price
-        higher_lows = lows[-1].price > lows[-2].price
-        lower_highs = highs[-1].price < highs[-2].price
-        lower_lows = lows[-1].price < lows[-2].price
-        if higher_highs and higher_lows: return Trend.UP
-        if lower_highs and lower_lows: return Trend.DOWN
+        if highs[-1].price > highs[-2].price and lows[-1].price > lows[-2].price: 
+            return Trend.UP
+        if highs[-1].price < highs[-2].price and lows[-1].price < lows[-2].price: 
+            return Trend.DOWN
     return Trend.RANGE
 
-def detect_structure_break(candles, swings: List[SwingPoint], prevailing_trend: Trend) -> Optional[StructureBreak]:
-    if not candles or not swings: return None
-    last_candle = candles[-1]
-    open_p, high_p, low_p, close_p = last_candle[1], last_candle[2], last_candle[3], last_candle[4]
-    
-    last_high = next((s for s in reversed(swings) if s.type == SwingType.HIGH), None)
-    last_low = next((s for s in reversed(swings) if s.type == SwingType.LOW), None)
-
-    body = abs(close_p - open_p)
-    total_range = high_p - low_p
-    total_range = max(total_range, close_p * 0.0001)
-    is_strong_body = (body / total_range) > 0.60 
-
-    if prevailing_trend == Trend.UP and last_high and close_p > last_high.price:
-        return StructureBreak("BOS", Trend.UP, last_high.price, close_p, is_strong_body)
-    if prevailing_trend == Trend.DOWN and last_low and close_p < last_low.price:
-        return StructureBreak("BOS", Trend.DOWN, last_low.price, close_p, is_strong_body)
-        
-    if prevailing_trend == Trend.UP and last_low and close_p < last_low.price:
-        return StructureBreak("CHoCH", Trend.DOWN, last_low.price, close_p, is_strong_body)
-    if prevailing_trend == Trend.DOWN and last_high and close_p > last_high.price:
-        return StructureBreak("CHoCH", Trend.UP, last_high.price, close_p, is_strong_body)
-        
-    return None
-
 def check_exhaustion(candles) -> Optional[str]:
+    """Mumların anatomisine bakarak tepeden veya dipten red yeme (Fitil) durumunu tespit eder."""
     for c in candles[-3:]:
         open_p, high_p, low_p, close_p = c[1], c[2], c[3], c[4]
-        body = abs(close_p - open_p)
-        body = max(body, close_p * 0.0001) 
+        body = max(abs(close_p - open_p), close_p * 0.0001) 
         
         upper_wick = high_p - max(open_p, close_p)
         lower_wick = min(open_p, close_p) - low_p
@@ -94,53 +59,14 @@ def check_exhaustion(candles) -> Optional[str]:
             return 'BOTTOM_REJECTION'
     return None
 
-def volume_anomaly_ratio(candles, baseline_window: int = 20) -> float:
-    if len(candles) < baseline_window + 1: return 1.0
-    baseline = candles[-(baseline_window + 1) : -1]
-    avg_vol = sum(c[5] for c in baseline) / len(baseline) 
-    if avg_vol == 0: return 1.0
-    return candles[-1][5] / avg_vol
-
-def momentum_roc(candles, periods: int = 5) -> float:
-    if len(candles) < periods + 1: return 0.0
-    past = candles[-(periods + 1)][4]
-    now = candles[-1][4]
-    if past == 0: return 0.0
-    return (now - past) / past * 100
-
 def calculate_atr(candles, period: int = 14) -> float:
     if len(candles) < period + 1: return 0.0
     tr_list = []
     for i in range(1, len(candles)):
-        high_p = candles[i][2]
-        low_p = candles[i][3]
-        prev_close = candles[i-1][4]
+        high_p, low_p, prev_close = candles[i][2], candles[i][3], candles[i-1][4]
         tr = max(high_p - low_p, abs(high_p - prev_close), abs(low_p - prev_close))
         tr_list.append(tr)
     return sum(tr_list[-period:]) / period
-
-# 🚀 DÜZELTME RADARI (Eşik Değeri %2.5)
-def check_overextension(candles, lookback: int, threshold_pct: float) -> str:
-    """Belirli bir mum aralığındaki fiyat uzamasını (şişkinliğini) ölçer."""
-    if len(candles) < lookback: 
-        return 'NORMAL'
-        
-    window = candles[-lookback:]
-    min_price = min(c[3] for c in window)
-    max_price = max(c[2] for c in window)
-    
-    first_open = window[0][1]
-    last_close = window[-1][4]
-    
-    move_pct = ((max_price - min_price) / min_price) * 100
-    
-    if move_pct >= threshold_pct:
-        if last_close > first_open:
-            return 'OVERBOUGHT' # Aşırı Alım - Fiyat Şişti (Düzeltme Beklenir)
-        else:
-            return 'OVERSOLD'   # Aşırı Satım - Fiyat Çöktü (Tepki Beklenir)
-            
-    return 'NORMAL'
 
 # --- ANA TARAYICI SINIFI ---
 class MarketScanner:
@@ -169,28 +95,16 @@ class MarketScanner:
             candidate_symbols = set(volume_rank.keys()) | set(gainer_rank.keys()) | set(loser_rank.keys())
             
             scored_candidates = []
-            current_ranks = {}
-            
             for symbol in candidate_symbols:
-                rv = volume_rank.get(symbol, self.NEUTRAL_RANK)
-                rg = gainer_rank.get(symbol, self.NEUTRAL_RANK)
-                rl = loser_rank.get(symbol, self.NEUTRAL_RANK)
-                best_rank = min(rv, rg, rl)
-                
-                current_ranks[symbol] = best_rank
-                prev_rank = self.previous_ranks.get(symbol)
-                velocity = (prev_rank - best_rank) if prev_rank else 0
-                is_new = prev_rank is None and best_rank <= 40
-                
-                if velocity >= 5 or is_new or best_rank <= 20:
-                    score = (self.NEUTRAL_RANK - best_rank) + (velocity * 2) + (10 if is_new else 0)
-                    scored_candidates.append((symbol, score))
+                best_rank = min(volume_rank.get(symbol, self.NEUTRAL_RANK), 
+                                gainer_rank.get(symbol, self.NEUTRAL_RANK), 
+                                loser_rank.get(symbol, self.NEUTRAL_RANK))
+                if best_rank <= 25:
+                    scored_candidates.append((symbol, best_rank))
                     
-            self.previous_ranks = current_ranks
-            scored_candidates.sort(key=lambda x: x[1], reverse=True)
-            return [x[0] for x in scored_candidates[:25]]
-            
-        except Exception as e:
+            scored_candidates.sort(key=lambda x: x[1])
+            return [x[0] for x in scored_candidates[:20]]
+        except Exception:
             return []
 
     async def scan_market(self):
@@ -201,156 +115,71 @@ class MarketScanner:
             try:
                 tasks = [
                     self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50),
-                    self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50),
-                    self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
+                    self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20),
+                    self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20)
                 ]
-                c_4h, c_1h, c_15m = await asyncio.gather(*tasks)
+                c_4h, c_15m, c_5m = await asyncio.gather(*tasks)
                 
-                # 🚀 REPAINT KORUMASI: Makro kararlar sadece "KAPANMIŞ" mumlar üzerinden verilir.
                 c_4h_closed = c_4h[:-1]
-                c_1h_closed = c_1h[:-1]
                 c_15m_closed = c_15m[:-1]
+                c_5m_closed = c_5m[:-1]
                 
+                # 1. MAKRO TREND TAYİNİ
                 swings_4h = find_swing_points(c_4h_closed)
                 macro_trend = determine_trend(swings_4h)
+                if macro_trend == Trend.RANGE:
+                    continue # Yatay piyasada timsah ava çıkmaz.
                 
-                vol_ratio = volume_anomaly_ratio(c_15m_closed)
-                roc_15m = momentum_roc(c_15m_closed)
+                # 2. KAPASİTE (ATR) KONTROLÜ - 4H Mumda yenecek et kaldı mı?
+                atr_4h = calculate_atr(c_4h_closed, period=14)
+                active_4h_candle = c_4h[-1]
+                current_range = active_4h_candle[2] - active_4h_candle[3] # Anlık Yüksek - Anlık Düşük
                 
-                # CLIMAX (TAVAN) KORUMASI
-                if vol_ratio < 1.30 or vol_ratio > 3.0: 
-                    continue 
+                if current_range >= atr_4h * 0.75:
+                    continue # Mum zaten potansiyelinin %75'ini doldurmuş, riskli.
                 
-                swings_15m = find_swing_points(c_15m_closed)
-                swings_1h = find_swing_points(c_1h_closed)
-                trend_1h = determine_trend(swings_1h)
-                
-                struct_break = detect_structure_break(c_15m_closed, swings_15m, trend_1h)
-                exhaustion = check_exhaustion(c_15m_closed)
+                # 3. MİKRO DÜZELTME (PULLBACK) VE ONAY AVI
+                exh_15m = check_exhaustion(c_15m_closed)
+                exh_5m = check_exhaustion(c_5m_closed)
                 
                 target_trend = None
                 reason = ""
-
-                # 1. AŞAMA: 15M Karar Mekanizması
-                if struct_break and struct_break.kind == "CHoCH" and struct_break.is_strong:
-                    if struct_break.direction == Trend.UP and roc_15m > 0.1:
+                
+                if macro_trend == Trend.UP:
+                    # Makro yükseliş. Fiyatın destekten sekmesini (Alt Fitil) bekliyoruz.
+                    if exh_15m == 'BOTTOM_REJECTION' or exh_5m == 'BOTTOM_REJECTION':
                         target_trend = 'long'
-                        reason = f"Makro bağımsız, kapanmış 15M mumda Yukarı Dönüş (CHoCH). Hacim: x{vol_ratio:.2f}."
-                    elif struct_break.direction == Trend.DOWN and roc_15m < -0.1:
+                        reason = f"Makro (4H) Yükseliş trendinde. 15M/5M'de destekten sekme (Alt Fitil) yakalandı. Kapasite uygun."
+                        
+                elif macro_trend == Trend.DOWN:
+                    # Makro düşüş. Fiyatın dirençten reddedilmesini (Üst Fitil) bekliyoruz.
+                    if exh_15m == 'TOP_REJECTION' or exh_5m == 'TOP_REJECTION':
                         target_trend = 'short'
-                        reason = f"Makro bağımsız, kapanmış 15M mumda Aşağı Dönüş (CHoCH). Hacim: x{vol_ratio:.2f}."
+                        reason = f"Makro (4H) Düşüş trendinde. 15M/5M'de dirençten red (Üst Fitil) yakalandı. Kapasite uygun."
 
-                elif exhaustion:
-                    if exhaustion == 'TOP_REJECTION' and roc_15m < -0.1:
-                        target_trend = 'short'
-                        reason = f"Kapanmış 15M mumda üst fitil (Tükeniş). SHORT giriyoruz!"
-                    elif exhaustion == 'BOTTOM_REJECTION' and roc_15m > 0.1:
-                        target_trend = 'long'
-                        reason = f"Kapanmış 15M mumda alt fitil (Tükeniş). LONG giriyoruz!"
+                if not target_trend:
+                    continue
 
-                elif struct_break and struct_break.kind == "BOS" and struct_break.is_strong:
-                    if struct_break.direction == Trend.UP and roc_15m > 0.1:
-                        target_trend = 'long'
-                        reason = f"Kapanmış 15M mumda Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}."
-                    elif struct_break.direction == Trend.DOWN and roc_15m < -0.1:
-                        target_trend = 'short'
-                        reason = f"Kapanmış 15M mumda Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}."
+                # 4. TİMSAH RİSK YÖNETİMİ (Geniş SL, Mantıklı TP)
+                current_price = c_15m[-1][4]
+                
+                if target_trend == 'long':
+                    final_sl = current_price - (atr_4h * 1.5) # 4H ATR'nin 1.5 katı genişliğinde güvenli stop
+                    target_tp = current_price + (atr_4h - current_range) # Mumun kalan potansiyeli kâr hedefi
+                else:
+                    final_sl = current_price + (atr_4h * 1.5)
+                    target_tp = current_price - (atr_4h - current_range)
 
-                # 2. AŞAMA: DÜZELTME AVI (Overextension Veto ve Ters Yön Çevirme) - Yeni Limit: %2.5
-                if target_trend:
-                    overext_15m = check_overextension(c_15m_closed, lookback=5, threshold_pct=2.5)
-                    overext_1h = check_overextension(c_1h_closed, lookback=4, threshold_pct=2.5)
-                    
-                    is_overbought = overext_15m == 'OVERBOUGHT' or overext_1h == 'OVERBOUGHT'
-                    is_oversold = overext_15m == 'OVERSOLD' or overext_1h == 'OVERSOLD'
-                    
-                    if target_trend == 'long' and is_overbought:
-                        target_trend = 'short'
-                        reason = f"⚠️ [DÜZELTME AVI] İlk plan LONG idi ama fiyat %2.5 üzeri şişti (OVERBOUGHT). Yön SHORT olarak tersine çevrildi!"
-                    
-                    elif target_trend == 'short' and is_oversold:
-                        target_trend = 'long'
-                        reason = f"⚠️ [DÜZELTME AVI] İlk plan SHORT idi ama fiyat %2.5 üzeri çöktü (OVERSOLD). Yön LONG olarak tersine çevrildi!"
+                opportunities.append({
+                    "symbol": symbol,
+                    "trend": target_trend,
+                    "sl_price": final_sl,
+                    "tp_price": target_tp,   # 🚀 TP NOKTASI EKLENDİ
+                    "reason": reason
+                })
+                break 
 
-                # 3. AŞAMA: MİKRO TEYİT (Geçmiş Yapı ve İlk 1 Dakika Açılış Kontrolü)
-                if target_trend:
-                    tasks_micro = [
-                        self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20),
-                        self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=20)
-                    ]
-                    c_5m, c_1m = await asyncio.gather(*tasks_micro)
-                    
-                    c_5m_closed = c_5m[-4:-1]   
-                    c_1m_closed = c_1m[-16:-1]  
-                    
-                    active_1m = c_1m[-1]
-                    active_1m_change = ((active_1m[4] - active_1m[1]) / active_1m[1]) * 100
-                    
-                    veto = False
-                    
-                    exh_5m = check_exhaustion(c_5m_closed) if len(c_5m_closed) >= 3 else None
-                    exh_1m = check_exhaustion(c_1m_closed) if len(c_1m_closed) >= 3 else None
-                    roc_1m = momentum_roc(c_1m_closed, periods=14) 
-                    
-                    if target_trend == 'long':
-                        if exh_5m == 'TOP_REJECTION' or exh_1m == 'TOP_REJECTION':
-                            veto = True
-                        elif roc_1m < -0.15:
-                            veto = True
-                        elif active_1m_change < -0.05: 
-                            veto = True
-                    else: # short (Düzeltme işlemleri de bu filtreden geçmek zorunda)
-                        if exh_5m == 'BOTTOM_REJECTION' or exh_1m == 'BOTTOM_REJECTION':
-                            veto = True
-                        elif roc_1m > 0.15:
-                            veto = True
-                        elif active_1m_change > 0.05: 
-                            veto = True
-
-                    if veto:
-                        continue
-
-                    # 4. AŞAMA: MİKRO TEYİT ALINDI! STOP'U HESAPLA
-                    current_price = c_15m[-1][4] 
-                    atr = calculate_atr(c_15m)
-                    
-                    if target_trend == 'long':
-                        long_atr_sl = current_price - (atr * 2)
-                        long_max_sl = current_price * 0.985
-                        final_sl = max(long_atr_sl, long_max_sl)
-                    else:
-                        short_atr_sl = current_price + (atr * 2)
-                        short_max_sl = current_price * 1.015
-                        final_sl = min(short_atr_sl, short_max_sl)
-
-                    opportunities.append({
-                        "symbol": symbol,
-                        "trend": target_trend,
-                        "sl_price": final_sl,
-                        "reason": reason + " (✅ Mikro Teyit Onaylandı!)"
-                    })
-                    break 
-
-            except Exception as e:
+            except Exception:
                 continue
                 
         return opportunities
-
-    async def check_momentum_reversal(self, symbol: str, trend: str) -> bool:
-        try:
-            candles = await self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
-            swings = find_swing_points(candles[:-1]) 
-            prevailing = Trend.UP if trend == 'long' else Trend.DOWN
-            
-            last_close = candles[-1][4]
-            last_high = next((s for s in reversed(swings) if s.type == SwingType.HIGH), None)
-            last_low = next((s for s in reversed(swings) if s.type == SwingType.LOW), None)
-
-            if prevailing == Trend.UP and last_low and last_close < last_low.price:
-                return True 
-            if prevailing == Trend.DOWN and last_high and last_close > last_high.price:
-                return True 
-                
-            return False
-        except:
-            return False
