@@ -1,4 +1,8 @@
 import ccxt.async_support as ccxt
+import asyncio
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Optional
 
 class ExecutionEngine:
     def __init__(self, config):
@@ -16,7 +20,7 @@ class ExecutionEngine:
             ticker = await self.exchange.fetch_ticker(symbol)
             return ticker['last']
         except Exception as e:
-            print(f"[{symbol}] Fiyat alınırken hata oluştu: {e}")
+            print(f"⚠️ [{symbol}] Fiyat alınırken anlık bir kesinti oldu: {e}")
             return None
 
     async def setup_margin_and_leverage(self, symbol):
@@ -41,7 +45,7 @@ class ExecutionEngine:
         amount = await self.calculate_amount(symbol, current_price)
         
         if hasattr(self.config, 'PAPER_TRADING') and self.config.PAPER_TRADING:
-            print(f"🛠️ [TEST MODU] Sanal İşlem Açıldı: {symbol} | Yön: {side.upper()} | Miktar: {amount}")
+            print(f"🔫 [TETİKÇİ - TEST MODU] Sanal İşlem Açıldı: {symbol} | Yön: {side.upper()} | Miktar: {amount}")
             return {
                 "status": "success",
                 "entry_price": current_price,
@@ -63,7 +67,7 @@ class ExecutionEngine:
 
     async def close_position(self, symbol, side, amount):
         if hasattr(self.config, 'PAPER_TRADING') and self.config.PAPER_TRADING:
-            print(f"🛠️ [TEST MODU] Sanal İşlem Kapatıldı: {symbol}")
+            print(f"💼 [TETİKÇİ - TEST MODU] Sanal İşlem Kapatıldı: {symbol}. Emir başarıyla uygulandı.")
             return True
             
         close_side = 'sell' if side == 'buy' else 'buy'
