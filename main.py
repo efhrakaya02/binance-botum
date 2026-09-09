@@ -40,29 +40,47 @@ class TradingBot:
                     profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100 if is_long else ((trade['entry_price'] - current_price) / trade['entry_price']) * 100
                     trade['current_sl'] = current_sl # Rapor için kaydet
 
-                    closed = False
+                    # 🚀 YENİ: Zirveden dönüş hesaplama (Peak Drop Analizi)
                     if is_long:
-                        if profit_pct >= self.config.HARD_TP_PCT:
-                            print(f"\n✅ [KÂR ALINDI] Patron, {symbol} hedefimize ulaştı! %{profit_pct:.2f} kârı kasaya koydum, masadan kalkıyoruz.")
-                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
-                            self.state_manager.record_closed_trade(symbol, profit_pct, "Take Profit")
-                            closed = True
-                        elif current_price <= current_sl:
-                            print(f"\n🚨 [STOP-LOSS] Bana kızma patron ama {symbol} işleminde piyasa aniden tersine döndü. Kırmızı çizgimizi delmesine izin vermeden zararı %{profit_pct:.2f} seviyesinde acımasızca kestim. Sermayeyi koruduk.")
-                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                        max_profit_pct = ((trade['max_reached_price'] - trade['entry_price']) / trade['entry_price']) * 100
+                        drop_from_peak = ((trade['max_reached_price'] - current_price) / trade['max_reached_price']) * 100
+                    else:
+                        max_profit_pct = ((trade['entry_price'] - trade['max_reached_price']) / trade['entry_price']) * 100
+                        drop_from_peak = ((current_price - trade['max_reached_price']) / trade['max_reached_price']) * 100
+
+                    # Zirve Yakalama (Peak TP) Tetikleyicisi: Kâr %3'ü geçtiyse ve zirveden %0.2'lik bir dönüş olduysa tetiği çek!
+                    peak_tp_triggered = max_profit_pct >= 3.0 and drop_from_peak >= 0.2
+
+                    closed = False
+                    
+                    # 1. DURUM: %3'ü Geçip Zirveden Döndüyse (Kârı Masadan Al)
+                    if peak_tp_triggered:
+                        print(f"\n✅ [ZİRVE YAKALANDI] Patron, {symbol} %3 barajını aştı ve ilk zirvesinden dönüş sinyali verdi! İşlemi tam tepede %{profit_pct:.2f} kârla kapatıyorum.")
+                        await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                        self.state_manager.record_closed_trade(symbol, profit_pct, "Peak TP")
+                        closed = True
+                        
+                    # 2. DURUM: LONG İşlemler İçin Kâr Koruma veya Zarar Kesme
+                    elif is_long and current_price <= current_sl:
+                        if profit_pct > 0:
+                            print(f"\n🛡️ [KÂR KORUNDU] {symbol} işleminde izleyen stop/başa baş kuralı çalıştı. İşlem %{profit_pct:.2f} kârla güvenle kapatıldı.")
+                            self.state_manager.record_closed_trade(symbol, profit_pct, "Trailing TP")
+                        else:
+                            print(f"\n🚨 [STOP-LOSS] Bana kızma patron ama {symbol} işleminde piyasa aniden tersine döndü. Kırmızı çizgimizi delmesine izin vermeden zararı %{profit_pct:.2f} seviyesinde acımasızca kestim.")
                             self.state_manager.record_closed_trade(symbol, profit_pct, "Stop Loss")
-                            closed = True
-                    else: # Short için
-                        if profit_pct >= self.config.HARD_TP_PCT:
-                            print(f"\n✅ [KÂR ALINDI] Patron, {symbol} hedefimize ulaştı! %{profit_pct:.2f} kârı kasaya koydum.")
-                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
-                            self.state_manager.record_closed_trade(symbol, profit_pct, "Take Profit")
-                            closed = True
-                        elif current_price >= current_sl:
+                        await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                        closed = True
+                        
+                    # 3. DURUM: SHORT İşlemler İçin Kâr Koruma veya Zarar Kesme
+                    elif not is_long and current_price >= current_sl:
+                        if profit_pct > 0:
+                            print(f"\n🛡️ [KÂR KORUNDU] {symbol} işleminde izleyen stop/başa baş kuralı çalıştı. İşlem %{profit_pct:.2f} kârla güvenle kapatıldı.")
+                            self.state_manager.record_closed_trade(symbol, profit_pct, "Trailing TP")
+                        else:
                             print(f"\n🚨 [STOP-LOSS] Patron, {symbol} beklediğimiz gibi gitmedi. Anaparayı korumak için zararı %{profit_pct:.2f} seviyesinde kestim.")
-                            await self.execution.close_position(symbol, trade['side'], trade['amount'])
                             self.state_manager.record_closed_trade(symbol, profit_pct, "Stop Loss")
-                            closed = True
+                        await self.execution.close_position(symbol, trade['side'], trade['amount'])
+                        closed = True
 
                     if closed:
                         del self.active_trades[symbol]
