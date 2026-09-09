@@ -18,7 +18,7 @@ class TradingBot:
         Binance 4H mum kapanışlarından (UTC: 00, 04, 08, 12, 16, 20)
         1 dakika önce (XX:59) tüm işlemleri kapatmak için uyarı verir.
         """
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC)
         if now.hour % 4 == 3 and now.minute >= 59:
             return True
         return False
