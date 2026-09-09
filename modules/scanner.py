@@ -62,19 +62,16 @@ def detect_structure_break(candles, swings: List[SwingPoint], prevailing_trend: 
     last_high = next((s for s in reversed(swings) if s.type == SwingType.HIGH), None)
     last_low = next((s for s in reversed(swings) if s.type == SwingType.LOW), None)
 
-    # Mum gövdesi güçlü mü analizi (Kapanış mumun zirvesine/dibine yakın mı?)
     body = abs(close_p - open_p)
     total_range = high_p - low_p
     total_range = max(total_range, close_p * 0.0001)
-    is_strong_body = (body / total_range) > 0.60 # Mumun %60'ı gövde ise güçlüdür
+    is_strong_body = (body / total_range) > 0.60 
 
-    # BOS (Trend Devamı)
     if prevailing_trend == Trend.UP and last_high and close_p > last_high.price:
         return StructureBreak("BOS", Trend.UP, last_high.price, close_p, is_strong_body)
     if prevailing_trend == Trend.DOWN and last_low and close_p < last_low.price:
         return StructureBreak("BOS", Trend.DOWN, last_low.price, close_p, is_strong_body)
         
-    # CHoCH (Trend Dönüşü - Erken Sinyal)
     if prevailing_trend == Trend.UP and last_low and close_p < last_low.price:
         return StructureBreak("CHoCH", Trend.DOWN, last_low.price, close_p, is_strong_body)
     if prevailing_trend == Trend.DOWN and last_high and close_p > last_high.price:
@@ -111,7 +108,6 @@ def momentum_roc(candles, periods: int = 5) -> float:
     if past == 0: return 0.0
     return (now - past) / past * 100
 
-# 🚀 YENİ EKLENEN: ATR Hesaplayıcı (Dinamik Stop İçin)
 def calculate_atr(candles, period: int = 14) -> float:
     if len(candles) < period + 1: return 0.0
     tr_list = []
@@ -180,6 +176,7 @@ class MarketScanner:
         
         for symbol in hot_symbols:
             try:
+                # 1. AŞAMA: Sadece Makro ve 15M Verilerini Çek
                 tasks = [
                     self.exchange.fetch_ohlcv(symbol, timeframe='4h', limit=50),
                     self.exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50),
@@ -191,7 +188,7 @@ class MarketScanner:
                 macro_trend = determine_trend(swings_4h)
                 
                 vol_ratio = volume_anomaly_ratio(c_15m)
-                roc = momentum_roc(c_15m)
+                roc_15m = momentum_roc(c_15m)
                 if vol_ratio < 1.30: continue 
                 
                 swings_15m = find_swing_points(c_15m)
@@ -201,68 +198,90 @@ class MarketScanner:
                 struct_break = detect_structure_break(c_15m, swings_15m, trend_1h)
                 exhaustion = check_exhaustion(c_15m)
                 
-                # 🚀 YENİ: Dinamik ATR Stop ve %1.5 Kesin Sınır Hesaplaması
-                current_price = c_15m[-1][4]
-                atr = calculate_atr(c_15m)
-                
-                # LONG için: 2x ATR uzağa koy, ama %1.5'ten daha aşağı inmesine İZİN VERME!
-                long_atr_sl = current_price - (atr * 2)
-                long_max_sl = current_price * 0.985
-                final_long_sl = max(long_atr_sl, long_max_sl) # Hangisi daha güvenliyse onu al (Yüksek olanı)
-
-                # SHORT için: 2x ATR uzağa koy, ama %1.5'ten daha yukarı çıkmasına İZİN VERME!
-                short_atr_sl = current_price + (atr * 2)
-                short_max_sl = current_price * 1.015
-                final_short_sl = min(short_atr_sl, short_max_sl) # Hangisi daha güvenliyse onu al (Düşük olanı)
-
                 target_trend = None
                 reason = ""
-                sl_price = 0.0
 
-                # 1. SENARYO: ERKEN DÖNÜŞ YAKALAMA (Mikro Makroyu Büküyor)
+                # 15M Karar Mekanizması
                 if struct_break and struct_break.kind == "CHoCH" and struct_break.is_strong:
-                    if struct_break.direction == Trend.UP and roc > 0.1:
+                    if struct_break.direction == Trend.UP and roc_15m > 0.1:
                         target_trend = 'long'
-                        sl_price = final_long_sl
-                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Yukarı Dönüş (CHoCH) yakalandı. Erken LONG!"
-                    
-                    elif struct_break.direction == Trend.DOWN and roc < -0.1:
+                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) Erken LONG Dönüşü (CHoCH) yakalandı."
+                    elif struct_break.direction == Trend.DOWN and roc_15m < -0.1:
                         target_trend = 'short'
-                        sl_price = final_short_sl
-                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) ve Güçlü Gövdeli bir Aşağı Dönüş (CHoCH) yakalandı. Erken SHORT!"
+                        reason = f"Makro yapı ({macro_trend.name}) bağımsız, 15M'de Hacimli (x{vol_ratio:.2f}) Erken SHORT Dönüşü (CHoCH) yakalandı."
 
-                # 2. SENARYO: TÜKENİŞ / TEPEDEN-DİPTEN RED YAKALAMA
                 elif exhaustion:
-                    if exhaustion == 'TOP_REJECTION' and roc < -0.1:
+                    if exhaustion == 'TOP_REJECTION' and roc_15m < -0.1:
                         target_trend = 'short'
-                        sl_price = final_short_sl
-                        reason = f"15M grafikte devasa üst fitil (Tepeden Red) oluştu. Alıcılar tükendi, balinalar boşaltıyor. SHORT giriyoruz!"
-                    
-                    elif exhaustion == 'BOTTOM_REJECTION' and roc > 0.1:
+                        reason = f"15M grafikte devasa üst fitil (Tükeniş). Alıcılar tükendi, SHORT giriyoruz!"
+                    elif exhaustion == 'BOTTOM_REJECTION' and roc_15m > 0.1:
                         target_trend = 'long'
-                        sl_price = final_long_sl
-                        reason = f"15M grafikte devasa alt fitil (Dipten Red) oluştu. Satıcılar tükendi, balinalar topluyor. LONG giriyoruz!"
+                        reason = f"15M grafikte devasa alt fitil (Tükeniş). Satıcılar tükendi, LONG giriyoruz!"
 
-                # 3. SENARYO: TREND DEVAMI (BOS)
                 elif struct_break and struct_break.kind == "BOS" and struct_break.is_strong:
-                    if struct_break.direction == Trend.UP and roc > 0.1:
+                    if struct_break.direction == Trend.UP and roc_15m > 0.1:
                         target_trend = 'long'
-                        sl_price = final_long_sl
-                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS) ile trend devam ediyor. Hacim: x{vol_ratio:.2f}. LONG giriyoruz."
-                    
-                    elif struct_break.direction == Trend.DOWN and roc < -0.1:
+                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}. LONG giriyoruz."
+                    elif struct_break.direction == Trend.DOWN and roc_15m < -0.1:
                         target_trend = 'short'
-                        sl_price = final_short_sl
-                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS) ile trend devam ediyor. Hacim: x{vol_ratio:.2f}. SHORT giriyoruz."
+                        reason = f"15M grafikte Güçlü Gövdeli kırılım (BOS). Hacim: x{vol_ratio:.2f}. SHORT giriyoruz."
 
+                # 2. AŞAMA: MİKRO TEYİT (Sadece 15M sinyal ürettiyse 5M ve 1M çekilir)
                 if target_trend:
+                    tasks_micro = [
+                        self.exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20),
+                        self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=20)
+                    ]
+                    c_5m, c_1m = await asyncio.gather(*tasks_micro)
+                    
+                    veto = False
+                    veto_reason = ""
+                    
+                    exh_5m = check_exhaustion(c_5m)
+                    exh_1m = check_exhaustion(c_1m)
+                    roc_1m = momentum_roc(c_1m, periods=3) # 1M'de son 3 mumun ivmesi (Çok kısa vade)
+                    
+                    if target_trend == 'long':
+                        if exh_5m == 'TOP_REJECTION' or exh_1m == 'TOP_REJECTION':
+                            veto = True
+                            veto_reason = "5M/1M grafikte Tepeden Red (Fitil) var."
+                        elif roc_1m < -0.15:
+                            veto = True
+                            veto_reason = "1M momentumu sert şekilde aşağı dönmüş."
+                    else: # short
+                        if exh_5m == 'BOTTOM_REJECTION' or exh_1m == 'BOTTOM_REJECTION':
+                            veto = True
+                            veto_reason = "5M/1M grafikte Dipten Alım (Fitil) var."
+                        elif roc_1m > 0.15:
+                            veto = True
+                            veto_reason = "1M momentumu sert şekilde yukarı dönmüş."
+
+                    # Eğer mikro teyit olumsuzsa (Veto edildiyse), bu coini atla!
+                    if veto:
+                        # Geliştirici olarak logda görmek istersen diye bu printi bıraktım.
+                        # print(f"🛑 [VETO] {symbol} {target_trend.upper()} iptal edildi. Sebep: {veto_reason}")
+                        continue
+
+                    # 3. AŞAMA: MİKRO TEYİT ALINDI! STOP'U HESAPLA VE İŞLEMİ GÖNDER
+                    current_price = c_15m[-1][4]
+                    atr = calculate_atr(c_15m)
+                    
+                    if target_trend == 'long':
+                        long_atr_sl = current_price - (atr * 2)
+                        long_max_sl = current_price * 0.985
+                        final_sl = max(long_atr_sl, long_max_sl)
+                    else:
+                        short_atr_sl = current_price + (atr * 2)
+                        short_max_sl = current_price * 1.015
+                        final_sl = min(short_atr_sl, short_max_sl)
+
                     opportunities.append({
                         "symbol": symbol,
                         "trend": target_trend,
-                        "sl_price": sl_price,
-                        "reason": reason
+                        "sl_price": final_sl,
+                        "reason": reason + f" (✅ 5M ve 1M Mikro Teyidi Alındı!)"
                     })
-                    break 
+                    break # Bir tane kaliteli sinyal bulduk, taramayı durdur ve işleme geç.
 
             except Exception as e:
                 continue
